@@ -308,6 +308,47 @@ class LLMNavClient(Node):
         
         return path
     
+    def generate_rotation_path(self, angle_rad: float, frame_id: str = 'odom') -> Path:
+        """Generate a path for rotating the robot by angle_rad (positive = left, negative = right)"""
+        try:
+            t = rclpy.time.Time()  # latest
+            base_to_odom = self.tf_buffer.lookup_transform(
+                frame_id, self.base_frame, t, timeout=Duration(seconds=1.0)
+            )
+        except TransformException as e:
+            raise RuntimeError(f'TF lookup failed for rotation path: {e}')
+        
+        # Get current position and orientation
+        current_pos = base_to_odom.transform.translation
+        current_quat = base_to_odom.transform.rotation
+        current_quat_array = np.array([current_quat.x, current_quat.y, current_quat.z, current_quat.w])
+        
+        # Create rotation around Z-axis (yaw)
+        rotation_z = R.from_euler('z', angle_rad, degrees=False)
+        
+        # Apply rotation to current orientation
+        current_rot = R.from_quat(current_quat_array)
+        new_rot = current_rot * rotation_z
+        new_quat = new_rot.as_quat()  # [x, y, z, w]
+        
+        # Create target pose (same position, rotated orientation)
+        target_pose = {
+            'position': {
+                'x': current_pos.x,
+                'y': current_pos.y,
+                'z': current_pos.z
+            },
+            'orientation': {
+                'x': new_quat[0],
+                'y': new_quat[1],
+                'z': new_quat[2],
+                'w': new_quat[3]
+            }
+        }
+        
+        # Convert to Path
+        return self.poses_to_path([target_pose], frame_id=frame_id)
+    
     # ========== Server Communication ==========
     def reset_navigation(self):
         """Call server to reset navigation"""
@@ -373,9 +414,6 @@ class LLMNavClient(Node):
     # ========== Main Loop ==========
     def run(self):
         """Main navigation loop"""
-        # Initialize robot pose
-        self.pre_nav()
-        self.sleep_with_spin(1.0)
         
         # Wait for sensors
         self.get_logger().info('Waiting for first observation...')
@@ -417,6 +455,27 @@ class LLMNavClient(Node):
             finished = result.get('finished', False)
             
             self.get_logger().info(f'Server response: action={action_type}, detected={detected}, score={score:.3f}')
+            
+            # Handle rotation actions (-1: left 90deg, -2: right 90deg)
+            if action_type == 'turn_left':
+                self.get_logger().info('Executing LEFT TURN 90 degrees')
+                try:
+                    path = self.generate_rotation_path(math.pi / 2.0, frame_id='odom')  # +90 degrees
+                    self.follow_path(path)
+                    self.get_logger().info('Left turn completed.')
+                except Exception as e:
+                    self.get_logger().error(f'Failed to execute left turn: {e}')
+                continue
+            
+            if action_type == 'turn_right':
+                self.get_logger().info('Executing RIGHT TURN 90 degrees')
+                try:
+                    path = self.generate_rotation_path(-math.pi / 2.0, frame_id='odom')  # -90 degrees
+                    self.follow_path(path)
+                    self.get_logger().info('Right turn completed.')
+                except Exception as e:
+                    self.get_logger().error(f'Failed to execute right turn: {e}')
+                continue
             
             # Handle visual servo (target reached)
             if action_type == 'visual_servo':

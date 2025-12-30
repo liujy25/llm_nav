@@ -371,6 +371,13 @@ def navigation_step():
         print("[Server] Action is TURN AROUND")
         poses = build_turnaround_poses(x0, y0, z0, yaw0, num_poses=20)
         action_type = 'turn_around'
+
+    elif r == -1.0:
+        print("[Server] Action is LEFT TURN 90 degrees")
+        action_type = 'turn_left'
+    elif r == -2.0:
+        print("[Server] Action is RIGHT TURN 90 degrees")
+        action_type = 'turn_right'
     else:
         # Normal navigation step
         print(f"[Server] Action is NAV STEP: r={r:.2f}, theta={theta:.2f}")

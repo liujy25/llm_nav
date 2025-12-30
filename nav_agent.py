@@ -31,7 +31,7 @@ class NavAgent:
         self.cfg.setdefault('num_theta', 40)
         self.cfg.setdefault('image_edge_threshold', 0.04)
         self.cfg.setdefault('turn_around_cooldown', 3)
-        self.cfg.setdefault('clip_dist', 2.0)
+        self.cfg.setdefault('clip_dist', 2.5)
         self.clip_dist = self.cfg['clip_dist']
         self.turn_around_cooldown = self.cfg['turn_around_cooldown']
         self._initialize_vlms()
@@ -56,9 +56,11 @@ class NavAgent:
         
         action_prompt = (
             f"TASK: NAVIGATE TO THE NEAREST {goal.upper()}, and get as close to it as possible. Use your prior knowledge about where items are typically located within a building."
+            f"The robot uses an omnidirectional (omni-wheel) base and can rotate in place with a very small turning radius. If a turn is needed, you may explicitly output a turn command: turn left 90° (action id: -1) or turn right 90° (action id: -2). When turning is required, prefer a “move to the waypoint first, then rotate, then continue” strategy—do not choose a pre-turned or biased trajectory in advance."
             f"{description_text}"
             f"There are {num_actions} red arrows superimposed onto your observation, which represent potential actions. "
             f"These are labeled with a number in a white circle, which represent the location you would move to if you took that action. "
+            f"First of all, chose a safe direction to go to, consider the body of the robot itself. Avoid to go the way near to the wall or obstacle. Avoid to turn too early."
             f"{note}"
             f"First, tell me what you see in your sensor observation, and if you have any leads on finding the {goal.upper()}. Second, tell me which general direction you should go in. "
             f"Lastly, explain which action acheives that best, and return it as {{'action': <action_key>}}. Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS"
@@ -248,7 +250,11 @@ class NavAgent:
         arrowData.sort(key=lambda x: x[1])
         thetas = set()
         out = []
-        filter_thresh = 0.75
+        # Adjust filter threshold relative to clip_dist
+        # filter_thresh should be proportional to clip_dist to avoid filtering out all actions
+        # Original: 0.75 is about 0.75/2.0 = 37.5% of typical clip_dist
+        # Use a relative threshold: at least 30% of clip_dist after clip_frac
+        filter_thresh = max(0.5, clip_frac * self.clip_dist * 0.3)  # At least 0.5m or 30% of clip_dist*clip_frac
         filtered = list(filter(lambda x: x[0] > filter_thresh, arrowData))
         filtered.sort(key=lambda x: x[1])
         if not filtered:
@@ -355,10 +361,14 @@ class NavAgent:
             start_px = (rgb_image.shape[1] // 2, rgb_image.shape[0] // 2)
 
         # ---------- 先画动作箭头 1..N ----------
+        projected_count = 0
+        skipped_count = 0
         for (r_i, theta_i) in a_final:
             end_px = self._can_project(r_i, theta_i, rgb_image.shape[:2], intrinsics, T_cam_base)
             if end_px is None:
+                skipped_count += 1
                 continue
+            projected_count += 1
 
             action_name = len(projected) + 1
             projected[(r_i, theta_i)] = action_name
@@ -385,6 +395,9 @@ class NavAgent:
 
             text_position = (circle_center[0] - tw // 2, circle_center[1] + th // 2)
             cv2.putText(rgb_image, text, text_position, font, text_size, text_color, text_thickness)
+
+        if len(a_final) > 0:
+            print(f"[DEBUG] _project_onto_image: {len(a_final)} actions from _action_proposer, {projected_count} projected, {skipped_count} skipped by _can_project")
 
         need_turnaround_button = allow_turnaround or (len(projected) <= 2)
 
@@ -431,6 +444,10 @@ class NavAgent:
         try:
             response_dict = self._eval_response(response)
             action_number = int(response_dict['action'])
+            if action_number == -1:
+                return response, rgb_vis, (-1.0, -1.0)
+            elif action_number == -2:
+                return response, rgb_vis, (-2.0, -2.0)
             if action_number == 0:
                 self.turned = iter
                 return response, rgb_vis, (0.0, 0.0)
