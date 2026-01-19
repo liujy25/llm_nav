@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Navigation Dashboard</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 15px;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 18px 20px;
+            margin-bottom: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: inline-block;
+        }
+
+        .status-bar {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        .status-indicator.connected {
+            background: #4caf50;
+            box-shadow: 0 0 10px #4caf50;
+        }
+
+        .status-indicator.disconnected {
+            background: #f44336;
+            box-shadow: 0 0 10px #f44336;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .mode-switch {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .mode-btn {
+            padding: 6px 16px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 0.05);
+            color: #e0e0e0;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .mode-btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .mode-btn.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-color: transparent;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .controls {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 15px 18px;
+            margin-bottom: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            display: none;
+        }
+
+        .controls.active {
+            display: block;
+        }
+
+        .control-row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+
+        .control-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .control-label {
+            font-weight: 500;
+            min-width: 100px;
+            font-size: 13px;
+        }
+
+        select, input[type="number"] {
+            flex: 1;
+            padding: 8px 12px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-size: 13px;
+            min-width: 180px;
+        }
+
+        select:focus, input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .nav-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        .nav-btn {
+            padding: 8px 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            border-radius: 6px;
+            color: white;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 13px;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .nav-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .nav-btn:active {
+            transform: translateY(0);
+        }
+
+        .nav-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .content {
+            display: grid;
+            grid-template-columns: 1.3fr 1fr;
+            gap: 15px;
+            margin-bottom: 15px;
+            max-height: calc(100vh - 280px);
+        }
+
+        .images-section {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .small-images {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        .image-card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 12px 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            transition: transform 0.3s ease;
+        }
+
+        .image-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+        }
+
+        .image-card h3 {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #667eea;
+        }
+
+        .image-container {
+            width: 100%;
+            aspect-ratio: 16/10;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
+        .image-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            transition: opacity 0.3s ease;
+        }
+
+        .image-placeholder {
+            color: rgba(255, 255, 255, 0.3);
+            font-size: 12px;
+        }
+
+        .response-card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 12px 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            max-height: calc(100vh - 280px);
+        }
+
+        .response-card h3 {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #667eea;
+        }
+
+        .response-content {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.7;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-y: auto;
+            color: #e0e0e0;
+            flex: 1;
+        }
+
+        .response-content::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .response-content::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 4px;
+        }
+
+        .response-content::-webkit-scrollbar-thumb {
+            background: rgba(102, 126, 234, 0.5);
+            border-radius: 4px;
+        }
+
+        .response-content::-webkit-scrollbar-thumb:hover {
+            background: rgba(102, 126, 234, 0.7);
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #667eea;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .goal-info {
+            background: rgba(102, 126, 234, 0.1);
+            border-left: 3px solid #667eea;
+            padding: 10px 12px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .goal-info strong {
+            color: #667eea;
+        }
+
+        @media (max-width: 1200px) {
+            .content {
+                grid-template-columns: 1fr;
+            }
+
+            .small-images {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .small-images {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 LLM Navigation Dashboard</h1>
+            <div class="status-bar">
+                <div class="status-item">
+                    <div class="status-indicator" id="connectionStatus"></div>
+                    <span id="connectionText">Connecting...</span>
+                </div>
+                <div class="status-item">
+                    <span>Goal: <strong id="goalText">-</strong></span>
+                </div>
+                <div class="status-item">
+                    <span>Iteration: <strong id="iterationText">0</strong></span>
+                </div>
+                <div class="status-item">
+                    <span>Detection: <strong id="detectionText">-</strong></span>
+                </div>
+                <div class="mode-switch">
+                    <button class="mode-btn active" id="liveModeBtn" onclick="switchMode('live')">
+                        🔴 Live
+                    </button>
+                    <button class="mode-btn" id="replayModeBtn" onclick="switchMode('replay')">
+                        📁 Replay
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="controls" id="replayControls">
+            <div class="control-row">
+                <span class="control-label">Log Directory:</span>
+                <select id="logSelect" onchange="onLogSelect()">
+                    <option value="">Select a log directory...</option>
+                </select>
+                <button class="nav-btn" onclick="loadLogs()">🔄 Refresh</button>
+            </div>
+            <div class="control-row">
+                <span class="control-label">Iteration:</span>
+                <input type="number" id="iterationInput" min="1" value="1">
+                <span id="iterationRange">/ -</span>
+                <div class="nav-buttons">
+                    <button class="nav-btn" onclick="prevIteration()">◀ Prev</button>
+                    <button class="nav-btn" onclick="nextIteration()">Next ▶</button>
+                    <button class="nav-btn" onclick="loadIteration()">Load</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="content">
+            <div class="images-section">
+                <div class="image-card">
+                    <h3>RGB Visualization</h3>
+                    <div class="image-container">
+                        <img id="rgbVisImg" style="display: none;">
+                        <span class="image-placeholder" id="rgbVisPlaceholder">Waiting for data...</span>
+                    </div>
+                </div>
+
+                <div class="small-images">
+                    <div class="image-card">
+                        <h3>Detection Result</h3>
+                        <div class="image-container">
+                            <img id="detectionImg" style="display: none;">
+                            <span class="image-placeholder" id="detectionPlaceholder">Waiting for data...</span>
+                        </div>
+                    </div>
+
+                    <div class="image-card">
+                        <h3>Explored Map</h3>
+                        <div class="image-container">
+                            <img id="exploredMapImg" style="display: none;">
+                            <span class="image-placeholder" id="exploredMapPlaceholder">Waiting for data...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="response-card">
+                <h3>💬 LLM Response</h3>
+                <div class="goal-info" id="goalInfo" style="display: none;">
+                    <div><strong>Goal:</strong> <span id="goalInfoText">-</span></div>
+                    <div id="descriptionInfo" style="display: none; margin-top: 5px;">
+                        <strong>Description:</strong> <span id="descriptionInfoText"></span>
+                    </div>
+                </div>
+                <div class="response-content" id="llmResponse">Waiting for data...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+        let currentMode = 'live';
+        let currentLogName = '';
+        let maxIteration = 1;
+
+        // Initialize Socket.IO connection
+        function initSocket() {
+            socket = io();
+
+            socket.on('connect', () => {
+                console.log('Connected to server');
+                updateConnectionStatus(true);
+            });
+
+            socket.on('disconnect', () => {
+                console.log('Disconnected from server');
+                updateConnectionStatus(false);
+            });
+
+            socket.on('navigation_update', (data) => {
+                if (currentMode === 'live') {
+                    updateDashboard(data);
+                }
+            });
+        }
+
+        function updateConnectionStatus(connected) {
+            const indicator = document.getElementById('connectionStatus');
+            const text = document.getElementById('connectionText');
+            
+            if (connected) {
+                indicator.className = 'status-indicator connected';
+                text.textContent = 'Connected';
+            } else {
+                indicator.className = 'status-indicator disconnected';
+                text.textContent = 'Disconnected';
+            }
+        }
+
+        function switchMode(mode) {
+            currentMode = mode;
+            
+            const liveBtn = document.getElementById('liveModeBtn');
+            const replayBtn = document.getElementById('replayModeBtn');
+            const replayControls = document.getElementById('replayControls');
+            
+            if (mode === 'live') {
+                liveBtn.classList.add('active');
+                replayBtn.classList.remove('active');
+                replayControls.classList.remove('active');
+                
+                // Clear replay content when switching to live mode
+                clearDisplay();
+                
+                // If there's a latest state in live mode, display it
+                if (nav_state['latest_state']) {
+                    // Will be received via socket when available
+                }
+            } else {
+                liveBtn.classList.remove('active');
+                replayBtn.classList.add('active');
+                replayControls.classList.add('active');
+                loadLogs();
+            }
+        }
+
+        function clearDisplay() {
+            // Clear images
+            ['detection', 'rgbVis', 'exploredMap'].forEach(name => {
+                const img = document.getElementById(`${name}Img`);
+                const placeholder = document.getElementById(`${name}Placeholder`);
+                img.style.display = 'none';
+                img.src = '';
+                placeholder.style.display = 'block';
+                placeholder.textContent = 'Waiting for data...';
+            });
+            
+            // Clear LLM response
+            document.getElementById('llmResponse').textContent = 'Waiting for data...';
+            
+            // Clear goal info
+            document.getElementById('goalInfo').style.display = 'none';
+            document.getElementById('descriptionInfo').style.display = 'none';
+        }
+
+        function loadLogs() {
+            fetch('/api/list_logs')
+                .then(response => response.json())
+                .then(data => {
+                    const select = document.getElementById('logSelect');
+                    select.innerHTML = '<option value="">Select a log directory...</option>';
+                    
+                    data.logs.forEach(log => {
+                        const option = document.createElement('option');
+                        option.value = log.name;
+                        option.textContent = `${log.name} (${log.num_iterations} iterations)`;
+                        option.dataset.maxIter = log.num_iterations;
+                        select.appendChild(option);
+                    });
+                })
+                .catch(error => console.error('Error loading logs:', error));
+        }
+
+        function onLogSelect() {
+            const select = document.getElementById('logSelect');
+            const selectedOption = select.options[select.selectedIndex];
+            
+            if (selectedOption.value) {
+                currentLogName = selectedOption.value;
+                maxIteration = parseInt(selectedOption.dataset.maxIter) || 1;
+                
+                document.getElementById('iterationInput').max = maxIteration;
+                document.getElementById('iterationInput').value = 1;
+                document.getElementById('iterationRange').textContent = `/ ${maxIteration}`;
+                
+                loadIteration();
+            } else {
+                // Clear display when no log is selected
+                clearDisplay();
+                document.getElementById('iterationRange').textContent = '/ -';
+            }
+        }
+
+        function loadIteration() {
+            if (!currentLogName) {
+                alert('Please select a log directory first');
+                return;
+            }
+            
+            const iteration = parseInt(document.getElementById('iterationInput').value);
+            
+            if (iteration < 1 || iteration > maxIteration) {
+                alert(`Iteration must be between 1 and ${maxIteration}`);
+                return;
+            }
+            
+            fetch(`/api/get_iteration?log_name=${currentLogName}&iteration=${iteration}`)
+                .then(response => response.json())
+                .then(data => {
+                    updateDashboard(data);
+                })
+                .catch(error => console.error('Error loading iteration:', error));
+        }
+
+        function prevIteration() {
+            const input = document.getElementById('iterationInput');
+            const current = parseInt(input.value);
+            if (current > 1) {
+                input.value = current - 1;
+                loadIteration();
+            }
+        }
+
+        function nextIteration() {
+            const input = document.getElementById('iterationInput');
+            const current = parseInt(input.value);
+            if (current < maxIteration) {
+                input.value = current + 1;
+                loadIteration();
+            }
+        }
+
+        function updateDashboard(data) {
+            // Update status bar
+            if (data.goal) {
+                document.getElementById('goalText').textContent = data.goal;
+                document.getElementById('goalInfoText').textContent = data.goal;
+                document.getElementById('goalInfo').style.display = 'block';
+            }
+            
+            if (data.goal_description) {
+                document.getElementById('descriptionInfoText').textContent = data.goal_description;
+                document.getElementById('descriptionInfo').style.display = 'block';
+            }
+            
+            if (data.iteration !== undefined) {
+                document.getElementById('iterationText').textContent = data.iteration;
+            }
+            
+            if (data.detected !== undefined) {
+                const score = data.detection_score ? data.detection_score.toFixed(3) : '0.000';
+                document.getElementById('detectionText').textContent = 
+                    data.detected ? `✓ ${score}` : '✗';
+            }
+            
+            // Update images
+            updateImage('detection', data.images?.detection);
+            updateImage('rgbVis', data.images?.rgb_vis);
+            updateImage('exploredMap', data.images?.explored_map);
+            
+            // Update LLM response
+            const responseDiv = document.getElementById('llmResponse');
+            if (data.llm_response) {
+                responseDiv.textContent = data.llm_response;
+                // Auto scroll to bottom
+                responseDiv.scrollTop = responseDiv.scrollHeight;
+            }
+        }
+
+        function updateImage(name, url) {
+            const img = document.getElementById(`${name}Img`);
+            const placeholder = document.getElementById(`${name}Placeholder`);
+            
+            if (url) {
+                // Add timestamp to prevent caching
+                img.src = url + '?t=' + new Date().getTime();
+                img.style.display = 'block';
+                placeholder.style.display = 'none';
+                
+                img.onerror = () => {
+                    img.style.display = 'none';
+                    placeholder.style.display = 'block';
+                    placeholder.textContent = 'Failed to load image';
+                };
+            } else {
+                img.style.display = 'none';
+                placeholder.style.display = 'block';
+                placeholder.textContent = 'No data available';
+            }
+        }
+
+        // Initialize on page load
+        window.onload = () => {
+            initSocket();
+        };
+    </script>
+</body>
+</html>
+

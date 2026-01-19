@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import math
+import time
 import numpy as np
 import cv2
 import ast
+from collections import deque
 
 from vlm import OpenAIVLM
 from utils import (
@@ -31,9 +33,13 @@ class NavAgent:
         self.cfg.setdefault('num_theta', 40)
         self.cfg.setdefault('image_edge_threshold', 0.04)
         self.cfg.setdefault('turn_around_cooldown', 3)
-        self.cfg.setdefault('clip_dist', 2.5)
+        self.cfg.setdefault('clip_dist', 2.0)
+        self.cfg.setdefault('memory_length', 3)  # Memory length for visual history
+        
         self.clip_dist = self.cfg['clip_dist']
         self.turn_around_cooldown = self.cfg['turn_around_cooldown']
+        self.memory_length = self.cfg['memory_length']
+        
         self._initialize_vlms()
         self.reset()
 
@@ -41,29 +47,65 @@ class NavAgent:
         system_instruction = (
             "You are an embodied robotic assistant, with an RGB image sensor. You observe the image and instructions "
             "given to you and output a textual response, which is converted into actions that physically move you "
-            "within the environment. You cannot move through closed doors. "
+            "within the environment. You are only allowed to search for the goal object in the room you are in now. You cannot go to other rooms."
+            "You cannot move through doors. "
         )
         self.actionVLM = OpenAIVLM(model="gpt-4o", system_instruction=system_instruction)
 
-    def _construct_prompt(self, goal: str, num_actions: int = 0, iter: int = 0, goal_description: str = ""):
+    def _construct_prompt(self, goal: str, num_actions: int = 0, iter: int = 0, goal_description: str = "", num_history: int = 0):
         allow_turnaround = ((iter - self.turned) >= self.turn_around_cooldown) or (num_actions <= 2)
-        note = "NOTE: choose action 0 if you want to TURN AROUND or DONT SEE ANY GOOD ACTIONS. " if allow_turnaround else ""
+
+        if allow_turnaround:
+            note = (
+                "NOTE: action 0 means TURN AROUND (rotate 180° in place) and is NOT a move-to-waypoint action. "
+                "There is NO waypoint 0. The red-arrow move actions are ONLY the non-zero numbered actions. "
+                "SEARCH RULE: If you do not see the target and have no strong lead, do NOT turn around immediately. "
+                "First choose a safe MOVE action that reveals NEW space/viewpoints (e.g., open area, action at the image edges). "
+                "Choose action 0 only if (a) none of the MOVE actions are safe, or (b) none of the MOVE actions would reveal new space "
+                "and you truly have no good options. "
+            )
+        else:
+            note = (
+                "NOTE: action 0 means TURN AROUND (rotate 180° in place) and is NOT a move-to-waypoint action. "
+                "There is NO waypoint 0. The red-arrow move actions are ONLY the non-zero numbered actions. "
+                "TURN AROUND (action 0) is currently NOT allowed; do local exploration with a safe MOVE action instead. "
+            )
+
+        # Add memory/history information if applicable
+        history_text = ""
+        if num_history > 0:
+            history_text = (
+                f"MEMORY CONTEXT: You are shown {num_history} PREVIOUS observation(s) first, followed by your CURRENT observation at the end. "
+                f"The previous observations show what you saw before and which action you took (marked with a GREEN circle). "
+                f"Use this information to understand where you've been and avoid revisiting the same areas unnecessarily. "
+                f"Make exploration decisions that reveal NEW areas rather than re-exploring old ones. "
+                f"IMPORTANT: DO NOT choose actions from the previous images - only choose an action number from the CURRENT (last) image. "
+            )
 
         # Add goal description to prompt if provided
         description_text = ""
         if goal_description and goal_description.strip():
             description_text = f" ADDITIONAL INFORMATION: {goal_description.strip()}. "
-        
+
         action_prompt = (
-            f"TASK: NAVIGATE TO THE NEAREST {goal.upper()}, and get as close to it as possible. Use your prior knowledge about where items are typically located within a building."
-            f"The robot uses an omnidirectional (omni-wheel) base and can rotate in place with a very small turning radius. If a turn is needed, you may explicitly output a turn command: turn left 90° (action id: -1) or turn right 90° (action id: -2). When turning is required, prefer a “move to the waypoint first, then rotate, then continue” strategy—do not choose a pre-turned or biased trajectory in advance."
+            f"{history_text}"
+            f"TASK: NAVIGATE TO THE NEAREST {goal.upper()}, and get as close to it as possible. "
+            f"Use your prior knowledge about where items are typically located within a room. "
+            f"The robot uses an omnidirectional (omni-wheel) base and can rotate in place with a very small turning radius. "
             f"{description_text}"
-            f"There are {num_actions} red arrows superimposed onto your observation, which represent potential actions. "
-            f"These are labeled with a number in a white circle, which represent the location you would move to if you took that action. "
-            f"First of all, chose a safe direction to go to, consider the body of the robot itself. Avoid to go the way near to the wall or obstacle. Avoid to turn too early."
+            f"There are {num_actions} red arrows superimposed onto your CURRENT observation, which represent potential MOVE actions. "
+            f"These MOVE actions are labeled with a NON-ZERO number in a white circle, which represent the location you would move to if you took that action. "
+            f"REMINDER: action 0 is NOT a move and has NO waypoint; action 0 means TURN AROUND (rotate 180° in place). "
+            f"First of all, chose a safe direction to go to, consider the body of the robot itself. "
+            f"If you want to check somewhere(a desk, an open area, etc.), you may not need to go there directly, which may cause collision, you can move to a place near it and then turn to check it. "
+            f"If you think you have checked a place, you should go to the next place to check, do not stay in one place too long. "
+            f"If you want to go to a place far away, you should explore nearby first(by choosing an action at the image edges to turn to new spots). "
+            f"Avoid to go the way near to the wall or obstacle. Avoid to turn too early during forward navigation; turning around is only for search when needed. "
             f"{note}"
-            f"First, tell me what you see in your sensor observation, and if you have any leads on finding the {goal.upper()}. Second, tell me which general direction you should go in. "
-            f"Lastly, explain which action acheives that best, and return it as {{'action': <action_key>}}. Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS"
+            f"First, tell me what you see in your sensor observation, and if you have any leads on finding the {goal.upper()}. "
+            f"Second, tell me which general direction you should go in. "
+            f"Lastly, explain which action acheives that best, and return it as {{'action': <action_key>}}. "
+            f"Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS"
         )
         return action_prompt
 
@@ -86,6 +128,7 @@ class NavAgent:
         self.init_pos = None
         self.turned = -3
         self.last_turned = False
+        self.memory = deque(maxlen=self.memory_length)  # Visual-action history memory
         self.actionVLM.reset()
 
     def cal_fov(self, intrinsics: np.ndarray, W: int):
@@ -431,32 +474,80 @@ class NavAgent:
         a_initial = self._navigability(obs)
         a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
-        allow_turnaround = ((iter - self.turned) >= self.turn_around_cooldown) & iter >= 2
+        allow_turnaround = ((iter - self.turned) >= self.turn_around_cooldown) or iter <= 2
 
+        # Start timing for projection (image annotation)
+        t_projection_start = time.time()
+        
+        # Generate visualization without highlighting (for initial display)
         a_final_projected, rgb_vis = self._projection(a_final, obs, allow_turnaround=allow_turnaround)
 
-        prompt = self._construct_prompt(goal, num_actions=len(a_final_projected), iter=iter, goal_description=goal_description)
+        # Build image list: history images + current image
+        images = []
+        for mem in self.memory:
+            images.append(mem['rgb_vis'])  # Add historical images with chosen actions highlighted
+        images.append(rgb_vis)  # Add current image (no action chosen yet)
 
-        response = self.actionVLM.call_chat(1, [rgb_vis], prompt)
+        # Construct prompt with memory information
+        prompt = self._construct_prompt(
+            goal, 
+            num_actions=len(a_final_projected), 
+            iter=iter, 
+            goal_description=goal_description,
+            num_history=len(self.memory)
+        )
+        
+        t_projection_end = time.time()
+        projection_time = t_projection_end - t_projection_start
+
+        # Start timing for VLM inference
+        t_vlm_start = time.time()
+        
+        # Call VLM with multiple images (memory + current)
+        response = self.actionVLM.call_chat(1, images, prompt)
+        
+        t_vlm_end = time.time()
+        vlm_inference_time = t_vlm_end - t_vlm_start
+        
+        print(f'[NavAgent] Memory size: {len(self.memory)}, Total images sent: {len(images)}')
+        print(f'[NavAgent] Timing - Projection: {projection_time:.3f}s, VLM inference: {vlm_inference_time:.3f}s')
         print(f'response: {response}')
 
         rev = {v: k for k, v in a_final_projected.items()}
         try:
             response_dict = self._eval_response(response)
             action_number = int(response_dict['action'])
-            if action_number == -1:
-                return response, rgb_vis, (-1.0, -1.0)
-            elif action_number == -2:
-                return response, rgb_vis, (-2.0, -2.0)
+            
+            # Re-generate visualization with chosen action highlighted in GREEN
+            _, rgb_vis_final = self._projection(
+                a_final, 
+                obs, 
+                chosen_action=action_number,
+                allow_turnaround=allow_turnaround
+            )
+            
+            # Save to memory: image with chosen action + action number + iteration
+            self.memory.append({
+                'rgb_vis': rgb_vis_final,
+                'action': action_number,
+                'iteration': iter
+            })
+            
+            # Prepare timing information
+            timing_info = {
+                'projection_time': float(projection_time),
+                'vlm_inference_time': float(vlm_inference_time)
+            }
+            
             if action_number == 0:
                 self.turned = iter
-                return response, rgb_vis, (0.0, 0.0)
+                return response, rgb_vis_final, (0.0, 0.0), timing_info
             else:
                 action = rev.get(action_number)
-                return response, rgb_vis, action
+                return response, rgb_vis_final, action, timing_info
         except (IndexError, KeyError, TypeError, ValueError) as e:
             print(f'Error parsing response {e}')
-            return None
+            return None, None, None, {'projection_time': 0.0, 'vlm_inference_time': 0.0}
 
     def _eval_response(self, response: str):
         """Converts the VLM response string into a dictionary, if possible"""

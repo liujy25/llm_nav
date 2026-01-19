@@ -24,3 +24,10 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Subproject directories (separate git repos)
+NavDP/
+InternNav/
+
+# Test output files
+test_results.json
+test_results.png

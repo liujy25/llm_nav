@@ -27,7 +27,7 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image as ImageMsg, CameraInfo, JointState
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Path
-from nav2_msgs.action import FollowPath
+from nav2_msgs.action import FollowPath, NavigateToPose
 
 from tf2_ros import Buffer, TransformListener, TransformException
 from scipy.spatial.transform import Rotation as R
@@ -61,7 +61,8 @@ class LLMNavClient(Node):
     ROS2 Client for LLM Navigation
     - Subscribe to sensors (RGB, Depth, TF)
     - Send HTTP requests to server
-    - Execute returned Path with FollowPath action
+    - Execute returned goal pose with NavigateToPose action (using Nav2 path planning)
+    - Measure and report timing (network transfer, server processing, detection, VLM)
     """
     
     def __init__(self, goal: str, goal_description: str = "", server_url: str = "http://10.19.126.158:1874"):
@@ -99,8 +100,9 @@ class LLMNavClient(Node):
             JointState, '/motion_target/target_joint_state_arm_left', pub_qos
         )
         
-        # Nav2 action client
+        # Nav2 action clients
         self.follow_path_client = ActionClient(self, FollowPath, '/follow_path')
+        self.navigate_to_pose_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         
         # Sensor data buffers
         from threading import Lock
@@ -260,8 +262,37 @@ class LLMNavClient(Node):
         self.sleep_with_spin(1.0)
     
     # ========== Path Execution ==========
+    def navigate_to_pose(self, pose_stamped: PoseStamped):
+        """Navigate to a goal pose using Nav2 NavigateToPose action"""
+        self.get_logger().info('Waiting for NavigateToPose action server...')
+        if not self.navigate_to_pose_client.wait_for_server(timeout_sec=10.0):
+            raise RuntimeError('NavigateToPose action server not available')
+        
+        goal = NavigateToPose.Goal()
+        goal.pose = pose_stamped
+        goal.behavior_tree = ""
+        
+        self.get_logger().info(f'Sending NavigateToPose to ({pose_stamped.pose.position.x:.2f}, '
+                              f'{pose_stamped.pose.position.y:.2f})')
+        send_goal_future = self.navigate_to_pose_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_goal_future)
+        
+        goal_handle = send_goal_future.result()
+        if not goal_handle.accepted:
+            raise RuntimeError('NavigateToPose goal rejected')
+        
+        self.get_logger().info('Goal accepted, navigating...')
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        
+        wrapped = result_future.result()
+        if wrapped.status != 4:  # SUCCEEDED
+            raise RuntimeError(f'NavigateToPose failed with status: {wrapped.status}')
+        
+        self.get_logger().info('NavigateToPose completed!')
+    
     def follow_path(self, path: Path):
-        """Execute path using Nav2 FollowPath action"""
+        """Execute path using Nav2 FollowPath action (kept for backward compatibility)"""
         self.get_logger().info('Waiting for FollowPath action server...')
         if not self.follow_path_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError('FollowPath action server not available')
@@ -289,6 +320,18 @@ class LLMNavClient(Node):
         
         self.get_logger().info('FollowPath completed!')
     
+    def dict_to_pose_stamped(self, pose_dict: dict, frame_id: str = 'odom') -> PoseStamped:
+        """Convert pose dict to ROS PoseStamped message"""
+        ps = PoseStamped()
+        now = self.get_clock().now().to_msg()
+        ps.header.frame_id = frame_id
+        ps.header.stamp = now
+        ps.pose.position.x = pose_dict['position']['x']
+        ps.pose.position.y = pose_dict['position']['y']
+        ps.pose.position.z = pose_dict['position']['z']
+        ps.pose.orientation = dict_to_quaternion(pose_dict['orientation'])
+        return ps
+    
     def poses_to_path(self, poses_list: list, frame_id: str = 'odom') -> Path:
         """Convert list of pose dicts to ROS Path message"""
         path = Path()
@@ -297,13 +340,7 @@ class LLMNavClient(Node):
         path.header.stamp = now
         
         for pose_dict in poses_list:
-            ps = PoseStamped()
-            ps.header.frame_id = frame_id
-            ps.header.stamp = now
-            ps.pose.position.x = pose_dict['position']['x']
-            ps.pose.position.y = pose_dict['position']['y']
-            ps.pose.position.z = pose_dict['position']['z']
-            ps.pose.orientation = dict_to_quaternion(pose_dict['orientation'])
+            ps = self.dict_to_pose_stamped(pose_dict, frame_id)
             path.poses.append(ps)
         
         return path
@@ -438,72 +475,84 @@ class LLMNavClient(Node):
                 self.get_logger().error(f'Failed to get observation: {e}')
                 continue
             
-            # Request decision from server
+            # Request decision from server with timing
             try:
+                t_request_start = time.time()
                 result = self.request_navigation_step(obs)
+                t_request_end = time.time()
+                total_request_time = t_request_end - t_request_start
             except Exception as e:
                 self.get_logger().error(f'Server request failed: {e}')
                 continue
             
-            # Parse result (server already processed everything, just need to convert to ROS Path)
+            # Parse result and timing information
             action_type = result.get('action_type', 'none')
-            path_data = result.get('path', {})
-            poses = path_data.get('poses', [])
-            frame_id = path_data.get('frame_id', 'odom')
+            goal_pose_data = result.get('goal_pose')
             detected = result.get('detected', False)
             score = result.get('detection_score', 0.0)
             finished = result.get('finished', False)
+            timing_info = result.get('timing', {})
+            
+            # Calculate network transfer time
+            server_time = timing_info.get('total_server_time', 0.0)
+            network_time = total_request_time - server_time
             
             self.get_logger().info(f'Server response: action={action_type}, detected={detected}, score={score:.3f}')
-            
-            # Handle rotation actions (-1: left 90deg, -2: right 90deg)
-            if action_type == 'turn_left':
-                self.get_logger().info('Executing LEFT TURN 90 degrees')
-                try:
-                    path = self.generate_rotation_path(math.pi / 2.0, frame_id='odom')  # +90 degrees
-                    self.follow_path(path)
-                    self.get_logger().info('Left turn completed.')
-                except Exception as e:
-                    self.get_logger().error(f'Failed to execute left turn: {e}')
-                continue
-            
-            if action_type == 'turn_right':
-                self.get_logger().info('Executing RIGHT TURN 90 degrees')
-                try:
-                    path = self.generate_rotation_path(-math.pi / 2.0, frame_id='odom')  # -90 degrees
-                    self.follow_path(path)
-                    self.get_logger().info('Right turn completed.')
-                except Exception as e:
-                    self.get_logger().error(f'Failed to execute right turn: {e}')
-                continue
-            
-            # Handle visual servo (target reached)
-            if action_type == 'visual_servo':
-                self.get_logger().info('Visual servo triggered -> switching to manipulation pose')
-                # self.pre_manip()
-                
-                if len(poses) > 0:
-                    path = self.poses_to_path(poses, frame_id=frame_id)
-                    self.follow_path(path)
-                
-                self.get_logger().info('Navigation finished!')
-                break
+            self.get_logger().info(f'Timing - Total: {total_request_time:.3f}s, Server: {server_time:.3f}s, '
+                                  f'Network: {network_time:.3f}s ({network_time/total_request_time*100:.1f}%)')
+            self.get_logger().info(f'  └─ Detection: {timing_info.get("detection_time", 0.0):.3f}s, '
+                                  f'VLM Projection: {timing_info.get("vlm_projection_time", 0.0):.3f}s, '
+                                  f'VLM Inference: {timing_info.get("vlm_inference_time", 0.0):.3f}s')
             
             # Handle no action
-            if action_type == 'none' or len(poses) == 0:
+            if action_type == 'none' or goal_pose_data is None:
                 self.get_logger().warn('No action from server, continuing...')
                 continue
             
-            # Execute path (server already computed complete path)
-            path = self.poses_to_path(poses, frame_id=frame_id)
+            # Extract goal pose
+            frame_id = goal_pose_data.get('frame_id', 'odom')
+            pose_dict = goal_pose_data.get('pose')
             
+            if pose_dict is None:
+                self.get_logger().warn('No pose in goal_pose data, continuing...')
+                continue
+            
+            # Convert to PoseStamped
+            goal_pose_stamped = self.dict_to_pose_stamped(pose_dict, frame_id=frame_id)
+            
+            # Handle visual servo (target reached)
+            if action_type == 'visual_servo':
+                self.get_logger().info('Visual servo triggered -> navigating to final position')
+                try:
+                    self.navigate_to_pose(goal_pose_stamped)
+                    self.get_logger().info('Visual servo completed!')
+                    # self.pre_manip()
+                    self.get_logger().info('Navigation finished!')
+                    break
+                except Exception as e:
+                    self.get_logger().error(f'Failed to execute visual servo: {e}')
+                    continue
+            
+            # Handle turn around
             if action_type == 'turn_around':
-                self.get_logger().info('Executing TURN AROUND')
-            elif action_type == 'nav_step':
-                self.get_logger().info('Executing NAV STEP')
+                self.get_logger().info('Executing TURN AROUND (180 degrees)')
+                try:
+                    self.navigate_to_pose(goal_pose_stamped)
+                    self.get_logger().info('Turn around completed.')
+                except Exception as e:
+                    self.get_logger().error(f'Failed to execute turn around: {e}')
+                continue
             
-            self.follow_path(path)
-            self.get_logger().info('Step completed.')
+            # Handle normal navigation step
+            if action_type == 'nav_step':
+                self.get_logger().info(f'Executing NAV STEP to ({pose_dict["position"]["x"]:.2f}, '
+                                      f'{pose_dict["position"]["y"]:.2f})')
+                try:
+                    self.navigate_to_pose(goal_pose_stamped)
+                    self.get_logger().info('Nav step completed.')
+                except Exception as e:
+                    self.get_logger().error(f'Failed to execute nav step: {e}')
+                continue
         
         self.get_logger().info('Run finished.')
 

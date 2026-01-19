@@ -7,6 +7,7 @@ import os
 import sys
 import math
 import json
+import time
 import argparse
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -14,7 +15,8 @@ from typing import Optional, Dict, Any, List
 import numpy as np
 import cv2
 from PIL import Image
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask_socketio import SocketIO, emit
 
 # Add current directory to path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +26,8 @@ from nav_agent import NavAgent
 from target_detector import TargetDetector
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'llm_nav_secret_key'
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Global state
 nav_state = {
@@ -32,16 +36,28 @@ nav_state = {
     'goal': None,
     'goal_description': '',
     'iteration_count': 0,
-    'log_dir': None
+    'log_dir': None,
+    'latest_state': None  # Store latest visualization state
 }
 
 
-def setup_log_directory():
-    """Create log directory for this session"""
+def setup_log_directory(goal: str = '', goal_description: str = ''):
+    """Create log directory for this session and save metadata"""
     base_dir = os.path.join(script_dir, '..', 'logs')
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_dir = os.path.join(base_dir, f'run_{timestamp}')
     os.makedirs(log_dir, exist_ok=True)
+    
+    # Save goal and description metadata
+    metadata = {
+        'goal': goal,
+        'goal_description': goal_description,
+        'timestamp': timestamp
+    }
+    metadata_path = os.path.join(log_dir, 'metadata.json')
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    
     return log_dir
 
 
@@ -69,42 +85,15 @@ def quat_dict_to_yaw(q: Dict[str, float]) -> float:
     )
 
 
-def build_path_poses(x0: float, y0: float, z0: float, yaw0: float,
-                     xg: float, yg: float, yawg: float,
-                     num_poses: int = 20) -> List[Dict[str, Any]]:
+def build_goal_pose(x: float, y: float, z: float, yaw: float) -> Dict[str, Any]:
     """
-    Build interpolated poses from start to goal
-    Returns list of pose dicts (not ROS Path, just data)
+    Build a single goal pose
+    Returns a pose dict with position and orientation
     """
-    poses = []
-    for i in range(1, num_poses + 1):
-        s = i / float(num_poses)
-        xi = x0 + s * (xg - x0)
-        yi = y0 + s * (yg - y0)
-        zi = z0  # Keep same z
-        yawi = yaw0 + s * (yawg - yaw0)
-        
-        poses.append({
-            'position': {'x': float(xi), 'y': float(yi), 'z': float(zi)},
-            'orientation': yaw_to_quaternion(float(yawi))
-        })
-    return poses
-
-
-def build_turnaround_poses(x: float, y: float, z: float, yaw0: float,
-                          num_poses: int = 20) -> List[Dict[str, Any]]:
-    """Build poses for 180-degree turn around"""
-    yawg = yaw0 + math.pi
-    poses = []
-    for i in range(1, num_poses + 1):
-        s = i / float(num_poses)
-        yawi = yaw0 + s * (yawg - yaw0)
-        
-        poses.append({
-            'position': {'x': float(x), 'y': float(y), 'z': float(z)},
-            'orientation': yaw_to_quaternion(float(yawi))
-        })
-    return poses
+    return {
+        'position': {'x': float(x), 'y': float(y), 'z': float(z)},
+        'orientation': yaw_to_quaternion(float(yaw))
+    }
 
 
 @app.route('/navigation_reset', methods=['POST'])
@@ -131,7 +120,7 @@ def navigation_reset():
     nav_state['goal'] = goal
     nav_state['goal_description'] = goal_description or ''
     nav_state['iteration_count'] = 0
-    nav_state['log_dir'] = setup_log_directory()
+    nav_state['log_dir'] = setup_log_directory(goal, goal_description or '')
     
     # Initialize NavAgent
     if nav_state['agent'] is None:
@@ -166,15 +155,32 @@ def navigation_step():
             'T_odom_base': JSON string, 4x4 matrix flattened (base->odom)
     
     Returns JSON: {
-        'action_type': 'nav_step' | 'visual_servo' | 'turn_around' | 'finished',
-        'poses': [...],  # List of 20 poses in odom frame
-        'frame_id': 'odom',
+        'action_type': 'nav_step' | 'visual_servo' | 'turn_around' | 'none',
+        'goal_pose': {
+            'frame_id': 'odom',
+            'pose': {
+                'position': {'x': float, 'y': float, 'z': float},
+                'orientation': {'x': float, 'y': float, 'z': float, 'w': float}
+            }
+        } | None,
         'detected': bool,
         'detection_score': float,
-        'iteration': int
+        'iteration': int,
+        'finished': bool,
+        'timing': {
+            'total_server_time': float,
+            'detection_time': float,
+            'vlm_projection_time': float,
+            'vlm_inference_time': float
+        }
     }
+    
+    Note: Client should use nav2's NavigateToPose action with the returned goal_pose
     """
     global nav_state
+    
+    # Start timing the entire server processing
+    t_server_start = time.time()
     
     if nav_state['goal'] is None:
         return jsonify({'error': 'Navigation not initialized. Call /navigation_reset first.'}), 400
@@ -235,13 +241,16 @@ def navigation_step():
     
     # Step 1: Target Detection
     print(f"[Server] Running detection for '{nav_state['goal']}'...")
+    t_detection_start = time.time()
     detection_vis_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_detection.jpg')
     detection_result = nav_state['detector'].detect_from_cv_image(bgr, detection_vis_path)
+    t_detection_end = time.time()
+    detection_time = t_detection_end - t_detection_start
     
     detected = detection_result.get('detected', False)
     score = detection_result.get('score', 0.0)
     
-    print(f"[Server] Detection: detected={detected}, score={score:.3f}")
+    print(f"[Server] Detection: detected={detected}, score={score:.3f}, time={detection_time:.3f}s")
     
     # Step 2: Visual Servo if detected with high confidence and within 1.5m
     target_distance = None
@@ -282,11 +291,10 @@ def navigation_step():
             print(f"[Server] Target distance: {target_distance:.3f}m")
             
             # Only execute visual servo if target is within 1.5m
-            if target_distance <= 1.5:
-                print("[Server] Target detected within 1.5m -> VISUAL SERVO")
+            if target_distance <= 5.0:
+                print("[Server] Target detected within 5m -> VISUAL SERVO")
                 yaw0 = mat_to_yaw(T_odom_base)
                 
-                # Compute goal pose (0.55m away from target)
                 dx = tx - bx
                 dy = ty - by
                 norm = math.hypot(dx, dy)
@@ -294,33 +302,80 @@ def navigation_step():
                     norm = 1e-9
                 ux, uy = dx / norm, dy / norm
                 
-                d0 = 0.55
+                d0 = 0.6
                 x_new = tx - d0 * ux
                 y_new = ty - d0 * uy
                 yaw_new = math.atan2(ty - y_new, tx - x_new) + math.radians(15)
                 
-                # Build path poses
-                poses = build_path_poses(bx, by, bz, yaw0, x_new, y_new, yaw_new, num_poses=20)
+                # Build goal pose
+                goal_pose = build_goal_pose(x_new, y_new, bz, yaw_new)
                 
-                # Return complete path data (all processing done on server)
+                # For visual_servo, we emit early since we don't have LLM response yet
+                log_name = os.path.basename(nav_state['log_dir'])
+                viz_state_early = {
+                    'iteration': iteration,
+                    'goal': nav_state['goal'],
+                    'goal_description': nav_state['goal_description'],
+                    'detected': True,
+                    'detection_score': float(score),
+                    'action_type': 'visual_servo',
+                    'target_distance': float(target_distance),
+                    'images': {},
+                    'llm_response': 'Target detected within range - executing visual servo'
+                }
+                
+                if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_detection.jpg')):
+                    viz_state_early['images']['detection'] = f'/logs/{log_name}/iter_{iteration:04d}_detection.jpg'
+                
+                nav_state['latest_state'] = viz_state_early
+                socketio.emit('navigation_update', viz_state_early)
+                
+                # Calculate total server time
+                t_server_end = time.time()
+                total_server_time = t_server_end - t_server_start
+                
+                timing_info = {
+                    'total_server_time': float(total_server_time),
+                    'detection_time': float(detection_time),
+                    'vlm_projection_time': 0.0,  # Visual servo doesn't use VLM
+                    'vlm_inference_time': 0.0
+                }
+                
+                # Save timing information for visual servo
+                timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+                timing_data = {
+                    'iteration': iteration,
+                    'total_server_time': float(total_server_time),
+                    'detection_time': float(detection_time),
+                    'vlm_projection_time': 0.0,
+                    'vlm_inference_time': 0.0,
+                    'action_type': 'visual_servo'
+                }
+                with open(timing_path, 'w') as f:
+                    json.dump(timing_data, f, indent=2)
+                
+                print(f"[Server] Timing - Total: {total_server_time:.3f}s, Detection: {detection_time:.3f}s")
+                
+                # Return goal pose for nav2 NavigateToPose
                 return jsonify({
                     'action_type': 'visual_servo',
-                    'path': {
+                    'goal_pose': {
                         'frame_id': 'odom',
-                        'poses': poses
+                        'pose': goal_pose
                     },
                     'detected': True,
                     'detection_score': score,
                     'target_distance': target_distance,
                     'iteration': iteration,
-                    'finished': True
+                    'finished': True,
+                    'timing': timing_info
                 })
             else:
                 print(f"[Server] Target detected but too far ({target_distance:.3f}m > 1.5m) -> LLM NAV")
     
     # Step 3: LLM Navigation Step
     print("[Server] Calling NavAgent for decision...")
-    response, rgb_vis, action = nav_state['agent']._nav(
+    response, rgb_vis, action, nav_timing = nav_state['agent']._nav(
         obs, nav_state['goal'], iteration, goal_description=nav_state['goal_description']
     )
     
@@ -344,17 +399,78 @@ def navigation_step():
     if explored_map is not None:
         cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_explored_map.jpg'), explored_map)
     
+    # Save timing information (will be updated at the end with total time and action type)
+    timing_data = {
+        'iteration': iteration,
+        'detection_time': float(detection_time),
+        'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
+        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0)),
+        'detected': detected,
+        'detection_score': float(score)
+    }
+    timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+    with open(timing_path, 'w') as f:
+        json.dump(timing_data, f, indent=2)
+    
+    # Prepare visualization state for Socket.IO
+    log_name = os.path.basename(nav_state['log_dir'])
+    viz_state = {
+        'iteration': iteration,
+        'goal': nav_state['goal'],
+        'goal_description': nav_state['goal_description'],
+        'detected': detected,
+        'detection_score': float(score),
+        'action_type': None,
+        'images': {},
+        'llm_response': response if response else ''
+    }
+    
+    # Add image paths
+    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_detection.jpg')):
+        viz_state['images']['detection'] = f'/logs/{log_name}/iter_{iteration:04d}_detection.jpg'
+    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg')):
+        viz_state['images']['rgb_vis'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb_vis.jpg'
+    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_explored_map.jpg')):
+        viz_state['images']['explored_map'] = f'/logs/{log_name}/iter_{iteration:04d}_explored_map.jpg'
+    
     if action is None:
+        viz_state['action_type'] = 'none'
+        nav_state['latest_state'] = viz_state
+        socketio.emit('navigation_update', viz_state)
+        
+        # Calculate total server time
+        t_server_end = time.time()
+        total_server_time = t_server_end - t_server_start
+        
+        timing_info = {
+            'total_server_time': float(total_server_time),
+            'detection_time': float(detection_time),
+            'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
+            'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+        }
+        
+        # Update timing file with total server time and action type
+        timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+        if os.path.exists(timing_path):
+            with open(timing_path, 'r') as f:
+                timing_data = json.load(f)
+            timing_data['total_server_time'] = float(total_server_time)
+            timing_data['action_type'] = 'none'
+            with open(timing_path, 'w') as f:
+                json.dump(timing_data, f, indent=2)
+        
+        print(f"[Server] Timing - Total: {total_server_time:.3f}s, Detection: {detection_time:.3f}s, "
+              f"VLM Projection: {timing_info['vlm_projection_time']:.3f}s, "
+              f"VLM Inference: {timing_info['vlm_inference_time']:.3f}s")
+        
         return jsonify({
             'action_type': 'none',
-            'path': {
-                'frame_id': 'odom',
-                'poses': []
-            },
+            'goal_pose': None,
             'detected': detected,
             'detection_score': score,
             'iteration': iteration,
-            'finished': False
+            'finished': False,
+            'timing': timing_info
         })
     
     r, theta = float(action[0]), float(action[1])
@@ -369,42 +485,70 @@ def navigation_step():
     # Action = 0 -> Turn around
     if abs(r) < 1e-9 and abs(theta) < 1e-9:
         print("[Server] Action is TURN AROUND")
-        poses = build_turnaround_poses(x0, y0, z0, yaw0, num_poses=20)
+        # Turn 180 degrees at current position
+        yaw_goal = yaw0 + math.pi
+        goal_pose = build_goal_pose(x0, y0, z0, yaw_goal)
         action_type = 'turn_around'
 
-    elif r == -1.0:
-        print("[Server] Action is LEFT TURN 90 degrees")
-        action_type = 'turn_left'
-    elif r == -2.0:
-        print("[Server] Action is RIGHT TURN 90 degrees")
-        action_type = 'turn_right'
     else:
         # Normal navigation step
         print(f"[Server] Action is NAV STEP: r={r:.2f}, theta={theta:.2f}")
         
+        dis = min(0.4, r)
         # Compute goal in odom frame
-        x_b = r * math.cos(theta)
-        y_b = r * math.sin(theta)
+        x_b = dis * math.cos(theta)
+        y_b = dis * math.sin(theta)
         p_base = np.array([x_b, y_b, 0.0, 1.0], dtype=np.float64)
         p_goal_odom = T_odom_base @ p_base
         xg = float(p_goal_odom[0])
         yg = float(p_goal_odom[1])
         yawg = yaw0 + float(theta)
         
-        poses = build_path_poses(x0, y0, z0, yaw0, xg, yg, yawg, num_poses=20)
+        goal_pose = build_goal_pose(xg, yg, z0, yawg)
         action_type = 'nav_step'
     
-    # Return complete path data (all processing done on server)
+    # Update visualization state and emit to clients
+    viz_state['action_type'] = action_type
+    nav_state['latest_state'] = viz_state
+    socketio.emit('navigation_update', viz_state)
+    
+    # Calculate total server time
+    t_server_end = time.time()
+    total_server_time = t_server_end - t_server_start
+    
+    timing_info = {
+        'total_server_time': float(total_server_time),
+        'detection_time': float(detection_time),
+        'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
+        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+    }
+    
+    # Update timing file with total server time and action type
+    timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+    if os.path.exists(timing_path):
+        with open(timing_path, 'r') as f:
+            timing_data = json.load(f)
+        timing_data['total_server_time'] = float(total_server_time)
+        timing_data['action_type'] = action_type
+        with open(timing_path, 'w') as f:
+            json.dump(timing_data, f, indent=2)
+    
+    print(f"[Server] Timing - Total: {total_server_time:.3f}s, Detection: {detection_time:.3f}s, "
+          f"VLM Projection: {timing_info['vlm_projection_time']:.3f}s, "
+          f"VLM Inference: {timing_info['vlm_inference_time']:.3f}s")
+    
+    # Return goal pose for nav2 NavigateToPose
     return jsonify({
         'action_type': action_type,
-        'path': {
+        'goal_pose': {
             'frame_id': 'odom',
-            'poses': poses
+            'pose': goal_pose
         },
         'detected': detected,
         'detection_score': score,
         'iteration': iteration,
-        'finished': False
+        'finished': False,
+        'timing': timing_info
     })
 
 
@@ -418,6 +562,126 @@ def health_check():
     })
 
 
+@app.route('/')
+def dashboard():
+    """Render visualization dashboard"""
+    return render_template('dashboard.html')
+
+
+@app.route('/api/list_logs', methods=['GET'])
+def list_logs():
+    """List all available log directories"""
+    base_dir = os.path.join(script_dir, '..', 'logs')
+    if not os.path.exists(base_dir):
+        return jsonify({'logs': []})
+    
+    logs = []
+    for item in os.listdir(base_dir):
+        item_path = os.path.join(base_dir, item)
+        if os.path.isdir(item_path) and item.startswith('run_'):
+            # Count iterations
+            files = os.listdir(item_path)
+            iterations = set()
+            for f in files:
+                if f.startswith('iter_') and f.endswith('_rgb.jpg'):
+                    iter_num = int(f.split('_')[1])
+                    iterations.add(iter_num)
+            
+            logs.append({
+                'name': item,
+                'path': item_path,
+                'num_iterations': len(iterations)
+            })
+    
+    # Sort by name (most recent first)
+    logs.sort(key=lambda x: x['name'], reverse=True)
+    return jsonify({'logs': logs})
+
+
+@app.route('/api/get_iteration', methods=['GET'])
+def get_iteration():
+    """Get data for a specific iteration from a log directory"""
+    log_name = request.args.get('log_name')
+    iteration = request.args.get('iteration', type=int)
+    
+    if not log_name or iteration is None:
+        return jsonify({'error': 'log_name and iteration are required'}), 400
+    
+    base_dir = os.path.join(script_dir, '..', 'logs')
+    log_dir = os.path.join(base_dir, log_name)
+    
+    if not os.path.exists(log_dir):
+        return jsonify({'error': 'Log directory not found'}), 404
+    
+    # Load metadata
+    metadata_path = os.path.join(log_dir, 'metadata.json')
+    goal = ''
+    goal_description = ''
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+                goal = metadata.get('goal', '')
+                goal_description = metadata.get('goal_description', '')
+        except:
+            pass
+    
+    # Build file paths
+    iter_prefix = f'iter_{iteration:04d}'
+    detection_img = f'{iter_prefix}_detection.jpg'
+    rgb_vis_img = f'{iter_prefix}_rgb_vis.jpg'
+    explored_map_img = f'{iter_prefix}_explored_map.jpg'
+    response_txt = f'{iter_prefix}_response.txt'
+    
+    # Check which files exist
+    result = {
+        'iteration': iteration,
+        'log_name': log_name,
+        'goal': goal,
+        'goal_description': goal_description,
+        'images': {},
+        'llm_response': ''
+    }
+    
+    if os.path.exists(os.path.join(log_dir, detection_img)):
+        result['images']['detection'] = f'/logs/{log_name}/{detection_img}'
+    
+    if os.path.exists(os.path.join(log_dir, rgb_vis_img)):
+        result['images']['rgb_vis'] = f'/logs/{log_name}/{rgb_vis_img}'
+    
+    if os.path.exists(os.path.join(log_dir, explored_map_img)):
+        result['images']['explored_map'] = f'/logs/{log_name}/{explored_map_img}'
+    
+    response_path = os.path.join(log_dir, response_txt)
+    if os.path.exists(response_path):
+        with open(response_path, 'r', encoding='utf-8') as f:
+            result['llm_response'] = f.read()
+    
+    return jsonify(result)
+
+
+@app.route('/logs/<path:filepath>')
+def serve_log_file(filepath):
+    """Serve log files (images, etc.)"""
+    base_dir = os.path.join(script_dir, '..', 'logs')
+    return send_from_directory(base_dir, filepath)
+
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection"""
+    print('[SocketIO] Client connected')
+    # Send current state if available
+    if nav_state['latest_state'] is not None:
+        emit('navigation_update', nav_state['latest_state'])
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    print('[SocketIO] Client disconnected')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='LLM Navigation Flask Server')
     parser.add_argument('--port', type=int, default=1874, help='Server port')
@@ -425,14 +689,19 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     print("=" * 60)
-    print("LLM Navigation Server (Flask)")
+    print("LLM Navigation Server (Flask + SocketIO)")
     print("=" * 60)
     print(f"Starting server on {args.host}:{args.port}")
     print("\nEndpoints:")
-    print("  POST /navigation_reset - Initialize navigation")
-    print("  POST /navigation_step  - Execute navigation step")
-    print("  GET  /health          - Health check")
+    print("  GET  /                    - Visualization Dashboard")
+    print("  POST /navigation_reset    - Initialize navigation")
+    print("  POST /navigation_step     - Execute navigation step")
+    print("  GET  /health              - Health check")
+    print("  GET  /api/list_logs       - List available logs")
+    print("  GET  /api/get_iteration   - Get specific iteration data")
+    print("=" * 60)
+    print(f"\n🌐 Open dashboard: http://{args.host}:{args.port}/")
     print("=" * 60)
     
-    app.run(host=args.host, port=args.port, debug=False)
+    socketio.run(app, host=args.host, port=args.port, debug=False, allow_unsafe_werkzeug=True)
 
