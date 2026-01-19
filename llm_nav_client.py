@@ -26,8 +26,7 @@ from cv_bridge import CvBridge
 
 from sensor_msgs.msg import Image as ImageMsg, CameraInfo, JointState
 from geometry_msgs.msg import PoseStamped, Quaternion
-from nav_msgs.msg import Path
-from nav2_msgs.action import FollowPath, NavigateToPose
+from nav2_msgs.action import NavigateToPose
 
 from tf2_ros import Buffer, TransformListener, TransformException
 from scipy.spatial.transform import Rotation as R
@@ -100,8 +99,7 @@ class LLMNavClient(Node):
             JointState, '/motion_target/target_joint_state_arm_left', pub_qos
         )
         
-        # Nav2 action clients
-        self.follow_path_client = ActionClient(self, FollowPath, '/follow_path')
+        # Nav2 action client
         self.navigate_to_pose_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         
         # Sensor data buffers
@@ -291,35 +289,6 @@ class LLMNavClient(Node):
         
         self.get_logger().info('NavigateToPose completed!')
     
-    def follow_path(self, path: Path):
-        """Execute path using Nav2 FollowPath action (kept for backward compatibility)"""
-        self.get_logger().info('Waiting for FollowPath action server...')
-        if not self.follow_path_client.wait_for_server(timeout_sec=10.0):
-            raise RuntimeError('FollowPath action server not available')
-        
-        goal = FollowPath.Goal()
-        goal.path = path
-        goal.controller_id = ""
-        goal.goal_checker_id = ""
-        
-        self.get_logger().info(f'Sending FollowPath with {len(path.poses)} poses')
-        send_goal_future = self.follow_path_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_goal_future)
-        
-        goal_handle = send_goal_future.result()
-        if not goal_handle.accepted:
-            raise RuntimeError('FollowPath goal rejected')
-        
-        self.get_logger().info('Path accepted, following...')
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
-        
-        wrapped = result_future.result()
-        if wrapped.status != 4:  # SUCCEEDED
-            raise RuntimeError(f'FollowPath failed with status: {wrapped.status}')
-        
-        self.get_logger().info('FollowPath completed!')
-    
     def dict_to_pose_stamped(self, pose_dict: dict, frame_id: str = 'odom') -> PoseStamped:
         """Convert pose dict to ROS PoseStamped message"""
         ps = PoseStamped()
@@ -331,60 +300,6 @@ class LLMNavClient(Node):
         ps.pose.position.z = pose_dict['position']['z']
         ps.pose.orientation = dict_to_quaternion(pose_dict['orientation'])
         return ps
-    
-    def poses_to_path(self, poses_list: list, frame_id: str = 'odom') -> Path:
-        """Convert list of pose dicts to ROS Path message"""
-        path = Path()
-        now = self.get_clock().now().to_msg()
-        path.header.frame_id = frame_id
-        path.header.stamp = now
-        
-        for pose_dict in poses_list:
-            ps = self.dict_to_pose_stamped(pose_dict, frame_id)
-            path.poses.append(ps)
-        
-        return path
-    
-    def generate_rotation_path(self, angle_rad: float, frame_id: str = 'odom') -> Path:
-        """Generate a path for rotating the robot by angle_rad (positive = left, negative = right)"""
-        try:
-            t = rclpy.time.Time()  # latest
-            base_to_odom = self.tf_buffer.lookup_transform(
-                frame_id, self.base_frame, t, timeout=Duration(seconds=1.0)
-            )
-        except TransformException as e:
-            raise RuntimeError(f'TF lookup failed for rotation path: {e}')
-        
-        # Get current position and orientation
-        current_pos = base_to_odom.transform.translation
-        current_quat = base_to_odom.transform.rotation
-        current_quat_array = np.array([current_quat.x, current_quat.y, current_quat.z, current_quat.w])
-        
-        # Create rotation around Z-axis (yaw)
-        rotation_z = R.from_euler('z', angle_rad, degrees=False)
-        
-        # Apply rotation to current orientation
-        current_rot = R.from_quat(current_quat_array)
-        new_rot = current_rot * rotation_z
-        new_quat = new_rot.as_quat()  # [x, y, z, w]
-        
-        # Create target pose (same position, rotated orientation)
-        target_pose = {
-            'position': {
-                'x': current_pos.x,
-                'y': current_pos.y,
-                'z': current_pos.z
-            },
-            'orientation': {
-                'x': new_quat[0],
-                'y': new_quat[1],
-                'z': new_quat[2],
-                'w': new_quat[3]
-            }
-        }
-        
-        # Convert to Path
-        return self.poses_to_path([target_pose], frame_id=frame_id)
     
     # ========== Server Communication ==========
     def reset_navigation(self):
