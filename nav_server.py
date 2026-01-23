@@ -91,7 +91,7 @@ def build_goal_pose(x: float, y: float, z: float, yaw: float) -> Dict[str, Any]:
     Returns a pose dict with position and orientation
     """
     return {
-        'position': {'x': float(x), 'y': float(y), 'z': float(z)},
+            'position': {'x': float(x), 'y': float(y), 'z': float(z)},
         'orientation': yaw_to_quaternion(float(yaw))
     }
 
@@ -122,9 +122,13 @@ def navigation_reset():
     nav_state['iteration_count'] = 0
     nav_state['log_dir'] = setup_log_directory(goal, goal_description or '')
     
-    # Initialize NavAgent
+    # Initialize NavAgent (or reset if already exists)
     if nav_state['agent'] is None:
         nav_state['agent'] = NavAgent()
+        nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
+    else:
+        # Reset existing agent with new goal information
+        nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
     
     # Initialize TargetDetector
     nav_state['detector'] = TargetDetector(
@@ -133,6 +137,7 @@ def navigation_reset():
     )
     
     print(f"[Server] Navigation reset: goal='{goal}', description='{goal_description}', log_dir={nav_state['log_dir']}")
+    print(f"[Server] NavAgent reset with goal information, VLM initialized with full task briefing")
     
     return jsonify({
         'status': 'success',
@@ -157,7 +162,7 @@ def navigation_step():
     Returns JSON: {
         'action_type': 'nav_step' | 'visual_servo' | 'turn_around' | 'none',
         'goal_pose': {
-            'frame_id': 'odom',
+        'frame_id': 'odom',
             'pose': {
                 'position': {'x': float, 'y': float, 'z': float},
                 'orientation': {'x': float, 'y': float, 'z': float, 'w': float}
@@ -414,6 +419,31 @@ def navigation_step():
     
     # Prepare visualization state for Socket.IO
     log_name = os.path.basename(nav_state['log_dir'])
+    
+    # Build history by looking at saved rgb_vis files from previous iterations
+    # (VLM manages its own conversation history, we just show past visualizations)
+    history = []
+    for prev_iter in range(max(1, iteration - 3), iteration):
+        hist_img_path = f'/logs/{log_name}/iter_{prev_iter:04d}_rgb_vis.jpg'
+        hist_img_full_path = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_rgb_vis.jpg')
+        if os.path.exists(hist_img_full_path):
+            # Try to read action_type from timing file
+            action_type_str = None
+            timing_file = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_timing.json')
+            if os.path.exists(timing_file):
+                try:
+                    with open(timing_file, 'r') as f:
+                        timing_data = json.load(f)
+                        action_type_str = timing_data.get('action_type', None)
+                except:
+                    pass
+            
+            history.append({
+                'iteration': prev_iter,
+                'action': action_type_str,  # Read from timing file
+                'image_path': hist_img_path
+            })
+    
     viz_state = {
         'iteration': iteration,
         'goal': nav_state['goal'],
@@ -422,7 +452,8 @@ def navigation_step():
         'detection_score': float(score),
         'action_type': None,
         'images': {},
-        'llm_response': response if response else ''
+        'llm_response': response if response else '',
+        'history': history  # Add history to viz_state (based on saved files)
     }
     
     # Add image paths
@@ -550,6 +581,86 @@ def navigation_step():
         'finished': False,
         'timing': timing_info
     })
+
+
+@app.route('/check_stop', methods=['POST'])
+def check_stop():
+    """
+    轻量级stop检测 - 只判断是否到达目标
+    供stop detection线程调用，2Hz频率
+    
+    Request:
+        - Files: 'rgb' (JPEG)
+    
+    Returns JSON: {
+        'should_stop': bool,
+        'raw_response': str
+    }
+    """
+    global nav_state
+    
+    if nav_state['goal'] is None or nav_state['agent'] is None:
+        return jsonify({'error': 'Navigation not initialized. Call /navigation_reset first.'}), 400
+    
+    try:
+        # 加载RGB
+        rgb_file = request.files['rgb']
+        rgb_pil = Image.open(rgb_file.stream).convert('RGB')
+        rgb = np.asarray(rgb_pil)
+    except Exception as e:
+        return jsonify({'error': f'Failed to load image: {str(e)}'}), 400
+    
+    goal = nav_state['goal']
+    goal_desc = nav_state['goal_description']
+    
+    # 构建简单的yes/no prompt
+    if goal_desc:
+        prompt = (
+            f"Look at this first-person view image. "
+            f"Can you clearly see the {goal} ({goal_desc}) directly in front of the camera "
+            f"and it appears to be within arm's reach (less than 1 meter away)? "
+            f"Answer ONLY 'yes' or 'no'."
+        )
+    else:
+        prompt = (
+            f"Look at this first-person view image. "
+            f"Can you clearly see the {goal} directly in front of the camera "
+            f"and it appears to be within arm's reach (less than 1 meter away)? "
+            f"Answer ONLY 'yes' or 'no'."
+        )
+    
+    try:
+        # 调用VLM - 不使用history，max_token小
+        action_vlm = nav_state['agent'].actionVLM
+        
+        # call_chat接口: call_chat(history: int, images: list[np.array], text_prompt: str)
+        # history=0表示不使用历史对话
+        response = action_vlm.call_chat(
+            history=0,  # 不使用历史
+            images=[rgb],  # 单张图片的列表
+            text_prompt=prompt
+        )
+        
+        # 解析yes/no
+        response_lower = response.lower().strip()
+        # 判断逻辑：包含yes且不包含no（避免"no, not yet"这种情况）
+        should_stop = 'yes' in response_lower and 'no' not in response_lower
+        
+        print(f"[StopCheck] Goal: {goal}, VLM response: '{response}' -> should_stop={should_stop}")
+        
+        return jsonify({
+            'should_stop': should_stop,
+            'raw_response': response
+        })
+    
+    except Exception as e:
+        print(f"[StopCheck] VLM call failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'should_stop': False,
+            'error': str(e)
+        })
 
 
 @app.route('/health', methods=['GET'])
@@ -700,7 +811,7 @@ if __name__ == '__main__':
     print("  GET  /api/list_logs       - List available logs")
     print("  GET  /api/get_iteration   - Get specific iteration data")
     print("=" * 60)
-    print(f"\n🌐 Open dashboard: http://{args.host}:{args.port}/")
+    print(f"\nOpen dashboard: http://{args.host}:{args.port}/")
     print("=" * 60)
     
     socketio.run(app, host=args.host, port=args.port, debug=False, allow_unsafe_werkzeug=True)

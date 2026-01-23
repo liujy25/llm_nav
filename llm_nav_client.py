@@ -25,11 +25,17 @@ from PIL import Image
 from cv_bridge import CvBridge
 
 from sensor_msgs.msg import Image as ImageMsg, CameraInfo, JointState
-from geometry_msgs.msg import PoseStamped, Quaternion
+from geometry_msgs.msg import PoseStamped, Quaternion, TwistStamped
 from nav2_msgs.action import NavigateToPose
 
 from tf2_ros import Buffer, TransformListener, TransformException
 from scipy.spatial.transform import Rotation as R
+from threading import Thread, Event, Lock
+
+
+class NavigationStoppedException(Exception):
+    """Raised when navigation is stopped by stop detection"""
+    pass
 
 
 def transform_to_matrix(transform) -> np.ndarray:
@@ -98,12 +104,22 @@ class LLMNavClient(Node):
         self.left_joint_state_pub = self.create_publisher(
             JointState, '/motion_target/target_joint_state_arm_left', pub_qos
         )
+        self.chassis_speed_pub = self.create_publisher(
+            TwistStamped, '/motion_target/target_speed_chassis', pub_qos
+        )
         
         # Nav2 action client
         self.navigate_to_pose_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         
+        # Stop detection相关
+        self._stop_event = Event()
+        self._stop_lock = Lock()
+        self._stop_count = 0
+        self._stop_thread = None
+        self._navigation_active = False
+        self._current_nav_goal_handle = None
+        
         # Sensor data buffers
-        from threading import Lock
         self._lock = Lock()
         self._latest_depth_info: Optional[CameraInfo] = None
         self._latest_rgb: Optional[np.ndarray] = None
@@ -259,9 +275,28 @@ class LLMNavClient(Node):
         
         self.sleep_with_spin(1.0)
     
+    def send_zero_velocity(self):
+        """Send zero velocity to stop the robot"""
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = 0.0
+        twist.twist.linear.y = 0.0
+        twist.twist.linear.z = 0.0
+        twist.twist.angular.x = 0.0
+        twist.twist.angular.y = 0.0
+        twist.twist.angular.z = 0.0
+        
+        # 发送多次确保收到
+        for _ in range(5):
+            self.chassis_speed_pub.publish(twist)
+            time.sleep(0.02)
+        
+        self.get_logger().info('Zero velocity command sent')
+    
     # ========== Path Execution ==========
     def navigate_to_pose(self, pose_stamped: PoseStamped):
-        """Navigate to a goal pose using Nav2 NavigateToPose action"""
+        """Navigate to a goal pose using Nav2 NavigateToPose action (with cancellation support)"""
         self.get_logger().info('Waiting for NavigateToPose action server...')
         if not self.navigate_to_pose_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError('NavigateToPose action server not available')
@@ -279,15 +314,43 @@ class LLMNavClient(Node):
         if not goal_handle.accepted:
             raise RuntimeError('NavigateToPose goal rejected')
         
+        # 保存goal_handle供stop线程取消使用
+        with self._stop_lock:
+            self._current_nav_goal_handle = goal_handle
+        
         self.get_logger().info('Goal accepted, navigating...')
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
         
-        wrapped = result_future.result()
-        if wrapped.status != 4:  # SUCCEEDED
-            raise RuntimeError(f'NavigateToPose failed with status: {wrapped.status}')
+        # 循环等待：检查完成或stop事件
+        try:
+            while not result_future.done():
+                # 检查stop事件
+                if self._stop_event.is_set():
+                    self.get_logger().warn('Stop detected! Canceling navigation...')
+                    cancel_future = goal_handle.cancel_goal_async()
+                    rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=2.0)
+                    
+                    # 发送零速度确保停止
+                    self.send_zero_velocity()
+                    raise NavigationStoppedException('Navigation stopped by stop detection')
+                
+                rclpy.spin_once(self, timeout_sec=0.1)
+            
+            wrapped = result_future.result()
+            
+            # 检查状态
+            if wrapped.status == 2:  # CANCELED
+                self.get_logger().info('Navigation was canceled')
+                return
+            elif wrapped.status != 4:  # Not SUCCEEDED
+                raise RuntimeError(f'NavigateToPose failed with status: {wrapped.status}')
+            
+            self.get_logger().info('NavigateToPose completed!')
         
-        self.get_logger().info('NavigateToPose completed!')
+        finally:
+            # 清除goal_handle
+            with self._stop_lock:
+                self._current_nav_goal_handle = None
     
     def dict_to_pose_stamped(self, pose_dict: dict, frame_id: str = 'odom') -> PoseStamped:
         """Convert pose dict to ROS PoseStamped message"""
@@ -363,6 +426,80 @@ class LLMNavClient(Node):
             self.get_logger().error(f'Server request failed: {e}')
             raise
     
+    # ========== Stop Detection ==========
+    def check_stop(self, rgb: np.ndarray) -> bool:
+        """调用server检查是否应该停止"""
+        url = f'{self.server_url}/check_stop'
+        
+        # 准备RGB图像
+        rgb_pil = Image.fromarray(rgb)
+        rgb_buffer = BytesIO()
+        rgb_pil.save(rgb_buffer, format='JPEG', quality=85)
+        rgb_buffer.seek(0)
+        
+        files = {'rgb': ('rgb.jpg', rgb_buffer, 'image/jpeg')}
+        
+        try:
+            response = requests.post(url, files=files, timeout=5)
+            response.raise_for_status()
+            result = response.json()
+            should_stop = result.get('should_stop', False)
+            
+            if should_stop:
+                raw_resp = result.get('raw_response', '')
+                self.get_logger().info(f'[StopCheck] VLM says: "{raw_resp}"')
+            
+            return should_stop
+        except Exception as e:
+            self.get_logger().warn(f'[StopCheck] Request failed: {e}')
+            return False
+    
+    def stop_detection_loop(self):
+        """独立线程：2Hz检测是否到达目标"""
+        rate = 2.0  # Hz
+        interval = 1.0 / rate
+        
+        self.get_logger().info('[StopThread] Stop detection thread started (2Hz)')
+        
+        while rclpy.ok() and self._navigation_active:
+            try:
+                # 获取当前RGB
+                with self._lock:
+                    if self._latest_rgb is None:
+                        time.sleep(interval)
+                        continue
+                    rgb = np.copy(self._latest_rgb)
+                
+                # 调用server检查stop
+                should_stop = self.check_stop(rgb)
+                
+                if should_stop:
+                    with self._stop_lock:
+                        self._stop_count += 1
+                        self.get_logger().info(
+                            f'[StopThread] Stop ({self._stop_count}/2)'
+                        )
+                        
+                        if self._stop_count >= 2:
+                            self.get_logger().info('[StopThread] Stopping navigation')
+                            self._stop_event.set()
+                            
+                            # 发送零速度
+                            self.send_zero_velocity()
+                            break
+                else:
+                    with self._stop_lock:
+                        if self._stop_count > 0:
+                            self.get_logger().info('[StopThread] Reset count')
+                        self._stop_count = 0  # 重置计数
+                
+            except Exception as e:
+                self.get_logger().error(f'[StopThread] Error: {e}')
+            
+            time.sleep(interval)
+        
+        self.get_logger().info('[StopThread] Stop detection thread ended')
+    
     # ========== Main Loop ==========
     def run(self):
         """Main navigation loop"""
@@ -375,101 +512,133 @@ class LLMNavClient(Node):
         # Reset server
         self.reset_navigation()
         
-        # Main loop
-        while rclpy.ok():
-            self.iteration_count += 1
-            self.get_logger().info(f'\n=== ITERATION {self.iteration_count} ===')
-            
-            # Small delay
-            self.sleep_with_spin(2.0)
-            
-            # Get observation
-            try:
-                obs = self.get_obs_snapshot()
-            except Exception as e:
-                self.get_logger().error(f'Failed to get observation: {e}')
-                continue
-            
-            # Request decision from server with timing
-            try:
-                t_request_start = time.time()
-                result = self.request_navigation_step(obs)
-                t_request_end = time.time()
-                total_request_time = t_request_end - t_request_start
-            except Exception as e:
-                self.get_logger().error(f'Server request failed: {e}')
-                continue
-            
-            # Parse result and timing information
-            action_type = result.get('action_type', 'none')
-            goal_pose_data = result.get('goal_pose')
-            detected = result.get('detected', False)
-            score = result.get('detection_score', 0.0)
-            finished = result.get('finished', False)
-            timing_info = result.get('timing', {})
-            
-            # Calculate network transfer time
-            server_time = timing_info.get('total_server_time', 0.0)
-            network_time = total_request_time - server_time
-            
-            self.get_logger().info(f'Server response: action={action_type}, detected={detected}, score={score:.3f}')
-            self.get_logger().info(f'Timing - Total: {total_request_time:.3f}s, Server: {server_time:.3f}s, '
-                                  f'Network: {network_time:.3f}s ({network_time/total_request_time*100:.1f}%)')
-            self.get_logger().info(f'  └─ Detection: {timing_info.get("detection_time", 0.0):.3f}s, '
-                                  f'VLM Projection: {timing_info.get("vlm_projection_time", 0.0):.3f}s, '
-                                  f'VLM Inference: {timing_info.get("vlm_inference_time", 0.0):.3f}s')
-            
-            # Handle no action
-            if action_type == 'none' or goal_pose_data is None:
-                self.get_logger().warn('No action from server, continuing...')
-                continue
-            
-            # Extract goal pose
-            frame_id = goal_pose_data.get('frame_id', 'odom')
-            pose_dict = goal_pose_data.get('pose')
-            
-            if pose_dict is None:
-                self.get_logger().warn('No pose in goal_pose data, continuing...')
-                continue
-            
-            # Convert to PoseStamped
-            goal_pose_stamped = self.dict_to_pose_stamped(pose_dict, frame_id=frame_id)
-            
-            # Handle visual servo (target reached)
-            if action_type == 'visual_servo':
-                self.get_logger().info('Visual servo triggered -> navigating to final position')
-                try:
-                    self.navigate_to_pose(goal_pose_stamped)
-                    self.get_logger().info('Visual servo completed!')
-                    # self.pre_manip()
-                    self.get_logger().info('Navigation finished!')
-                    break
-                except Exception as e:
-                    self.get_logger().error(f'Failed to execute visual servo: {e}')
-                    continue
-            
-            # Handle turn around
-            if action_type == 'turn_around':
-                self.get_logger().info('Executing TURN AROUND (180 degrees)')
-                try:
-                    self.navigate_to_pose(goal_pose_stamped)
-                    self.get_logger().info('Turn around completed.')
-                except Exception as e:
-                    self.get_logger().error(f'Failed to execute turn around: {e}')
-                continue
-            
-            # Handle normal navigation step
-            if action_type == 'nav_step':
-                self.get_logger().info(f'Executing NAV STEP to ({pose_dict["position"]["x"]:.2f}, '
-                                      f'{pose_dict["position"]["y"]:.2f})')
-                try:
-                    self.navigate_to_pose(goal_pose_stamped)
-                    self.get_logger().info('Nav step completed.')
-                except Exception as e:
-                    self.get_logger().error(f'Failed to execute nav step: {e}')
-                continue
+        # 启动stop检测线程
+        self._navigation_active = True
+        self._stop_event.clear()
+        self._stop_count = 0
+        self._stop_thread = Thread(target=self.stop_detection_loop, daemon=True)
+        self._stop_thread.start()
+        self.get_logger().info('Stop detection thread launched')
         
-        self.get_logger().info('Run finished.')
+        try:
+            # Main loop
+            while rclpy.ok():
+                # 检查stop事件
+                if self._stop_event.is_set():
+                    self.get_logger().info('Navigation stopped')
+                    # self.pre_manip()  # 如果需要，可以进入manipulation姿态
+                    break
+                
+                self.iteration_count += 1
+                self.get_logger().info(f'\n=== ITERATION {self.iteration_count} ===')
+                
+                # Small delay
+                self.sleep_with_spin(2.0)
+            
+                # Get observation
+                try:
+                    obs = self.get_obs_snapshot()
+                except Exception as e:
+                    self.get_logger().error(f'Failed to get observation: {e}')
+                    continue
+                
+                # Request decision from server with timing
+                try:
+                    t_request_start = time.time()
+                    result = self.request_navigation_step(obs)
+                    t_request_end = time.time()
+                    total_request_time = t_request_end - t_request_start
+                except Exception as e:
+                    self.get_logger().error(f'Server request failed: {e}')
+                    continue
+                
+                # Parse result and timing information
+                action_type = result.get('action_type', 'none')
+                goal_pose_data = result.get('goal_pose')
+                detected = result.get('detected', False)
+                score = result.get('detection_score', 0.0)
+                finished = result.get('finished', False)
+                timing_info = result.get('timing', {})
+                
+                # Calculate network transfer time
+                server_time = timing_info.get('total_server_time', 0.0)
+                network_time = total_request_time - server_time
+                
+                self.get_logger().info(f'Server response: action={action_type}, detected={detected}, score={score:.3f}')
+                self.get_logger().info(f'Timing - Total: {total_request_time:.3f}s, Server: {server_time:.3f}s, '
+                                      f'Network: {network_time:.3f}s ({network_time/total_request_time*100:.1f}%)')
+                self.get_logger().info(f'  └─ Detection: {timing_info.get("detection_time", 0.0):.3f}s, '
+                                      f'VLM Projection: {timing_info.get("vlm_projection_time", 0.0):.3f}s, '
+                                      f'VLM Inference: {timing_info.get("vlm_inference_time", 0.0):.3f}s')
+                
+                # Handle no action
+                if action_type == 'none' or goal_pose_data is None:
+                    self.get_logger().warn('No action from server, continuing...')
+                    continue
+                
+                # Extract goal pose
+                frame_id = goal_pose_data.get('frame_id', 'odom')
+                pose_dict = goal_pose_data.get('pose')
+                
+                if pose_dict is None:
+                    self.get_logger().warn('No pose in goal_pose data, continuing...')
+                    continue
+                
+                # Convert to PoseStamped
+                goal_pose_stamped = self.dict_to_pose_stamped(pose_dict, frame_id=frame_id)
+                
+                # Handle visual servo (target reached)
+                if action_type == 'visual_servo':
+                    self.get_logger().info('Visual servo triggered -> navigating to final position')
+                    try:
+                        self.navigate_to_pose(goal_pose_stamped)
+                        self.get_logger().info('Visual servo completed!')
+                        break
+                    except NavigationStoppedException:
+                        self.get_logger().info('Visual servo stopped by stop detection')
+                        break
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to execute visual servo: {e}')
+                    continue
+                
+                # Handle turn around
+                if action_type == 'turn_around':
+                    self.get_logger().info('Executing TURN AROUND (180 degrees)')
+                    try:
+                        self.navigate_to_pose(goal_pose_stamped)
+                        self.get_logger().info('Turn around completed.')
+                    except NavigationStoppedException:
+                        self.get_logger().info('Turn around stopped by stop detection')
+                        break
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to execute turn around: {e}')
+                    continue
+                
+                # Handle normal navigation step
+                if action_type == 'nav_step':
+                    self.get_logger().info(f'Executing NAV STEP to ({pose_dict["position"]["x"]:.2f}, '
+                                          f'{pose_dict["position"]["y"]:.2f})')
+                    try:
+                        self.navigate_to_pose(goal_pose_stamped)
+                        self.get_logger().info('Nav step completed.')
+                    except NavigationStoppedException:
+                        self.get_logger().info('Nav step stopped by stop detection')
+                        break
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to execute nav step: {e}')
+                    continue
+        
+        finally:
+            # 清理：停止stop检测线程
+            self.get_logger().info('Stopping stop detection thread...')
+            self._navigation_active = False
+            if self._stop_thread and self._stop_thread.is_alive():
+                self._stop_thread.join(timeout=3.0)
+            
+            # 确保机器人停止
+            self.send_zero_velocity()
+            
+            self.get_logger().info('Navigation finished.')
 
 
 def main():

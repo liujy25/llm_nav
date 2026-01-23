@@ -85,47 +85,81 @@ class OpenAIVLM(VLM):
         """
         from openai import OpenAI
         self.name = model
-        self.client = OpenAI(
-            base_url=os.environ.get("OPENAI_BASE_URL"),
-            api_key=os.environ.get("OPENAI_API_KEY"),
-        )
+        self.client = OpenAI(api_key="EMPTY",
+                base_url="http://10.15.89.71:34134/v1/",
+                timeout=10)
         self.model = model
-        self.history = [] 
+        self.system_instruction = system_instruction  # Store system instruction
+        self.initial_prompt = None  # Will be set during reset with goal info
+        self.history = []  # Conversation history (user+assistant pairs)
         self.max_image_res = max_image_res
 
 
     def call_chat(self, history: int, images: list[np.array], text_prompt: str):
         """
         Perform context-aware inference with the OpenAI model.
+        
+        History structure:
+        1. System instruction (if provided, always at the beginning)
+        2. Initial prompt (if provided via reset(), contains full task briefing)
+        3. Recent conversation history (user+assistant pairs, limited by history parameter)
+        4. Current message
 
         Parameters
         ----------
         history : int
-            The number of environment steps to keep in context.
+            The number of recent conversation ROUNDS (user+assistant pairs) to keep in context.
+            Note: System instruction and initial prompt are always kept.
         images : list[np.array]
-            A list of RGB image arrays.
+            Current observation images (typically just one image per iteration).
         text_prompt : str
-            The text prompt to process.
+            The text prompt for current iteration (typically short).
         """
+        # Build current user message
         text_contents = [{
             "type": "text",
             "text": text_prompt
         }]
         image_contents = self._image_contents_from_images(images)
-        messages = [{"role": "user", "content": text_contents + image_contents}]
+        current_message = {"role": "user", "content": text_contents + image_contents}
+        
+        # Construct full message list for API call
+        messages = []
+        
+        # 1. Add system instruction (if available)
+        if self.system_instruction:
+            messages.append({"role": "system", "content": self.system_instruction})
+        
+        # 2. Add initial prompt as first user message (if available)
+        if self.initial_prompt:
+            messages.append({"role": "user", "content": self.initial_prompt})
+            # Add a placeholder assistant acknowledgment if this is the first iteration
+            if len(self.history) == 0:
+                messages.append({"role": "assistant", "content": "Understood. I will follow these instructions for navigation."})
+        
+        # 3. Add recent conversation history (limited by history parameter)
+        # Only keep the most recent N rounds of conversation
+        if len(self.history) > 2 * history:
+            self.history = self.history[-2 * history:]
+        messages.extend(self.history)
+        
+        # 4. Add current message
+        messages.append(current_message)
+        
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.history + messages,
+                messages=messages,
                 max_tokens=2048,
                 temperature=0.0,
             )
-            self.history.append(messages[0]) # append user message
-            self.history.append({"role": "assistant", "content": [{"type": "text", "text": response.choices[0].message.content}]}) # append response
-
-            # Manage history length based on the number of past steps to keep
-            if len(self.history) > 2 * history:
-                self.history = self.history[-2 * history:]
+            
+            # Save current interaction to history
+            self.history.append(current_message)
+            self.history.append({
+                "role": "assistant", 
+                "content": [{"type": "text", "text": response.choices[0].message.content}]
+            })
 
         except Exception as e:
             logging.error(f"OPENAI API ERROR: {e}")
@@ -141,11 +175,18 @@ class OpenAIVLM(VLM):
         if len(self.history) > 1:
             self.history = self.history[:-2]
 
-    def reset(self):
+    def reset(self, initial_prompt: str = None):
         """
-        Reset the chat history.
+        Reset the chat history and optionally set initial prompt.
+        
+        Parameters
+        ----------
+        initial_prompt : str, optional
+            Initial prompt containing task briefing (e.g., goal description, rules).
+            This will be added to history after system instruction.
         """
         self.history = []
+        self.initial_prompt = initial_prompt
 
 
     def call(self, images: list[np.array], text_prompt: str):
