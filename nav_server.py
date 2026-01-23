@@ -160,7 +160,7 @@ def navigation_step():
             'T_odom_base': JSON string, 4x4 matrix flattened (base->odom)
     
     Returns JSON: {
-        'action_type': 'nav_step' | 'visual_servo' | 'turn_around' | 'none',
+        'action_type': 'nav_step' | 'turn_around' | 'none',
         'goal_pose': {
         'frame_id': 'odom',
             'pose': {
@@ -257,128 +257,7 @@ def navigation_step():
     
     print(f"[Server] Detection: detected={detected}, score={score:.3f}, time={detection_time:.3f}s")
     
-    # Step 2: Visual Servo if detected with high confidence and within 1.5m
-    target_distance = None
-    if detected and score > 0.5:
-        # Compute target position in odom frame to check distance
-        depth_val = obs['depth']
-        K = obs['intrinsic']
-        T_cam_odom = obs['extrinsic']
-        T_odom_base = obs['base_to_odom_matrix']
-        
-        u = int(round(detection_result['center_x']))
-        v = int(round(detection_result['center_y']))
-        h, w = depth_val.shape[:2]
-        u = int(np.clip(u, 0, w - 1))
-        v = int(np.clip(v, 0, h - 1))
-        
-        d = float(depth_val[v, u])
-        
-        if d > 1e-6:
-            # Unproject to camera frame
-            fx, fy = float(K[0, 0]), float(K[1, 1])
-            cx, cy = float(K[0, 2]), float(K[1, 2])
-            x_c = (u - cx) / fx * d
-            y_c = (v - cy) / fy * d
-            z_c = d
-            p_cam = np.array([x_c, y_c, z_c, 1.0], dtype=np.float64)
-            
-            # Transform to odom frame
-            T_odom_cam = np.linalg.inv(T_cam_odom.astype(np.float64))
-            p_odom = T_odom_cam @ p_cam
-            tx, ty = float(p_odom[0]), float(p_odom[1])
-            
-            # Current base position
-            bx, by, bz = float(T_odom_base[0, 3]), float(T_odom_base[1, 3]), float(T_odom_base[2, 3])
-            
-            # Calculate distance in xy plane
-            target_distance = math.hypot(tx - bx, ty - by)
-            print(f"[Server] Target distance: {target_distance:.3f}m")
-            
-            # Only execute visual servo if target is within 1.5m
-            if target_distance <= 5.0:
-                print("[Server] Target detected within 5m -> VISUAL SERVO")
-                yaw0 = mat_to_yaw(T_odom_base)
-                
-                dx = tx - bx
-                dy = ty - by
-                norm = math.hypot(dx, dy)
-                if norm < 1e-9:
-                    norm = 1e-9
-                ux, uy = dx / norm, dy / norm
-                
-                d0 = 0.6
-                x_new = tx - d0 * ux
-                y_new = ty - d0 * uy
-                yaw_new = math.atan2(ty - y_new, tx - x_new) + math.radians(15)
-                
-                # Build goal pose
-                goal_pose = build_goal_pose(x_new, y_new, bz, yaw_new)
-                
-                # For visual_servo, we emit early since we don't have LLM response yet
-                log_name = os.path.basename(nav_state['log_dir'])
-                viz_state_early = {
-                    'iteration': iteration,
-                    'goal': nav_state['goal'],
-                    'goal_description': nav_state['goal_description'],
-                    'detected': True,
-                    'detection_score': float(score),
-                    'action_type': 'visual_servo',
-                    'target_distance': float(target_distance),
-                    'images': {},
-                    'llm_response': 'Target detected within range - executing visual servo'
-                }
-                
-                if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_detection.jpg')):
-                    viz_state_early['images']['detection'] = f'/logs/{log_name}/iter_{iteration:04d}_detection.jpg'
-                
-                nav_state['latest_state'] = viz_state_early
-                socketio.emit('navigation_update', viz_state_early)
-                
-                # Calculate total server time
-                t_server_end = time.time()
-                total_server_time = t_server_end - t_server_start
-                
-                timing_info = {
-                    'total_server_time': float(total_server_time),
-                    'detection_time': float(detection_time),
-                    'vlm_projection_time': 0.0,  # Visual servo doesn't use VLM
-                    'vlm_inference_time': 0.0
-                }
-                
-                # Save timing information for visual servo
-                timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
-                timing_data = {
-                    'iteration': iteration,
-                    'total_server_time': float(total_server_time),
-                    'detection_time': float(detection_time),
-                    'vlm_projection_time': 0.0,
-                    'vlm_inference_time': 0.0,
-                    'action_type': 'visual_servo'
-                }
-                with open(timing_path, 'w') as f:
-                    json.dump(timing_data, f, indent=2)
-                
-                print(f"[Server] Timing - Total: {total_server_time:.3f}s, Detection: {detection_time:.3f}s")
-                
-                # Return goal pose for nav2 NavigateToPose
-                return jsonify({
-                    'action_type': 'visual_servo',
-                    'goal_pose': {
-                        'frame_id': 'odom',
-                        'pose': goal_pose
-                    },
-                    'detected': True,
-                    'detection_score': score,
-                    'target_distance': target_distance,
-                    'iteration': iteration,
-                    'finished': True,
-                    'timing': timing_info
-                })
-            else:
-                print(f"[Server] Target detected but too far ({target_distance:.3f}m > 1.5m) -> LLM NAV")
-    
-    # Step 3: LLM Navigation Step
+    # Step 2: LLM Navigation Step
     print("[Server] Calling NavAgent for decision...")
     response, rgb_vis, action, nav_timing = nav_state['agent']._nav(
         obs, nav_state['goal'], iteration, goal_description=nav_state['goal_description']
@@ -614,23 +493,14 @@ def check_stop():
     goal_desc = nav_state['goal_description']
     
     # 构建简单的yes/no prompt
-    if goal_desc:
-        prompt = (
-            f"Look at this first-person view image. "
-            f"Can you clearly see the {goal} ({goal_desc}) directly in front of the camera "
-            f"and it appears to be within arm's reach (less than 1 meter away)? "
-            f"Answer ONLY 'yes' or 'no'."
-        )
-    else:
-        prompt = (
-            f"Look at this first-person view image. "
-            f"Can you clearly see the {goal} directly in front of the camera "
-            f"and it appears to be within arm's reach (less than 1 meter away)? "
-            f"Answer ONLY 'yes' or 'no'."
-        )
+    prompt = (
+        f"Your are a robot navigation agent. You are given a first-person view image and a goal. "
+        f"Look at this first-person view image. "
+        f"Do you think you have found and are close to the goal:{goal}?"
+        f"Answer ONLY 'yes' or 'no'."
+    )
     
     try:
-        # 调用VLM - 不使用history，max_token小
         action_vlm = nav_state['agent'].actionVLM
         
         # call_chat接口: call_chat(history: int, images: list[np.array], text_prompt: str)

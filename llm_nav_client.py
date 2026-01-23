@@ -587,20 +587,6 @@ class LLMNavClient(Node):
                 # Convert to PoseStamped
                 goal_pose_stamped = self.dict_to_pose_stamped(pose_dict, frame_id=frame_id)
                 
-                # Handle visual servo (target reached)
-                if action_type == 'visual_servo':
-                    self.get_logger().info('Visual servo triggered -> navigating to final position')
-                    try:
-                        self.navigate_to_pose(goal_pose_stamped)
-                        self.get_logger().info('Visual servo completed!')
-                        break
-                    except NavigationStoppedException:
-                        self.get_logger().info('Visual servo stopped by stop detection')
-                        break
-                    except Exception as e:
-                        self.get_logger().error(f'Failed to execute visual servo: {e}')
-                    continue
-                
                 # Handle turn around
                 if action_type == 'turn_around':
                     self.get_logger().info('Executing TURN AROUND (180 degrees)')

@@ -185,12 +185,11 @@ CONSTRAINTS:
 - Stay in the current room
 
 RESPONSE FORMAT:
-For each observation, think step-by-step:
+For each observation, think step-by-step and answer the following questions:
 1. What do you see? Any leads on finding the {goal.upper()}?
 2. Based on what you've seen before (I will show you your history), which direction should you go?
 3. Which action achieves that best?
-
-Finally, return your decision as: {{'action': <action_number>}}
+4. return your decision as: {{'action': <action_number>}}
 
 Remember these instructions throughout the navigation episode. I will show you observations with iteration IDs, and you should apply these rules consistently to make navigation decisions.
 """
