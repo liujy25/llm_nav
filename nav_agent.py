@@ -27,17 +27,16 @@ class NavAgent:
 
     def __init__(self, cfg=None):
         self.cfg = cfg or {}
-        self.turned = -999999
 
         # defaults
         self.cfg.setdefault('num_theta', 40)
         self.cfg.setdefault('image_edge_threshold', 0.04)
-        self.cfg.setdefault('turn_around_cooldown', 3)
         self.cfg.setdefault('clip_dist', 2.0)
         self.cfg.setdefault('vlm_history_length', 3)  # VLM keeps recent N conversation rounds
-        
+        self.cfg.setdefault('turn_angle_deg', 30.0)  # Turn left/right angle in degrees
+
+        self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
         self.clip_dist = self.cfg['clip_dist']
-        self.turn_around_cooldown = self.cfg['turn_around_cooldown']
         self.vlm_history_length = self.cfg['vlm_history_length']
         
         self._initialize_vlms()
@@ -68,23 +67,28 @@ class NavAgent:
         -------
         str
             Short iteration prompt
-        """
-        allow_turnaround = ((iter - self.turned) >= self.turn_around_cooldown) or (num_actions <= 2)
+        """        
         
-        # Short note about turn around availability
-        if allow_turnaround:
-            turnaround_note = "Turn around (action 0) is AVAILABLE if needed."
-        else:
-            turnaround_note = "Turn around (action 0) is NOT available this iteration."
-        
-        # Concise iteration prompt
+        # REASONING MODE
         iteration_prompt = (
             f"--- Iteration {iter} ---\n"
             f"Current observation: {num_actions} available actions shown.\n"
-            f"{turnaround_note}\n"
-            f"Based on the task briefing and your exploration history, which action should you take?\n"
-            f"Return {{'action': <number>}}."
+            f"\n"
+            f"Now answer the 4 questions from the task briefing:\n"
+            f"1. What do you see?\n"
+            f"2. Which direction should you go?\n"
+            f"3. Which action number?\n"
+            f"4. {{'action': <number>}}"
         )
+        # ACTION ONLY MODE
+        # iteration_prompt = (
+        #     f"--- Iteration {iter} ---\n"
+        #     f"Current observation: {num_actions} available MOVE actions shown (numbered 1..{num_actions}).\n"
+        #     f"Additionally, there are always two TURN actions:\n"
+        #     f"- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place\n"
+        #     f"- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place\n\n"
+        #     f"Now only answer the selected action number: {{'action': <number>}}"
+        # )
         return iteration_prompt
 
     def step(self, obs: dict):
@@ -114,8 +118,6 @@ class NavAgent:
         self.stopping_calls = [-2]
         self.step_ndx = 0
         self.init_pos = None
-        self.turned = -3
-        self.last_turned = False
         
         # Build initial prompt with goal information if provided
         if goal:
@@ -157,27 +159,36 @@ ROBOT CAPABILITIES:
 - Can rotate in place efficiently
 
 NAVIGATION ACTIONS:
-- Red arrows in images show potential MOVE actions
-- Each action is labeled with a NON-ZERO number in a white circle
-- The number indicates the destination waypoint you would move to
-- Action 0 is special: TURN AROUND (rotate 180° in place), NOT a move action
-- There is NO waypoint 0 for action 0
+There are two types of actions available to you:
+
+1. MOVE ACTIONS (numbered 1, 2, 3, ...):
+   - Red arrows in images show potential forward movement directions
+   - Each action is labeled with a POSITIVE number in a white circle
+   - The number indicates the destination waypoint you would move to
+   - These actions move the robot forward to new positions
+
+2. ROTATION ACTIONS (always available):
+   - Action -1: TURN LEFT by {self.turn_angle_deg:.0f}° in place (shown on left side of image)
+   - Action -2: TURN RIGHT by {self.turn_angle_deg:.0f}° in place (shown on right side of image)
+   - These actions rotate the robot without changing position
 {description_text}
 DECISION STRATEGY:
 1. Use prior knowledge about where items like {goal.upper()} are typically located in rooms
-2. Choose safe directions considering the robot's body size
-3. To check a place (desk, open area, etc.), move NEAR it first, then turn to check (avoid direct collision)
-4. Don't stay in one place too long; move to next area after checking
-5. For far destinations, explore nearby first (use actions at image edges to reveal new areas)
-6. Avoid paths near walls or obstacles
-7. Avoid turning too early during forward navigation; turning around is only for search when needed
+2. PRIORITIZE forward movement (MOVE actions) over rotation when possible
+3. Use rotation actions (TURN LEFT/RIGHT) only when you need to adjust your viewing angle
+4. Choose safe directions considering the robot's body size
+5. To check a place (desk, open area, etc.), move NEAR it first, then turn to check (avoid direct collision)
+6. Don't stay in one place too long; move to next area after checking
+7. For far destinations, explore nearby first (use actions at image edges to reveal new areas)
+8. Avoid paths near walls or obstacles
 
-TURN AROUND RULES:
-- Action 0 (TURN AROUND) may not always be available (depends on cooldown)
-- When available: If you don't see the target and have no strong lead, do NOT turn around immediately
-- First choose a safe MOVE action that reveals NEW space/viewpoints
-- Choose action 0 only if: (a) none of the MOVE actions are safe, or (b) none would reveal new space
-- When NOT available: Choose a safe MOVE action for local exploration instead
+ROTATION USAGE GUIDELINES:
+- Prefer MOVE actions for exploration (they cover more ground)
+- Use TURN LEFT/RIGHT when:
+  * You need to look around at your current position
+  * You want to check behind or beside you
+  * You need to align with a target before moving forward
+- Avoid excessive rotation; make progress through movement
 
 CONSTRAINTS:
 - You CANNOT go through closed doors
@@ -185,12 +196,21 @@ CONSTRAINTS:
 - Stay in the current room
 
 RESPONSE FORMAT:
-For each observation, think step-by-step and answer the following questions:
-1. What do you see? Any leads on finding the {goal.upper()}?
-2. Based on what you've seen before (I will show you your history), which direction should you go?
-3. Which action achieves that best?
-4. return your decision as: {{'action': <action_number>}}
+For each observation, you MUST think about ALL the following questions in order:
 
+1. What do you see? Any leads on finding the {goal.upper()}?
+   (Answer: Describe what you observe in the current view)
+
+2. Based on what you've seen before (I will show you your history), which direction should you go?
+   (Answer: Explain your navigation strategy based on history and current observation)
+
+3. Which action number achieves that direction best?
+   (Answer: State the specific action number and why you chose it)
+
+4. Final decision:
+   {{'action': <action_number>}}
+
+You MUST think about the answers to questions 1-3 before giving the final decision in step 4.
 Remember these instructions throughout the navigation episode. I will show you observations with iteration IDs, and you should apply these rules consistently to make navigation decisions.
 """
         return initial_prompt
@@ -419,7 +439,7 @@ Remember these instructions throughout the navigation episode. I will show you o
         out.sort(key=lambda x: x[1])
         return [(mag, theta) for mag, theta, _ in out]
 
-    def _projection(self, a_final: list, obs: dict, chosen_action: int = None, allow_turnaround: bool = False):
+    def _projection(self, a_final: list, obs: dict, chosen_action: int = None):
         rgb = obs['rgb'].copy()
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
@@ -434,7 +454,6 @@ Remember these instructions throughout the navigation episode. I will show you o
             intrinsics=K,
             T_cam_base=T_cam_base,
             chosen_action=chosen_action,
-            allow_turnaround=allow_turnaround,
         )
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         return projected, rgb
@@ -454,7 +473,7 @@ Remember these instructions throughout the navigation episode. I will show you o
             return (u, v)
         return None
 
-    def _project_onto_image(self, a_final, rgb_image, intrinsics, T_cam_base, chosen_action=None, allow_turnaround=False):
+    def _project_onto_image(self, a_final, rgb_image, intrinsics, T_cam_base, chosen_action=None):
         scale_factor = rgb_image.shape[0] / 1080.0
         font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -506,31 +525,65 @@ Remember these instructions throughout the navigation episode. I will show you o
         if len(a_final) > 0:
             print(f"[DEBUG] _project_onto_image: {len(a_final)} actions from _action_proposer, {projected_count} projected, {skipped_count} skipped by _can_project")
 
-        need_turnaround_button = allow_turnaround or (len(projected) <= 2)
+        # ---------- 画左转按钮 (Action -1) ----------
+        text = '-1'
+        text_size = 2.4 * scale_factor  # Same size as move actions
+        text_thickness = max(1, math.ceil(3 * scale_factor))
+        (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
 
-        if need_turnaround_button:
-            text = '0'
-            text_size = 3.1 * scale_factor
-            text_thickness = max(1, math.ceil(3 * scale_factor))
-            (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
+        circle_center_left = (math.ceil(0.05 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
+        circle_radius = max(tw, th) // 2 + max(1, math.ceil(15 * scale_factor))
 
-            circle_center = (math.ceil(0.05 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
-            circle_radius = max(tw, th) // 2 + max(1, math.ceil(15 * scale_factor))
+        if chosen_action == -1:
+            cv2.circle(rgb_image, circle_center_left, circle_radius, GREEN, -1)
+        else:
+            cv2.circle(rgb_image, circle_center_left, circle_radius, circle_color, -1)
 
-            if chosen_action == 0:
-                cv2.circle(rgb_image, circle_center, circle_radius, GREEN, -1)
-            else:
-                cv2.circle(rgb_image, circle_center, circle_radius, circle_color, -1)
+        cv2.circle(rgb_image, circle_center_left, circle_radius, RED, max(1, math.ceil(2 * scale_factor)))
 
-            cv2.circle(rgb_image, circle_center, circle_radius, RED, max(1, math.ceil(2 * scale_factor)))
+        text_position_left = (circle_center_left[0] - tw // 2, circle_center_left[1] + th // 2)
+        cv2.putText(rgb_image, text, text_position_left, font, text_size, text_color, text_thickness)
+        
+        # 添加 "TURN LEFT" 标签（放在圆圈下方）
+        label_text = 'TURN LEFT'
+        label_size = 1.8 * scale_factor
+        label_thickness = max(1, math.ceil(3 * scale_factor))  # Thicker text
+        cv2.putText(
+            rgb_image, label_text,
+            (text_position_left[0] // 2, text_position_left[1] + math.ceil(80 * scale_factor)),
+            font, label_size, RED, label_thickness
+        )
 
-            text_position = (circle_center[0] - tw // 2, circle_center[1] + th // 2)
-            cv2.putText(rgb_image, text, text_position, font, text_size, text_color, text_thickness)
-            cv2.putText(
-                rgb_image, 'TURN AROUND',
-                (text_position[0] // 2, text_position[1] + math.ceil(80 * scale_factor)),
-                font, text_size * 0.75, RED, text_thickness
-            )
+        # ---------- 画右转按钮 (Action -2) ----------
+        text = '-2'
+        (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
+
+        # Move right button further from edge to avoid text overflow
+        circle_center_right = (math.ceil(0.90 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
+        circle_radius = max(tw, th) // 2 + max(1, math.ceil(15 * scale_factor))
+
+        if chosen_action == -2:
+            cv2.circle(rgb_image, circle_center_right, circle_radius, GREEN, -1)
+        else:
+            cv2.circle(rgb_image, circle_center_right, circle_radius, circle_color, -1)
+
+        cv2.circle(rgb_image, circle_center_right, circle_radius, RED, max(1, math.ceil(2 * scale_factor)))
+
+        text_position_right = (circle_center_right[0] - tw // 2, circle_center_right[1] + th // 2)
+        cv2.putText(rgb_image, text, text_position_right, font, text_size, text_color, text_thickness)
+        
+        # 添加 "TURN RIGHT" 标签（放在圆圈下方，确保不超出边界）
+        label_text = 'TURN RIGHT'
+        label_size = 1.8 * scale_factor
+        label_thickness = max(1, math.ceil(3 * scale_factor))  # Thicker text
+        (label_w, label_h), _ = cv2.getTextSize(label_text, font, label_size, label_thickness)
+        # Right align with the circle, with some padding from right edge
+        label_x = min(circle_center_right[0] - label_w // 2, rgb_image.shape[1] - label_w - 5)
+        cv2.putText(
+            rgb_image, label_text,
+            (label_x, text_position_right[1] + math.ceil(80 * scale_factor)),
+            font, label_size, RED, label_thickness
+        )
 
         return projected
 
@@ -538,13 +591,11 @@ Remember these instructions throughout the navigation episode. I will show you o
         a_initial = self._navigability(obs)
         a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
-        allow_turnaround = ((iter - self.turned) >= self.turn_around_cooldown) or iter <= 2
-
         # Start timing for projection (image annotation)
         t_projection_start = time.time()
         
         # Generate visualization without highlighting (for initial display)
-        a_final_projected, rgb_vis = self._projection(a_final, obs, allow_turnaround=allow_turnaround)
+        a_final_projected, rgb_vis = self._projection(a_final, obs)
 
         # Only send current image (VLM manages history internally)
         images = [rgb_vis]
@@ -581,8 +632,7 @@ Remember these instructions throughout the navigation episode. I will show you o
             _, rgb_vis_final = self._projection(
                 a_final, 
                 obs, 
-                chosen_action=action_number,
-                allow_turnaround=allow_turnaround
+                chosen_action=action_number
             )
             
             # Note: No need to save to memory anymore - VLM manages its own history
@@ -593,10 +643,15 @@ Remember these instructions throughout the navigation episode. I will show you o
                 'vlm_inference_time': float(vlm_inference_time)
             }
             
-            if action_number == 0:
-                self.turned = iter
-                return response, rgb_vis_final, (0.0, 0.0), timing_info
+            # Handle rotation actions
+            if action_number == -1:
+                # Turn left: return positive angle (counter-clockwise)
+                return response, rgb_vis_final, ('turn', self.turn_angle_deg), timing_info
+            elif action_number == -2:
+                # Turn right: return negative angle (clockwise)
+                return response, rgb_vis_final, ('turn', -self.turn_angle_deg), timing_info
             else:
+                # Forward movement action
                 action = rev.get(action_number)
                 return response, rgb_vis_final, action, timing_info
         except (IndexError, KeyError, TypeError, ValueError) as e:

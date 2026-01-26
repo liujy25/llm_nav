@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Flask Server for LLM Navigation
-Server端负责推理（NavAgent + TargetDetector），返回Path或Action
+Server端负责推理（NavAgent），返回Path或Action
 """
 import os
 import sys
@@ -23,7 +23,6 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(script_dir)
 
 from nav_agent import NavAgent
-from target_detector import TargetDetector
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'llm_nav_secret_key'
@@ -32,7 +31,6 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Global state
 nav_state = {
     'agent': None,
-    'detector': None,
     'goal': None,
     'goal_description': '',
     'iteration_count': 0,
@@ -130,12 +128,6 @@ def navigation_reset():
         # Reset existing agent with new goal information
         nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
     
-    # Initialize TargetDetector
-    nav_state['detector'] = TargetDetector(
-        target_name=goal,
-        confidence_threshold=confidence_threshold
-    )
-    
     print(f"[Server] Navigation reset: goal='{goal}', description='{goal_description}', log_dir={nav_state['log_dir']}")
     print(f"[Server] NavAgent reset with goal information, VLM initialized with full task briefing")
     
@@ -150,7 +142,7 @@ def navigation_reset():
 @app.route('/navigation_step', methods=['POST'])
 def navigation_step():
     """
-    Single navigation step with detection and planning
+    Single navigation step with VLM planning
     
     Request:
         - Files: 'rgb' (JPEG/PNG), 'depth' (PNG 16-bit or NPY)
@@ -168,13 +160,10 @@ def navigation_step():
                 'orientation': {'x': float, 'y': float, 'z': float, 'w': float}
             }
         } | None,
-        'detected': bool,
-        'detection_score': float,
         'iteration': int,
         'finished': bool,
         'timing': {
             'total_server_time': float,
-            'detection_time': float,
             'vlm_projection_time': float,
             'vlm_inference_time': float
         }
@@ -244,20 +233,7 @@ def navigation_step():
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb.jpg'), bgr)
     
-    # Step 1: Target Detection
-    print(f"[Server] Running detection for '{nav_state['goal']}'...")
-    t_detection_start = time.time()
-    detection_vis_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_detection.jpg')
-    detection_result = nav_state['detector'].detect_from_cv_image(bgr, detection_vis_path)
-    t_detection_end = time.time()
-    detection_time = t_detection_end - t_detection_start
-    
-    detected = detection_result.get('detected', False)
-    score = detection_result.get('score', 0.0)
-    
-    print(f"[Server] Detection: detected={detected}, score={score:.3f}, time={detection_time:.3f}s")
-    
-    # Step 2: LLM Navigation Step
+    # LLM Navigation Step
     print("[Server] Calling NavAgent for decision...")
     response, rgb_vis, action, nav_timing = nav_state['agent']._nav(
         obs, nav_state['goal'], iteration, goal_description=nav_state['goal_description']
@@ -286,11 +262,8 @@ def navigation_step():
     # Save timing information (will be updated at the end with total time and action type)
     timing_data = {
         'iteration': iteration,
-        'detection_time': float(detection_time),
         'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
-        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0)),
-        'detected': detected,
-        'detection_score': float(score)
+        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
     }
     timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
     with open(timing_path, 'w') as f:
@@ -327,8 +300,6 @@ def navigation_step():
         'iteration': iteration,
         'goal': nav_state['goal'],
         'goal_description': nav_state['goal_description'],
-        'detected': detected,
-        'detection_score': float(score),
         'action_type': None,
         'images': {},
         'llm_response': response if response else '',
@@ -336,8 +307,6 @@ def navigation_step():
     }
     
     # Add image paths
-    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_detection.jpg')):
-        viz_state['images']['detection'] = f'/logs/{log_name}/iter_{iteration:04d}_detection.jpg'
     if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg')):
         viz_state['images']['rgb_vis'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb_vis.jpg'
     if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_explored_map.jpg')):
@@ -354,7 +323,6 @@ def navigation_step():
         
         timing_info = {
             'total_server_time': float(total_server_time),
-            'detection_time': float(detection_time),
             'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
             'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
         }
@@ -369,21 +337,17 @@ def navigation_step():
             with open(timing_path, 'w') as f:
                 json.dump(timing_data, f, indent=2)
         
-        print(f"[Server] Timing - Total: {total_server_time:.3f}s, Detection: {detection_time:.3f}s, "
+        print(f"[Server] Timing - Total: {total_server_time:.3f}s, "
               f"VLM Projection: {timing_info['vlm_projection_time']:.3f}s, "
               f"VLM Inference: {timing_info['vlm_inference_time']:.3f}s")
         
         return jsonify({
             'action_type': 'none',
             'goal_pose': None,
-            'detected': detected,
-            'detection_score': score,
             'iteration': iteration,
             'finished': False,
             'timing': timing_info
         })
-    
-    r, theta = float(action[0]), float(action[1])
     
     # Current base state
     T_odom_base = obs['base_to_odom_matrix'].astype(np.float64)
@@ -392,16 +356,26 @@ def navigation_step():
     z0 = float(T_odom_base[2, 3])
     yaw0 = mat_to_yaw(T_odom_base)
     
-    # Action = 0 -> Turn around
-    if abs(r) < 1e-9 and abs(theta) < 1e-9:
-        print("[Server] Action is TURN AROUND")
-        # Turn 180 degrees at current position
-        yaw_goal = yaw0 + math.pi
+    # Check action type: ('turn', angle) or (r, theta)
+    if isinstance(action, tuple) and len(action) == 2 and action[0] == 'turn':
+        # Rotation action: ('turn', angle_in_degrees)
+        angle_deg = float(action[1])
+        angle_rad = math.radians(angle_deg)
+        
+        if angle_deg > 0:
+            print(f"[Server] Action is TURN LEFT: {angle_deg:.1f} degrees")
+            action_type = 'turn_left'
+        else:
+            print(f"[Server] Action is TURN RIGHT: {abs(angle_deg):.1f} degrees")
+            action_type = 'turn_right'
+        
+        # Rotate at current position
+        yaw_goal = yaw0 + angle_rad
         goal_pose = build_goal_pose(x0, y0, z0, yaw_goal)
-        action_type = 'turn_around'
-
+    
     else:
-        # Normal navigation step
+        # Forward movement action: (r, theta)
+        r, theta = float(action[0]), float(action[1])
         print(f"[Server] Action is NAV STEP: r={r:.2f}, theta={theta:.2f}")
         
         dis = min(0.4, r)
@@ -428,7 +402,6 @@ def navigation_step():
     
     timing_info = {
         'total_server_time': float(total_server_time),
-        'detection_time': float(detection_time),
         'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
         'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
     }
@@ -443,7 +416,7 @@ def navigation_step():
         with open(timing_path, 'w') as f:
             json.dump(timing_data, f, indent=2)
     
-    print(f"[Server] Timing - Total: {total_server_time:.3f}s, Detection: {detection_time:.3f}s, "
+    print(f"[Server] Timing - Total: {total_server_time:.3f}s, "
           f"VLM Projection: {timing_info['vlm_projection_time']:.3f}s, "
           f"VLM Inference: {timing_info['vlm_inference_time']:.3f}s")
     
@@ -454,8 +427,6 @@ def navigation_step():
             'frame_id': 'odom',
             'pose': goal_pose
         },
-        'detected': detected,
-        'detection_score': score,
         'iteration': iteration,
         'finished': False,
         'timing': timing_info
@@ -492,13 +463,28 @@ def check_stop():
     goal = nav_state['goal']
     goal_desc = nav_state['goal_description']
     
-    # 构建简单的yes/no prompt
-    prompt = (
-        f"Your are a robot navigation agent. You are given a first-person view image and a goal. "
-        f"Look at this first-person view image. "
-        f"Do you think you have found and are close to the goal:{goal}?"
-        f"Answer ONLY 'yes' or 'no'."
-    )
+    prompt = f"""
+    You are a robot navigation stop classifier.
+
+    Goal: {goal}
+
+    Answer 'yes' ONLY when you are confident we should stop now.
+
+    There are two valid stop situations:
+
+    1) Direct stop (APPROACHABLE goal):
+    - The goal object is clearly visible (not tiny/far/ambiguous), AND
+    - It appears near (large / close-up details), AND
+    - It is reachable by driving closer (not on a tabletop/shelf/counter).
+
+    2) Furniture stop (SURFACE goal, e.g., on a table/shelf/counter or inside cabinet):
+    - The goal object is clearly visible, AND
+    - You can see the supporting furniture (tabletop / shelf / counter / cabinet) indicating the robot cannot drive right up to the object, AND
+    - You look close enough to the furniture edge (near the table/counter), even if the goal is not centered.
+
+    If unsure, if the goal is far, answer 'no'.
+    Answer ONLY 'yes' or 'no'.
+    """
     
     try:
         action_vlm = nav_state['agent'].actionVLM

@@ -212,13 +212,9 @@
             grid-column: span 2;
         }
         
-        /* Row 2: Detection spans 1 column, History spans 3 columns */
-        .content > .image-card:nth-child(3) {
-            grid-column: span 1;
-        }
-        
+        /* Row 2: History spans all 4 columns */
         .content > .history-section {
-            grid-column: span 3;
+            grid-column: span 4;
         }
         
         .history-section {
@@ -466,9 +462,6 @@
                 <div class="status-item">
                     <span>Iteration: <strong id="iterationText">0</strong></span>
                 </div>
-                <div class="status-item">
-                    <span>Detection: <strong id="detectionText">-</strong></span>
-                </div>
                 <div class="mode-switch">
                     <button class="mode-btn active" id="liveModeBtn" onclick="switchMode('live')">
                         🔴 Live
@@ -521,15 +514,7 @@
                 <div class="response-content" id="llmResponse">Waiting for data...</div>
             </div>
 
-            <!-- Row 2: Detection Result + History -->
-            <div class="image-card">
-                <h3>Detection Result</h3>
-                <div class="image-container">
-                    <img id="detectionImg" style="display: none;">
-                    <span class="image-placeholder" id="detectionPlaceholder">Waiting for data...</span>
-                </div>
-            </div>
-
+            <!-- Row 2: History -->
             <div class="history-section">
                 <h3>Decision History (Memory)</h3>
                 <div class="history-container" id="historyContainer">
@@ -608,7 +593,7 @@
 
         function clearDisplay() {
             // Clear images
-            ['detection', 'rgbVis'].forEach(name => {
+            ['rgbVis'].forEach(name => {
                 const img = document.getElementById(`${name}Img`);
                 const placeholder = document.getElementById(`${name}Placeholder`);
                 img.style.display = 'none';
@@ -723,14 +708,7 @@
                 document.getElementById('iterationText').textContent = data.iteration;
             }
             
-            if (data.detected !== undefined) {
-                const score = data.detection_score ? data.detection_score.toFixed(3) : '0.000';
-                document.getElementById('detectionText').textContent = 
-                    data.detected ? `✓ ${score}` : '✗';
-            }
-            
             // Update images
-            updateImage('detection', data.images?.detection);
             updateImage('rgbVis', data.images?.rgb_vis);
             
             // Update LLM response

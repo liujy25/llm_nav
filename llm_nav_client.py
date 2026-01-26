@@ -587,17 +587,30 @@ class LLMNavClient(Node):
                 # Convert to PoseStamped
                 goal_pose_stamped = self.dict_to_pose_stamped(pose_dict, frame_id=frame_id)
                 
-                # Handle turn around
-                if action_type == 'turn_around':
-                    self.get_logger().info('Executing TURN AROUND (180 degrees)')
+                # Handle turn left
+                if action_type == 'turn_left':
+                    self.get_logger().info('Executing TURN LEFT')
                     try:
                         self.navigate_to_pose(goal_pose_stamped)
-                        self.get_logger().info('Turn around completed.')
+                        self.get_logger().info('Turn left completed.')
                     except NavigationStoppedException:
-                        self.get_logger().info('Turn around stopped by stop detection')
+                        self.get_logger().info('Turn left stopped by stop detection')
                         break
                     except Exception as e:
-                        self.get_logger().error(f'Failed to execute turn around: {e}')
+                        self.get_logger().error(f'Failed to execute turn left: {e}')
+                    continue
+                
+                # Handle turn right
+                if action_type == 'turn_right':
+                    self.get_logger().info('Executing TURN RIGHT')
+                    try:
+                        self.navigate_to_pose(goal_pose_stamped)
+                        self.get_logger().info('Turn right completed.')
+                    except NavigationStoppedException:
+                        self.get_logger().info('Turn right stopped by stop detection')
+                        break
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to execute turn right: {e}')
                     continue
                 
                 # Handle normal navigation step
