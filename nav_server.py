@@ -127,7 +127,11 @@ def navigation_reset():
     # Build agent config with keyframe mode settings
     agent_cfg = {
         'keyframe_mode': keyframe_mode,
-        'keyframe_angle_range': keyframe_angle_range
+        'keyframe_angle_range': keyframe_angle_range,
+
+        'vlm_model': 'qwen3-vl-8b-instruct',
+        'vlm_api_key': 'sk-83be1f30087144a2a901f8f060ccf543',
+        'vlm_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     }
     
     # Initialize NavAgent (or reset if already exists)
@@ -413,7 +417,8 @@ def navigation_step():
         p_goal_odom = T_odom_base @ p_base
         xg = float(p_goal_odom[0])
         yg = float(p_goal_odom[1])
-        yawg = yaw0 + float(theta)
+        # Keep current orientation for forward movement (no rotation)
+        yawg = yaw0
         
         goal_pose = build_goal_pose(xg, yg, z0, yawg)
         action_type = 'nav_step'
@@ -502,8 +507,7 @@ def check_stop():
 
     1) Direct stop (APPROACHABLE goal):
     - The goal object is clearly visible (not tiny/far/ambiguous), AND
-    - It appears near (large / close-up details), AND
-    - It is reachable by driving closer (not on a tabletop/shelf/counter).
+    - It appears near (If you think you are less than 1 meter to it.)
 
     2) Furniture stop (SURFACE goal, e.g., on a table/shelf/counter or inside cabinet):
     - The goal object is clearly visible, AND
