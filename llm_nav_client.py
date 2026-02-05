@@ -70,18 +70,25 @@ class LLMNavClient(Node):
     - Measure and report timing (network transfer, server processing, detection, VLM)
     """
     
-    def __init__(self, goal: str, goal_description: str = "", server_url: str = "http://10.19.126.158:1874"):
+    def __init__(self, goal: str, goal_description: str = "", server_url: str = "http://10.19.126.158:1874",
+                 keyframe_mode: bool = False, keyframe_angle_range: float = 25.0):
         super().__init__('llm_nav_client')
         
         self.goal = goal
         self.goal_description = goal_description
         self.server_url = server_url.rstrip('/')
         self.iteration_count = 0
+        self.keyframe_mode = keyframe_mode
+        self.keyframe_angle_range = keyframe_angle_range
         
         self.get_logger().info(f'Goal: {self.goal}')
         if self.goal_description:
             self.get_logger().info(f'Goal Description: {self.goal_description}')
         self.get_logger().info(f'Server URL: {self.server_url}')
+        if self.keyframe_mode:
+            self.get_logger().info(f'Keyframe Mode: Enabled (angle_range={self.keyframe_angle_range}°)')
+        else:
+            self.get_logger().info(f'Keyframe Mode: Disabled')
         
         # Frame names
         self.camera_frame = 'camera_head_left_link'
@@ -371,10 +378,13 @@ class LLMNavClient(Node):
         data = {
             'goal': self.goal,
             'goal_description': self.goal_description,
-            'confidence_threshold': 0.5
+            'confidence_threshold': 0.5,
+            'keyframe_mode': self.keyframe_mode,
+            'keyframe_angle_range': self.keyframe_angle_range
         }
         
         self.get_logger().info(f'Resetting navigation on server: {url}')
+        self.get_logger().info(f'Keyframe mode: {self.keyframe_mode}, angle_range: {self.keyframe_angle_range}°')
         try:
             response = requests.post(url, json=data, timeout=10)
             response.raise_for_status()
@@ -645,10 +655,14 @@ def main():
     
     parser = argparse.ArgumentParser(description='LLM Navigation ROS2 Client')
     parser.add_argument('--goal', type=str, default=None, help='Navigation goal')
-    parser.add_argument('--goal-description', type=str, default=None, 
+    parser.add_argument('--goal-description', type=str, default=None,
                        help='Optional description of the goal location (e.g., "it may be on the green table in the corner of the room")')
-    parser.add_argument('--server', type=str, default='http://10.19.126.158:1874', 
+    parser.add_argument('--server', type=str, default='http://10.19.126.158:1874',
                        help='Server URL')
+    parser.add_argument('--keyframe-mode', action='store_true',
+                       help='Enable keyframe mode for navigation')
+    parser.add_argument('--keyframe-angle-range', type=float, default=25.0,
+                       help='Angle range for non-keyframes in degrees (default: 25.0)')
     args = parser.parse_args()
     
     print("=" * 60)
@@ -666,7 +680,13 @@ def main():
         goal_description = args.goal_description
     
     rclpy.init()
-    node = LLMNavClient(goal=goal, goal_description=goal_description, server_url=args.server)
+    node = LLMNavClient(
+        goal=goal,
+        goal_description=goal_description,
+        server_url=args.server,
+        keyframe_mode=args.keyframe_mode,
+        keyframe_angle_range=args.keyframe_angle_range
+    )
     
     try:
         node.run()

@@ -34,10 +34,28 @@ class NavAgent:
         self.cfg.setdefault('clip_dist', 2.0)
         self.cfg.setdefault('vlm_history_length', 3)  # VLM keeps recent N conversation rounds
         self.cfg.setdefault('turn_angle_deg', 30.0)  # Turn left/right angle in degrees
+        
+        # Navigability configuration (obstacle height range)
+        self.cfg.setdefault('obstacle_height_min', 0.15)  # Minimum obstacle height (m)
+        self.cfg.setdefault('obstacle_height_max', 2.0)   # Maximum obstacle height (m)
+        
+        # Prompt mode: 'reasoning' or 'action_only'
+        self.cfg.setdefault('prompt_mode', 'reasoning')  # 'reasoning' or 'action_only'
+        
+        # Keyframe mode configuration
+        self.cfg.setdefault('keyframe_mode', False)  # Enable keyframe-based navigation
+        self.cfg.setdefault('keyframe_angle_range', 25.0)  # Angle range for non-keyframes (degrees)
+        
+        # VLM configuration defaults
+        self.cfg.setdefault('vlm_model', '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/')
+        self.cfg.setdefault('vlm_api_key', 'EMPTY')
+        self.cfg.setdefault('vlm_base_url', 'http://10.15.89.71:34134/v1/')
+        self.cfg.setdefault('vlm_timeout', 10)
 
         self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
         self.clip_dist = self.cfg['clip_dist']
         self.vlm_history_length = self.cfg['vlm_history_length']
+        self.prompt_mode = self.cfg['prompt_mode']
         
         self._initialize_vlms()
         self.reset()
@@ -49,12 +67,19 @@ class NavAgent:
             "within the environment. You are only allowed to search for the goal object in the room you are in now. You cannot go to other rooms."
             "You cannot move through doors. "
         )
-        self.actionVLM = OpenAIVLM(model="/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/", system_instruction=system_instruction)
+        self.actionVLM = OpenAIVLM(
+            model=self.cfg['vlm_model'],
+            system_instruction=system_instruction,
+            api_key=self.cfg['vlm_api_key'],
+            base_url=self.cfg['vlm_base_url'],
+            timeout=self.cfg['vlm_timeout']
+        )
 
     def _construct_prompt(self, num_actions: int = 0, iter: int = 0):
         """
         Build short iteration prompt for current observation.
         The full task briefing is already in VLM's history from reset().
+        Dynamically generates different prompts based on keyframe/non-keyframe mode.
         
         Parameters
         ----------
@@ -67,28 +92,41 @@ class NavAgent:
         -------
         str
             Short iteration prompt
-        """        
+        """
         
-        # REASONING MODE
-        iteration_prompt = (
-            f"--- Iteration {iter} ---\n"
-            f"Current observation: {num_actions} available actions shown.\n"
-            f"\n"
-            f"Now answer the 4 questions from the task briefing:\n"
-            f"1. What do you see?\n"
-            f"2. Which direction should you go?\n"
-            f"3. Which action number?\n"
-            f"4. {{'action': <number>}}"
-        )
-        # ACTION ONLY MODE
-        # iteration_prompt = (
-        #     f"--- Iteration {iter} ---\n"
-        #     f"Current observation: {num_actions} available MOVE actions shown (numbered 1..{num_actions}).\n"
-        #     f"Additionally, there are always two TURN actions:\n"
-        #     f"- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place\n"
-        #     f"- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place\n\n"
-        #     f"Now only answer the selected action number: {{'action': <number>}}"
-        # )
+        # Determine prompt based on keyframe mode
+        if self.cfg['keyframe_mode'] and hasattr(self, 'is_keyframe'):
+            is_keyframe = self.is_keyframe
+        else:
+            is_keyframe = True  # Default to keyframe if mode disabled
+        
+        if is_keyframe:
+            # KEYFRAME: Use reasoning mode for comprehensive decision
+            iteration_prompt = (
+                f"--- Iteration {iter} (KEYFRAME) ---\n"
+                f"Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).\n"
+                f"Additionally, there are always two TURN actions:\n"
+                f"- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place\n"
+                f"- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place\n\n"
+                f"Please think step by step:\n"
+                f"1. What do you see? Any leads on finding the target?\n"
+                f"2. Based on what you've seen before, which direction should you go?\n"
+                f"3. Which action number achieves that direction best?\n"
+                f"4. Final decision: {{'action': <action_number>}}\n\n"
+                f"Think about questions 1-3 before giving your final decision in step 4."
+            )
+        else:
+            # NON-KEYFRAME: Use action-only mode for quick selection
+            iteration_prompt = (
+                f"--- Iteration {iter} (NON-KEYFRAME) ---\n"
+                f"Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).\n"
+                f"Additionally, there are always two TURN actions:\n"
+                f"- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place\n"
+                f"- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place\n\n"
+                f"You are continuing toward the previously selected waypoint. "
+                f"Select the best action to reach it: {{'action': <action_number>}}"
+            )
+        
         return iteration_prompt
 
     def step(self, obs: dict):
@@ -118,6 +156,12 @@ class NavAgent:
         self.stopping_calls = [-2]
         self.step_ndx = 0
         self.init_pos = None
+        
+        # Keyframe mode state
+        self.current_waypoint_P_global = None  # (x, y, z) in odom frame
+        self.is_keyframe = True  # First frame is always keyframe
+        self.keyframe_history = []  # List of keyframe records
+        self.nonkeyframe_buffer = []  # Non-keyframes since last keyframe
         
         # Build initial prompt with goal information if provided
         if goal:
@@ -162,10 +206,11 @@ NAVIGATION ACTIONS:
 There are two types of actions available to you:
 
 1. MOVE ACTIONS (numbered 1, 2, 3, ...):
-   - Red arrows in images show potential forward movement directions
-   - Each action is labeled with a POSITIVE number in a white circle
-   - The number indicates the destination waypoint you would move to
-   - These actions move the robot forward to new positions
+   - Numbered circles in the image show potential destination waypoints
+   - Each waypoint is labeled with a POSITIVE number (1, 2, 3, ...) in a circle with red border
+   - The number indicates which waypoint you would move to
+   - These waypoints represent safe, reachable positions in different directions
+   - Selecting a MOVE action will navigate the robot to that waypoint
 
 2. ROTATION ACTIONS (always available):
    - Action -1: TURN LEFT by {self.turn_angle_deg:.0f}° in place (shown on left side of image)
@@ -195,29 +240,156 @@ CONSTRAINTS:
 - You CANNOT go up or down stairs
 - Stay in the current room
 
-RESPONSE FORMAT:
-For each observation, you MUST think about ALL the following questions in order:
-
-1. What do you see? Any leads on finding the {goal.upper()}?
-   (Answer: Describe what you observe in the current view)
-
-2. Based on what you've seen before (I will show you your history), which direction should you go?
-   (Answer: Explain your navigation strategy based on history and current observation)
-
-3. Which action number achieves that direction best?
-   (Answer: State the specific action number and why you chose it)
-
-4. Final decision:
-   {{'action': <action_number>}}
-
-You MUST think about the answers to questions 1-3 before giving the final decision in step 4.
 Remember these instructions throughout the navigation episode. I will show you observations with iteration IDs, and you should apply these rules consistently to make navigation decisions.
 """
         return initial_prompt
+    
+    def get_history_summary(self):
+        """
+        Get a summary of navigation history for debugging/logging.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing history statistics
+        """
+        if not self.cfg['keyframe_mode']:
+            return {'keyframe_mode': False}
+        
+        return {
+            'keyframe_mode': True,
+            'total_keyframes': len(self.keyframe_history),
+            'nonkeyframe_buffer_size': len(self.nonkeyframe_buffer),
+            'current_waypoint_P': self.current_waypoint_P_global.tolist() if self.current_waypoint_P_global is not None else None,
+            'keyframe_iters': [kf['iter'] for kf in self.keyframe_history],
+            'nonkeyframe_iters': [nkf['iter'] for nkf in self.nonkeyframe_buffer]
+        }
 
     def cal_fov(self, intrinsics: np.ndarray, W: int):
         fx = intrinsics[0, 0]
         return 2 * np.arctan(W / (2 * fx)) * 180 / np.pi
+    
+    def _transform_waypoint_to_current_base(self, P_global, T_odom_base_current):
+        """
+        Transform waypoint P from global (odom) coordinates to current base frame.
+        
+        Parameters
+        ----------
+        P_global : np.ndarray
+            Waypoint position in odom frame (x, y, z)
+        T_odom_base_current : np.ndarray
+            Current base pose (4x4 matrix, base->odom)
+            
+        Returns
+        -------
+        r : float
+            Distance from current base to P
+        theta : float
+            Angle from current base to P (radians)
+        """
+        # Transform P from odom to current base frame
+        # T_odom_base: base->odom, so we need odom->base = inv(T_odom_base)
+        T_base_odom = np.linalg.inv(T_odom_base_current)
+        
+        # P in homogeneous coordinates
+        P_homo = np.array([P_global[0], P_global[1], P_global[2], 1.0], dtype=np.float64)
+        
+        # Transform to base frame
+        P_base = T_base_odom @ P_homo
+        
+        # Calculate r and theta in base frame (x-forward, y-left)
+        r = float(np.sqrt(P_base[0]**2 + P_base[1]**2))
+        theta = float(np.arctan2(P_base[1], P_base[0]))
+        
+        return r, theta
+    
+    def _can_project_waypoint(self, P_global, obs):
+        """
+        Check if waypoint P can be projected to current frame.
+        
+        Parameters
+        ----------
+        P_global : np.ndarray
+            Waypoint position in odom frame (x, y, z)
+        obs : dict
+            Current observation with intrinsic, extrinsic, base_to_odom_matrix
+            
+        Returns
+        -------
+        can_project : bool
+            Whether P can be projected to image
+        pixel_coords : tuple or None
+            (u, v) pixel coordinates if projectable, None otherwise
+        """
+        if P_global is None:
+            return False, None
+        
+        # Transform P to current base frame
+        r, theta = self._transform_waypoint_to_current_base(P_global, obs['base_to_odom_matrix'])
+        
+        # Try to project to image
+        K = obs['intrinsic']
+        T_cam_odom = obs['extrinsic']
+        T_odom_base = obs['base_to_odom_matrix']
+        T_cam_base = T_cam_odom @ T_odom_base
+        
+        # Check if can project (using existing method)
+        pixel_coords = self._can_project(r, theta, obs['rgb'].shape[:2], K, T_cam_base)
+        
+        if pixel_coords is not None:
+            return True, pixel_coords
+        else:
+            return False, None
+    
+    def _determine_frame_type(self, obs):
+        """
+        Determine if current frame is keyframe or non-keyframe.
+        
+        Parameters
+        ----------
+        obs : dict
+            Current observation
+            
+        Returns
+        -------
+        is_keyframe : bool
+            True if keyframe, False if non-keyframe
+        angle_range : tuple or None
+            (theta_min, theta_max) for non-keyframe, None for keyframe
+        clip_dist_override : float or None
+            Distance override for non-keyframe, None for keyframe
+        r_P : float or None
+            Distance to waypoint P in current base frame (for non-keyframe)
+        theta_P : float or None
+            Angle to waypoint P in current base frame (for non-keyframe)
+        """
+        if not self.cfg['keyframe_mode']:
+            # Keyframe mode disabled, always treat as keyframe
+            return True, None, None, None, None
+        
+        # First frame is always keyframe
+        if self.current_waypoint_P_global is None:
+            return True, None, None, None, None
+        
+        # Check if P can be projected to current frame
+        can_project, _ = self._can_project_waypoint(self.current_waypoint_P_global, obs)
+        
+        if can_project:
+            # Non-keyframe: P is visible
+            r_P, theta_P = self._transform_waypoint_to_current_base(
+                self.current_waypoint_P_global, obs['base_to_odom_matrix']
+            )
+            
+            # Calculate angle range: P ± keyframe_angle_range
+            angle_range_deg = self.cfg['keyframe_angle_range']
+            angle_range_rad = np.deg2rad(angle_range_deg)
+            theta_min = theta_P - angle_range_rad
+            theta_max = theta_P + angle_range_rad
+            
+            return False, (theta_min, theta_max), r_P, r_P, theta_P
+        else:
+            # Keyframe: P is not visible
+            return True, None, None, None, None
 
     def _global_to_grid(self, position: np.ndarray):
         dx = position[0] - self.init_pos[0]
@@ -228,11 +400,41 @@ Remember these instructions throughout the navigation episode. I will show you o
         return (x, y)
 
     def _get_navigability_mask(self, depth_image: np.ndarray, intrinsics: np.ndarray, T_cam_world: np.ndarray):
-        thresh = 0.3
+        """
+        Compute navigability mask based on obstacle height range.
+        
+        Logic: A pixel is navigable if there are NO points in the obstacle height range [min, max].
+        - If height is in [obstacle_height_min, obstacle_height_max]: obstacle (not navigable)
+        - Otherwise: navigable (either too low like ground, or too high like ceiling)
+        
+        Parameters
+        ----------
+        depth_image : np.ndarray
+            Depth image in meters
+        intrinsics : np.ndarray
+            Camera intrinsic matrix
+        T_cam_world : np.ndarray
+            Transform from world to camera (odom->cam)
+            
+        Returns
+        -------
+        navigability_mask : np.ndarray
+            Boolean mask where True = navigable, False = obstacle
+        """
         height_map = depth_to_height(depth_image, intrinsics, T_cam_world)
-        navigability_mask = np.abs(height_map - (0.0 - 0.04)) < thresh
-        navigability_mask = navigability_mask.astype(bool)
-        return navigability_mask
+        
+        # Get obstacle height range from config
+        h_min = self.cfg['obstacle_height_min']
+        h_max = self.cfg['obstacle_height_max']
+        
+        # Navigable if height is OUTSIDE the obstacle range
+        # (either below h_min like ground, or above h_max like ceiling)
+        navigability_mask = (height_map < h_min) | (height_map > h_max)
+        
+        # Also mark invalid depth as not navigable
+        navigability_mask = navigability_mask & np.isfinite(height_map)
+        
+        return navigability_mask.astype(bool)
 
     def _get_radial_distance(
         self,
@@ -242,10 +444,15 @@ Remember these instructions throughout the navigation episode. I will show you o
         depth_image: np.ndarray,
         intrinsics: np.ndarray,
         T_cam_base: np.ndarray,
+        clip_dist: float = None,
     ):
         H, W = navigability_mask.shape
+        
+        # Use provided clip_dist or fall back to self.clip_dist
+        if clip_dist is None:
+            clip_dist = self.clip_dist
 
-        agent_point_base = np.array([self.clip_dist * np.cos(theta_i), self.clip_dist * np.sin(theta_i), 0.0], dtype=np.float64)
+        agent_point_base = np.array([clip_dist * np.cos(theta_i), clip_dist * np.sin(theta_i), 0.0], dtype=np.float64)
         end_pxl = point_to_pixel(agent_point_base, intrinsics, T_cam_base)
         if end_pxl is None:
             return None, None
@@ -311,7 +518,26 @@ Remember these instructions throughout the navigation episode. I will show you o
         point = self._global_to_grid(global_coords)
         cv2.line(self.explored_map, agent_coords, point, self.explored_color, self.voxel_ray_size)
 
-    def _navigability(self, obs: dict):
+    def _navigability(self, obs: dict, angle_range=None, clip_dist_override=None):
+        """
+        Compute navigable directions.
+        
+        Parameters
+        ----------
+        obs : dict
+            Observation dictionary
+        angle_range : tuple, optional
+            (theta_min, theta_max) to limit angle search range (in radians)
+            If None, use full sensor range
+        clip_dist_override : float, optional
+            Override self.clip_dist for ray casting
+            If None, use self.clip_dist
+            
+        Returns
+        -------
+        a_initial : list
+            List of (r, theta) tuples
+        """
         rgb_image = obs['rgb'].copy()
         depth_image = obs['depth']
         K = obs['intrinsic']
@@ -327,19 +553,28 @@ Remember these instructions throughout the navigation episode. I will show you o
 
         navigability_mask = self._get_navigability_mask(depth_image, K, T_cam_odom)
 
-        sensor_range = np.deg2rad(self.fov / 2) * 1.5
-        all_thetas = np.linspace(-sensor_range, sensor_range, int(self.cfg['num_theta']))
+        # Determine angle range
+        if angle_range is not None:
+            # Use specified range
+            theta_min, theta_max = angle_range
+            all_thetas = np.linspace(theta_min, theta_max, int(self.cfg['num_theta']))
+        else:
+            # Use full sensor range
+            sensor_range = np.deg2rad(self.fov / 2) * 1.5
+            all_thetas = np.linspace(-sensor_range, sensor_range, int(self.cfg['num_theta']))
 
         start = agent_frame_to_image_coords([0.0, 0.0, 0.0], K, T_cam_base)
+        
+        # Determine clip_dist to use
+        clip_dist = clip_dist_override if clip_dist_override is not None else self.clip_dist
 
         a_initial = []
         for theta_i in all_thetas:
             r_i, theta_i = self._get_radial_distance(
-                start, theta_i, navigability_mask, depth_image, K, T_cam_base
+                start, theta_i, navigability_mask, depth_image, K, T_cam_base, clip_dist
             )
             if r_i is not None:
-                # 你原逻辑：voxel里写 r/2，action里仍返回 r（后面再 /2）
-                self._update_voxel(r_i, theta_i, T_odom_base, clip_dist=self.clip_dist, clip_frac=0.66)
+                self._update_voxel(r_i, theta_i, T_odom_base, clip_dist=clip_dist, clip_frac=0.66)
                 a_initial.append((r_i, theta_i))
 
         return a_initial
@@ -347,8 +582,6 @@ Remember these instructions throughout the navigation episode. I will show you o
     def _action_proposer(self, a_initial: list, T_odom_base: np.ndarray):
         min_angle = self.fov / 360
         explore_bias = 4
-        clip_frac = 0.66
-        clip_mag = self.clip_dist
 
         explore = explore_bias > 0
         unique = {}
@@ -372,16 +605,14 @@ Remember these instructions throughout the navigation episode. I will show you o
                 np.sum(np.all((topdown_map[yg-2:yg+2, xg] == self.explored_color), axis=-1)) +
                 np.sum(np.all(topdown_map[yg, xg-2:xg+2] == self.explored_color, axis=-1))
             )
-            arrowData.append([clip_frac * mag, theta, score < 3])
+            # 不再使用clip_frac，直接使用原始距离
+            arrowData.append([mag, theta, score < 3])
 
         arrowData.sort(key=lambda x: x[1])
         thetas = set()
         out = []
-        # Adjust filter threshold relative to clip_dist
-        # filter_thresh should be proportional to clip_dist to avoid filtering out all actions
-        # Original: 0.75 is about 0.75/2.0 = 37.5% of typical clip_dist
-        # Use a relative threshold: at least 30% of clip_dist after clip_frac
-        filter_thresh = max(0.5, clip_frac * self.clip_dist * 0.3)  # At least 0.5m or 30% of clip_dist*clip_frac
+        # 只过滤太近的点（< 0.5m）
+        filter_thresh = 0.5
         filtered = list(filter(lambda x: x[0] > filter_thresh, arrowData))
         filtered.sort(key=lambda x: x[1])
         if not filtered:
@@ -395,28 +626,29 @@ Remember these instructions throughout the navigation episode. I will show you o
                 smallest_theta = longest[1]
                 longest_ndx = f.index(longest)
 
-                out.append([min(longest[0], clip_mag), longest[1], longest[2]])
+                # 不再使用clip_mag限制
+                out.append([longest[0], longest[1], longest[2]])
                 thetas.add(longest[1])
 
                 for i in range(longest_ndx + 1, len(f)):
                     if f[i][1] - longest_theta > (min_angle * 0.9):
-                        out.append([min(f[i][0], clip_mag), f[i][1], f[i][2]])
+                        out.append([f[i][0], f[i][1], f[i][2]])
                         thetas.add(f[i][1])
                         longest_theta = f[i][1]
 
                 for i in range(longest_ndx - 1, -1, -1):
                     if smallest_theta - f[i][1] > (min_angle * 0.9):
-                        out.append([min(f[i][0], clip_mag), f[i][1], f[i][2]])
+                        out.append([f[i][0], f[i][1], f[i][2]])
                         thetas.add(f[i][1])
                         smallest_theta = f[i][1]
 
                 for r_i, theta_i, e_i in filtered:
                     if len(thetas) == 0:
-                        out.append((min(r_i, clip_mag), theta_i, e_i))
+                        out.append((r_i, theta_i, e_i))
                         thetas.add(theta_i)
                     else:
                         if theta_i not in thetas and min([abs(theta_i - t) for t in thetas]) > min_angle * explore_bias:
-                            out.append((min(r_i, clip_mag), theta_i, e_i))
+                            out.append((r_i, theta_i, e_i))
                             thetas.add(theta_i)
 
         if len(out) == 0:
@@ -424,16 +656,16 @@ Remember these instructions throughout the navigation episode. I will show you o
             longest_theta = longest[1]
             smallest_theta = longest[1]
             longest_ndx = filtered.index(longest)
-            out.append([min(longest[0], clip_mag), longest[1], longest[2]])
+            out.append([longest[0], longest[1], longest[2]])
 
             for i in range(longest_ndx + 1, len(filtered)):
                 if filtered[i][1] - longest_theta > min_angle:
-                    out.append([min(filtered[i][0], clip_mag), filtered[i][1], filtered[i][2]])
+                    out.append([filtered[i][0], filtered[i][1], filtered[i][2]])
                     longest_theta = filtered[i][1]
 
             for i in range(longest_ndx - 1, -1, -1):
                 if smallest_theta - filtered[i][1] > min_angle:
-                    out.append([min(filtered[i][0], clip_mag), filtered[i][1], filtered[i][2]])
+                    out.append([filtered[i][0], filtered[i][1], filtered[i][2]])
                     smallest_theta = filtered[i][1]
 
         out.sort(key=lambda x: x[1])
@@ -486,30 +718,50 @@ Remember these instructions throughout the navigation episode. I will show you o
         if start_px is None:
             start_px = (rgb_image.shape[1] // 2, rgb_image.shape[0] // 2)
 
-        # ---------- 先画动作箭头 1..N ----------
+        # ---------- 画waypoint圆圈 1..N（不画箭头）----------
         projected_count = 0
         skipped_count = 0
+        skipped_reasons = []
+        
         for (r_i, theta_i) in a_final:
+            # 先检查原始距离是否可以投影（用于过滤）
             end_px = self._can_project(r_i, theta_i, rgb_image.shape[:2], intrinsics, T_cam_base)
             if end_px is None:
                 skipped_count += 1
+                skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - original distance not projectable")
                 continue
+            
+            # Waypoint位置：最大距离的4/5处（80%）
+            r_waypoint = r_i * 0.8
+            
+            # 投影waypoint到图像（不做边缘检测，因为已经用原始距离检查过了）
+            H, W = rgb_image.shape[:2]
+            p_base = np.array([r_waypoint * np.cos(theta_i), r_waypoint * np.sin(theta_i), 0.0], dtype=np.float64)
+            uv = point_to_pixel(p_base, intrinsics, T_cam_base)
+            if uv is None:
+                skipped_count += 1
+                skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - waypoint projection failed")
+                continue
+            waypoint_px = (int(round(uv[0][0])), int(round(uv[0][1])))
+            
+            # 确保waypoint在图像范围内
+            if not (0 <= waypoint_px[0] < W and 0 <= waypoint_px[1] < H):
+                skipped_count += 1
+                skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - waypoint out of bounds: ({waypoint_px[0]}, {waypoint_px[1]})")
+                continue
+            
             projected_count += 1
-
             action_name = len(projected) + 1
             projected[(r_i, theta_i)] = action_name
+            print(f"[DEBUG] Projected action {action_name}: r={r_i:.2f}m, waypoint_r={r_waypoint:.2f}m, theta={np.degrees(theta_i):.1f}°, px=({waypoint_px[0]}, {waypoint_px[1]})")
 
-            cv2.arrowedLine(
-                rgb_image, tuple(start_px), tuple(end_px),
-                RED, max(1, math.ceil(5 * scale_factor)), tipLength=0.0
-            )
-
+            # 只画圆圈（不画箭头）
             text = str(action_name)
             text_size = 2.4 * scale_factor
             text_thickness = max(1, math.ceil(3 * scale_factor))
             (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
 
-            circle_center = (end_px[0], end_px[1])
+            circle_center = waypoint_px
             circle_radius = max(tw, th) // 2 + max(1, math.ceil(15 * scale_factor))
 
             if chosen_action is not None and action_name == chosen_action:
@@ -588,7 +840,20 @@ Remember these instructions throughout the navigation episode. I will show you o
         return projected
 
     def _nav(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
-        a_initial = self._navigability(obs)
+        # Determine frame type (keyframe or non-keyframe)
+        is_keyframe, angle_range, clip_dist_override, r_P, theta_P = self._determine_frame_type(obs)
+        
+        # Store frame type for prompt generation
+        self.is_keyframe = is_keyframe
+        
+        print(f"[NavAgent] Frame type: {'KEYFRAME' if is_keyframe else 'NON-KEYFRAME'}")
+        if not is_keyframe:
+            print(f"[NavAgent] Non-keyframe: P at r={r_P:.2f}m, theta={np.degrees(theta_P):.1f}°, "
+                  f"angle_range={np.degrees(angle_range[0]):.1f}° to {np.degrees(angle_range[1]):.1f}°, "
+                  f"clip_dist={clip_dist_override:.2f}m")
+        
+        # Compute navigability with appropriate parameters
+        a_initial = self._navigability(obs, angle_range=angle_range, clip_dist_override=clip_dist_override)
         a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
         # Start timing for projection (image annotation)
@@ -600,9 +865,9 @@ Remember these instructions throughout the navigation episode. I will show you o
         # Only send current image (VLM manages history internally)
         images = [rgb_vis]
 
-        # Construct short iteration prompt (full task briefing already in VLM history)
+        # Construct prompt based on frame type (keyframe uses reasoning, non-keyframe uses action-only)
         prompt = self._construct_prompt(
-            num_actions=len(a_final_projected), 
+            num_actions=len(a_final_projected),
             iter=iter
         )
         
@@ -653,6 +918,42 @@ Remember these instructions throughout the navigation episode. I will show you o
             else:
                 # Forward movement action
                 action = rev.get(action_number)
+                
+                # History management for keyframe mode
+                if self.cfg['keyframe_mode']:
+                    # Create frame record
+                    frame_record = {
+                        'iter': iter,
+                        'is_keyframe': is_keyframe,
+                        'action': action,
+                        'action_number': action_number,
+                        'response': response,
+                        'rgb_vis': rgb_vis_final.copy() if rgb_vis_final is not None else None,
+                        'timestamp': obs.get('timestamp', None)
+                    }
+                    
+                    if is_keyframe:
+                        # Save waypoint P for keyframe
+                        if action is not None:
+                            r, theta = action
+                            # Convert (r, theta) in current base frame to global (odom) coordinates
+                            T_odom_base = obs['base_to_odom_matrix']
+                            # Point in base frame
+                            p_base = np.array([r * np.cos(theta), r * np.sin(theta), 0.0, 1.0], dtype=np.float64)
+                            # Transform to odom frame
+                            p_odom = T_odom_base @ p_base
+                            self.current_waypoint_P_global = p_odom[:3]
+                            print(f"[NavAgent] Keyframe: Saved waypoint P at global position: {self.current_waypoint_P_global}")
+                        
+                        # Add to keyframe history and clear non-keyframe buffer
+                        self.keyframe_history.append(frame_record)
+                        self.nonkeyframe_buffer = []
+                        print(f"[NavAgent] History: Added keyframe (total keyframes: {len(self.keyframe_history)})")
+                    else:
+                        # Add to non-keyframe buffer
+                        self.nonkeyframe_buffer.append(frame_record)
+                        print(f"[NavAgent] History: Added non-keyframe to buffer (buffer size: {len(self.nonkeyframe_buffer)})")
+                
                 return response, rgb_vis_final, action, timing_info
         except (IndexError, KeyError, TypeError, ValueError) as e:
             print(f'Error parsing response {e}')

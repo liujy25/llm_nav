@@ -1,8 +1,5 @@
 import logging
-import os
-import torch
 import numpy as np
-import cv2
 
 from PIL import Image
 from utils import append_mime_tag, encode_image_b64, resize_image_if_needed
@@ -72,7 +69,8 @@ class OpenAIVLM(VLM):
     An implementation using models served via OpenAI API.
     """
 
-    def __init__(self, model="gpt-4o-latest", system_instruction=None, max_image_res=None):
+    def __init__(self, model="gpt-4o-latest", system_instruction=None, max_image_res=None,
+                 api_key="EMPTY", base_url="http://10.15.89.71:34134/v1/", timeout=10):
         """
         Initialize the OpenAI model with specified configuration.
 
@@ -82,12 +80,22 @@ class OpenAIVLM(VLM):
             The model version to be used.
         system_instruction : str, optional
             System instructions for model behavior.
+        max_image_res : int, optional
+            Maximum image resolution for resizing.
+        api_key : str, optional
+            API key for OpenAI client (default: "EMPTY" for local deployment).
+        base_url : str, optional
+            Base URL for OpenAI API (default: local vLLM server).
+        timeout : int, optional
+            Request timeout in seconds (default: 10).
         """
         from openai import OpenAI
         self.name = model
-        self.client = OpenAI(api_key="EMPTY",
-                base_url="http://10.15.89.71:34134/v1/",
-                timeout=10)
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout
+        )
         self.model = model
         self.system_instruction = system_instruction  # Store system instruction
         self.initial_prompt = None  # Will be set during reset with goal info

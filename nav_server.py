@@ -101,7 +101,9 @@ def navigation_reset():
     Request JSON: {
         "goal": str,  # navigation goal (e.g., "door", "chair")
         "goal_description": str,  # optional description of goal location
-        "confidence_threshold": float  # optional, default 0.5
+        "confidence_threshold": float,  # optional, default 0.5
+        "keyframe_mode": bool,  # optional, enable keyframe mode
+        "keyframe_angle_range": float  # optional, angle range for non-keyframes (degrees)
     }
     """
     global nav_state
@@ -110,6 +112,8 @@ def navigation_reset():
     goal = data.get('goal')
     goal_description = data.get('goal_description', '')
     confidence_threshold = data.get('confidence_threshold', 0.5)
+    keyframe_mode = data.get('keyframe_mode', False)
+    keyframe_angle_range = data.get('keyframe_angle_range', 25.0)
     
     if not goal:
         return jsonify({'error': 'goal is required'}), 400
@@ -120,22 +124,33 @@ def navigation_reset():
     nav_state['iteration_count'] = 0
     nav_state['log_dir'] = setup_log_directory(goal, goal_description or '')
     
+    # Build agent config with keyframe mode settings
+    agent_cfg = {
+        'keyframe_mode': keyframe_mode,
+        'keyframe_angle_range': keyframe_angle_range
+    }
+    
     # Initialize NavAgent (or reset if already exists)
     if nav_state['agent'] is None:
-        nav_state['agent'] = NavAgent()
+        nav_state['agent'] = NavAgent(cfg=agent_cfg)
         nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
     else:
-        # Reset existing agent with new goal information
+        # Update agent config and reset with new goal information
+        nav_state['agent'].cfg['keyframe_mode'] = keyframe_mode
+        nav_state['agent'].cfg['keyframe_angle_range'] = keyframe_angle_range
         nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
     
     print(f"[Server] Navigation reset: goal='{goal}', description='{goal_description}', log_dir={nav_state['log_dir']}")
+    print(f"[Server] Keyframe mode: {keyframe_mode}, angle_range: {keyframe_angle_range}°")
     print(f"[Server] NavAgent reset with goal information, VLM initialized with full task briefing")
     
     return jsonify({
         'status': 'success',
         'goal': goal,
         'goal_description': goal_description,
-        'log_dir': nav_state['log_dir']
+        'log_dir': nav_state['log_dir'],
+        'keyframe_mode': keyframe_mode,
+        'keyframe_angle_range': keyframe_angle_range
     })
 
 
@@ -259,15 +274,26 @@ def navigation_step():
     if explored_map is not None:
         cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_explored_map.jpg'), explored_map)
     
+    # Get keyframe history summary
+    history_summary = nav_state['agent'].get_history_summary()
+    
     # Save timing information (will be updated at the end with total time and action type)
     timing_data = {
         'iteration': iteration,
         'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
-        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0)),
+        'is_keyframe': history_summary.get('keyframe_mode', False) and getattr(nav_state['agent'], 'is_keyframe', True),
+        'keyframe_mode_enabled': history_summary.get('keyframe_mode', False)
     }
     timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
     with open(timing_path, 'w') as f:
         json.dump(timing_data, f, indent=2)
+    
+    # Save keyframe history summary
+    if history_summary.get('keyframe_mode', False):
+        history_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_keyframe_history.json')
+        with open(history_path, 'w') as f:
+            json.dump(history_summary, f, indent=2)
     
     # Prepare visualization state for Socket.IO
     log_name = os.path.basename(nav_state['log_dir'])
@@ -334,6 +360,7 @@ def navigation_step():
                 timing_data = json.load(f)
             timing_data['total_server_time'] = float(total_server_time)
             timing_data['action_type'] = 'none'
+            # Keyframe info already saved above
             with open(timing_path, 'w') as f:
                 json.dump(timing_data, f, indent=2)
         
@@ -413,6 +440,7 @@ def navigation_step():
             timing_data = json.load(f)
         timing_data['total_server_time'] = float(total_server_time)
         timing_data['action_type'] = action_type
+        # Keyframe info already saved above
         with open(timing_path, 'w') as f:
             json.dump(timing_data, f, indent=2)
     
