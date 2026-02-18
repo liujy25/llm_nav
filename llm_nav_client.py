@@ -401,7 +401,7 @@ class LLMNavClient(Node):
         
         # Prepare RGB image (JPEG)
         rgb = obs['rgb']
-        rgb_pil = Image.fromarray(rgb)
+        rgb_pil = Image.fromarray(rgb, mode='RGB')  # Explicitly specify RGB mode
         rgb_buffer = BytesIO()
         rgb_pil.save(rgb_buffer, format='JPEG', quality=95)
         rgb_buffer.seek(0)

@@ -129,9 +129,9 @@ def navigation_reset():
         'keyframe_mode': keyframe_mode,
         'keyframe_angle_range': keyframe_angle_range,
 
-        'vlm_model': 'qwen3-vl-8b-instruct',
-        'vlm_api_key': 'sk-83be1f30087144a2a901f8f060ccf543',
-        'vlm_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/',
+        'vlm_api_key': 'EMPTY',
+        'vlm_base_url': 'http://10.15.89.71:34134/v1/',
     }
     
     # Initialize NavAgent (or reset if already exists)
@@ -270,6 +270,11 @@ def navigation_step():
         with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_response.txt'), 'w') as f:
             f.write(response)
     
+    # Save prompt for debugging (if available in timing info)
+    if nav_timing.get('prompt'):
+        with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_prompt.txt'), 'w', encoding='utf-8') as f:
+            f.write(nav_timing['prompt'])
+    
     # Save voxel maps
     voxel_map = nav_state['agent'].voxel_map
     explored_map = nav_state['agent'].explored_map
@@ -302,29 +307,75 @@ def navigation_step():
     # Prepare visualization state for Socket.IO
     log_name = os.path.basename(nav_state['log_dir'])
     
-    # Build history by looking at saved rgb_vis files from previous iterations
-    # (VLM manages its own conversation history, we just show past visualizations)
-    history = []
-    for prev_iter in range(max(1, iteration - 3), iteration):
-        hist_img_path = f'/logs/{log_name}/iter_{prev_iter:04d}_rgb_vis.jpg'
-        hist_img_full_path = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_rgb_vis.jpg')
-        if os.path.exists(hist_img_full_path):
-            # Try to read action_type from timing file
-            action_type_str = None
-            timing_file = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_timing.json')
-            if os.path.exists(timing_file):
-                try:
-                    with open(timing_file, 'r') as f:
-                        timing_data = json.load(f)
-                        action_type_str = timing_data.get('action_type', None)
-                except:
-                    pass
+    # Build history split into current cycle and historical keyframes
+    current_cycle = []
+    historical_keyframes = []
+    
+    if history_summary.get('keyframe_mode', False):
+        full_history = history_summary.get('full_history', [])
+        
+        # Process all keyframes except the last one (which is current cycle)
+        for kf in full_history[:-1]:
+            kf_iter = kf['iter']
+            hist_img_path = f'/logs/{log_name}/iter_{kf_iter:04d}_rgb_vis.jpg'
+            hist_img_full_path = os.path.join(nav_state['log_dir'], f'iter_{kf_iter:04d}_rgb_vis.jpg')
+            if os.path.exists(hist_img_full_path):
+                historical_keyframes.append({
+                    'iteration': kf_iter,
+                    'action': kf['action_number'],
+                    'image_path': hist_img_path,
+                    'is_keyframe': True
+                })
+        
+        # Process current cycle (last keyframe + its non-keyframes)
+        if len(full_history) > 0:
+            last_kf = full_history[-1]
+            kf_iter = last_kf['iter']
+            hist_img_path = f'/logs/{log_name}/iter_{kf_iter:04d}_rgb_vis.jpg'
+            hist_img_full_path = os.path.join(nav_state['log_dir'], f'iter_{kf_iter:04d}_rgb_vis.jpg')
+            if os.path.exists(hist_img_full_path):
+                current_cycle.append({
+                    'iteration': kf_iter,
+                    'action': last_kf['action_number'],
+                    'image_path': hist_img_path,
+                    'is_keyframe': True
+                })
             
-            history.append({
-                'iteration': prev_iter,
-                'action': action_type_str,  # Read from timing file
-                'image_path': hist_img_path
-            })
+            # Add non-keyframes of current cycle
+            for nkf in last_kf.get('non_keyframes', []):
+                nkf_iter = nkf['iter']
+                hist_img_path = f'/logs/{log_name}/iter_{nkf_iter:04d}_rgb_vis.jpg'
+                hist_img_full_path = os.path.join(nav_state['log_dir'], f'iter_{nkf_iter:04d}_rgb_vis.jpg')
+                if os.path.exists(hist_img_full_path):
+                    current_cycle.append({
+                        'iteration': nkf_iter,
+                        'action': nkf['action_number'],
+                        'image_path': hist_img_path,
+                        'is_keyframe': False
+                    })
+    else:
+        # Fallback: non-keyframe mode, show last 4 iterations as current cycle
+        for prev_iter in range(max(1, iteration - 3), iteration):
+            hist_img_path = f'/logs/{log_name}/iter_{prev_iter:04d}_rgb_vis.jpg'
+            hist_img_full_path = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_rgb_vis.jpg')
+            if os.path.exists(hist_img_full_path):
+                # Try to read action_type from timing file
+                action_type_str = None
+                timing_file = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_timing.json')
+                if os.path.exists(timing_file):
+                    try:
+                        with open(timing_file, 'r') as f:
+                            timing_data = json.load(f)
+                            action_type_str = timing_data.get('action_type', None)
+                    except:
+                        pass
+                
+                current_cycle.append({
+                    'iteration': prev_iter,
+                    'action': action_type_str,
+                    'image_path': hist_img_path,
+                    'is_keyframe': False
+                })
     
     viz_state = {
         'iteration': iteration,
@@ -333,7 +384,8 @@ def navigation_step():
         'action_type': None,
         'images': {},
         'llm_response': response if response else '',
-        'history': history  # Add history to viz_state (based on saved files)
+        'current_cycle': current_cycle,
+        'historical_keyframes': historical_keyframes
     }
     
     # Add image paths
@@ -639,7 +691,9 @@ def get_iteration():
         'goal': goal,
         'goal_description': goal_description,
         'images': {},
-        'llm_response': ''
+        'llm_response': '',
+        'current_cycle': [],
+        'historical_keyframes': []
     }
     
     if os.path.exists(os.path.join(log_dir, detection_img)):
@@ -655,6 +709,79 @@ def get_iteration():
     if os.path.exists(response_path):
         with open(response_path, 'r', encoding='utf-8') as f:
             result['llm_response'] = f.read()
+    
+    # Load keyframe history if available
+    history_path = os.path.join(log_dir, f'{iter_prefix}_keyframe_history.json')
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, 'r') as f:
+                history_summary = json.load(f)
+                full_history = history_summary.get('full_history', [])
+                
+                # Process all keyframes except the last one (which is current cycle)
+                for kf in full_history[:-1]:
+                    kf_iter = kf['iter']
+                    hist_img_path = f'/logs/{log_name}/iter_{kf_iter:04d}_rgb_vis.jpg'
+                    hist_img_full_path = os.path.join(log_dir, f'iter_{kf_iter:04d}_rgb_vis.jpg')
+                    if os.path.exists(hist_img_full_path):
+                        result['historical_keyframes'].append({
+                            'iteration': kf_iter,
+                            'action': kf['action_number'],
+                            'image_path': hist_img_path,
+                            'is_keyframe': True
+                        })
+                
+                # Process current cycle (last keyframe + its non-keyframes)
+                if len(full_history) > 0:
+                    last_kf = full_history[-1]
+                    kf_iter = last_kf['iter']
+                    hist_img_path = f'/logs/{log_name}/iter_{kf_iter:04d}_rgb_vis.jpg'
+                    hist_img_full_path = os.path.join(log_dir, f'iter_{kf_iter:04d}_rgb_vis.jpg')
+                    if os.path.exists(hist_img_full_path):
+                        result['current_cycle'].append({
+                            'iteration': kf_iter,
+                            'action': last_kf['action_number'],
+                            'image_path': hist_img_path,
+                            'is_keyframe': True
+                        })
+                    
+                    # Add non-keyframes of current cycle
+                    for nkf in last_kf.get('non_keyframes', []):
+                        nkf_iter = nkf['iter']
+                        hist_img_path = f'/logs/{log_name}/iter_{nkf_iter:04d}_rgb_vis.jpg'
+                        hist_img_full_path = os.path.join(log_dir, f'iter_{nkf_iter:04d}_rgb_vis.jpg')
+                        if os.path.exists(hist_img_full_path):
+                            result['current_cycle'].append({
+                                'iteration': nkf_iter,
+                                'action': nkf['action_number'],
+                                'image_path': hist_img_path,
+                                'is_keyframe': False
+                            })
+        except Exception as e:
+            print(f"Error loading keyframe history: {e}")
+    else:
+        # Fallback: non-keyframe mode, show last 4 iterations as current cycle
+        for prev_iter in range(max(1, iteration - 3), iteration):
+            hist_img_path = f'/logs/{log_name}/iter_{prev_iter:04d}_rgb_vis.jpg'
+            hist_img_full_path = os.path.join(log_dir, f'iter_{prev_iter:04d}_rgb_vis.jpg')
+            if os.path.exists(hist_img_full_path):
+                # Try to read action_type from timing file
+                action_type_str = None
+                timing_file = os.path.join(log_dir, f'iter_{prev_iter:04d}_timing.json')
+                if os.path.exists(timing_file):
+                    try:
+                        with open(timing_file, 'r') as f:
+                            timing_data = json.load(f)
+                            action_type_str = timing_data.get('action_type', None)
+                    except:
+                        pass
+                
+                result['current_cycle'].append({
+                    'iteration': prev_iter,
+                    'action': action_type_str,
+                    'image_path': hist_img_path,
+                    'is_keyframe': False
+                })
     
     return jsonify(result)
 

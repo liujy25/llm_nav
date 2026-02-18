@@ -27,6 +27,7 @@ Thumbs.db
 # Subproject directories (separate git repos)
 NavDP/
 InternNav/
+logs/
 
 # Test output files
 test_results.json

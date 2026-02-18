@@ -3,7 +3,7 @@ import numpy as np
 
 from PIL import Image
 from utils import append_mime_tag, encode_image_b64, resize_image_if_needed
-
+from openai import OpenAI
 
 class VLM:
     """
@@ -89,7 +89,6 @@ class OpenAIVLM(VLM):
         timeout : int, optional
             Request timeout in seconds (default: 10).
         """
-        from openai import OpenAI
         self.name = model
         self.client = OpenAI(
             api_key=api_key,
@@ -169,6 +168,74 @@ class OpenAIVLM(VLM):
                 "content": [{"type": "text", "text": response.choices[0].message.content}]
             })
 
+        except Exception as e:
+            logging.error(f"OPENAI API ERROR: {e}")
+            return "OPENAI API ERROR"
+
+        return response.choices[0].message.content
+
+    def call_chat_with_custom_history(self, custom_history: list, images: list[np.array], text_prompt: str):
+        """
+        使用自定义历史调用VLM（由NavAgent控制Memory）
+        
+        这个方法允许NavAgent完全控制传递给VLM的对话历史，而不是使用self.history。
+        用于实现关键帧/非关键帧的分层Memory机制。
+        
+        Parameters
+        ----------
+        custom_history : list
+            自定义的对话历史，格式为：
+            [
+                {"role": "user", "content": [...]},
+                {"role": "assistant", "content": "..."},
+                ...
+            ]
+        images : list[np.array]
+            当前观测图片
+        text_prompt : str
+            当前prompt
+            
+        Returns
+        -------
+        str
+            VLM响应文本
+        """
+        # 构建当前用户消息
+        text_contents = [{
+            "type": "text",
+            "text": text_prompt
+        }]
+        image_contents = self._image_contents_from_images(images)
+        current_message = {"role": "user", "content": text_contents + image_contents}
+        
+        # 构建完整消息列表
+        messages = []
+        
+        # 1. 添加系统指令（如果有）
+        if self.system_instruction:
+            messages.append({"role": "system", "content": self.system_instruction})
+        
+        # 2. 添加初始prompt（如果有）
+        if self.initial_prompt:
+            messages.append({"role": "user", "content": self.initial_prompt})
+            messages.append({"role": "assistant", "content": "Understood. I will follow these instructions for navigation."})
+        
+        # 3. 添加自定义历史（关键：由NavAgent控制）
+        messages.extend(custom_history)
+        
+        # 4. 添加当前消息
+        messages.append(current_message)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=2048,
+                temperature=0.0,
+            )
+            
+            # 注意：不保存到self.history，因为Memory由NavAgent管理
+            
         except Exception as e:
             logging.error(f"OPENAI API ERROR: {e}")
             return "OPENAI API ERROR"

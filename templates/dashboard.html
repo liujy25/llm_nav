@@ -514,11 +514,19 @@
                 <div class="response-content" id="llmResponse">Waiting for data...</div>
             </div>
 
-            <!-- Row 2: History -->
+            <!-- Row 2: Current Cycle (Current Keyframe + Non-keyframes) -->
             <div class="history-section">
-                <h3>Decision History (Memory)</h3>
-                <div class="history-container" id="historyContainer">
-                    <div class="history-empty">No history available yet...</div>
+                <h3>Current Cycle (当前周期)</h3>
+                <div class="history-container" id="currentCycleContainer">
+                    <div class="history-empty">No current cycle data yet...</div>
+                </div>
+            </div>
+            
+            <!-- Row 3: Historical Keyframes -->
+            <div class="history-section">
+                <h3>Historical Keyframes (历史关键帧)</h3>
+                <div class="history-container" id="historicalKeyframesContainer">
+                    <div class="history-empty">No historical keyframes yet...</div>
                 </div>
             </div>
         </div>
@@ -610,8 +618,10 @@
             document.getElementById('descriptionInfo').style.display = 'none';
             
             // Clear history
-            document.getElementById('historyContainer').innerHTML = 
-                '<div class="history-empty">No history available yet...</div>';
+            document.getElementById('currentCycleContainer').innerHTML =
+                '<div class="history-empty">No current cycle data yet...</div>';
+            document.getElementById('historicalKeyframesContainer').innerHTML =
+                '<div class="history-empty">No historical keyframes yet...</div>';
         }
 
         function loadLogs() {
@@ -719,53 +729,72 @@
                 responseDiv.scrollTop = responseDiv.scrollHeight;
             }
             
-            // Update history
-            updateHistory(data.history);
+            // Update history (split into current cycle and historical keyframes)
+            updateHistory(data.current_cycle, data.historical_keyframes);
         }
         
-        function updateHistory(history) {
-            const container = document.getElementById('historyContainer');
-            
-            if (!history || history.length === 0) {
-                container.innerHTML = '<div class="history-empty">No history available yet...</div>';
-                return;
+        function updateHistory(currentCycle, historicalKeyframes) {
+            // Update current cycle container
+            const currentCycleContainer = document.getElementById('currentCycleContainer');
+            if (!currentCycle || currentCycle.length === 0) {
+                currentCycleContainer.innerHTML = '<div class="history-empty">No current cycle data yet...</div>';
+            } else {
+                currentCycleContainer.innerHTML = '';
+                currentCycle.forEach((item) => {
+                    currentCycleContainer.appendChild(createHistoryItem(item));
+                });
+                currentCycleContainer.scrollLeft = currentCycleContainer.scrollWidth;
             }
             
-            // Clear container
-            container.innerHTML = '';
+            // Update historical keyframes container
+            const historicalContainer = document.getElementById('historicalKeyframesContainer');
+            if (!historicalKeyframes || historicalKeyframes.length === 0) {
+                historicalContainer.innerHTML = '<div class="history-empty">No historical keyframes yet...</div>';
+            } else {
+                historicalContainer.innerHTML = '';
+                historicalKeyframes.forEach((item) => {
+                    historicalContainer.appendChild(createHistoryItem(item));
+                });
+                historicalContainer.scrollLeft = historicalContainer.scrollWidth;
+            }
+        }
+        
+        function createHistoryItem(item) {
+            const historyItem = document.createElement('div');
+            historyItem.className = 'history-item';
             
-            // Add history items in chronological order
-            history.forEach((item, index) => {
-                const historyItem = document.createElement('div');
-                historyItem.className = 'history-item';
-                
-                const header = document.createElement('div');
-                header.className = 'history-item-header';
-                header.innerHTML = `
-                    <span class="iteration">Iter #${item.iteration}</span>
-                    <span class="action">Action ${item.action}</span>
-                `;
-                
-                const img = document.createElement('img');
-                img.className = 'history-item-image';
-                img.src = item.image_path + '?t=' + new Date().getTime();
-                img.alt = `History iteration ${item.iteration}`;
-                img.onerror = function() {
-                    this.style.display = 'none';
-                    const placeholder = document.createElement('div');
-                    placeholder.className = 'history-empty';
-                    placeholder.style.padding = '20px';
-                    placeholder.textContent = 'Image not available';
-                    this.parentNode.appendChild(placeholder);
-                };
-                
-                historyItem.appendChild(header);
-                historyItem.appendChild(img);
-                container.appendChild(historyItem);
-            });
+            const header = document.createElement('div');
+            header.className = 'history-item-header';
             
-            // Auto scroll to the right (most recent)
-            container.scrollLeft = container.scrollWidth;
+            // Add frame type indicator (keyframe or non-keyframe)
+            const frameType = item.is_keyframe ? 'K' : 'N';
+            const frameTypeColor = item.is_keyframe ? '#667eea' : '#4caf50';
+            
+            header.innerHTML = `
+                <span class="iteration">
+                    <span style="background: ${frameTypeColor}; padding: 2px 6px; border-radius: 3px; margin-right: 4px;">${frameType}</span>
+                    Iter #${item.iteration}
+                </span>
+                <span class="action">Action ${item.action}</span>
+            `;
+            
+            const img = document.createElement('img');
+            img.className = 'history-item-image';
+            img.src = item.image_path + '?t=' + new Date().getTime();
+            img.alt = `History iteration ${item.iteration}`;
+            img.onerror = function() {
+                this.style.display = 'none';
+                const placeholder = document.createElement('div');
+                placeholder.className = 'history-empty';
+                placeholder.style.padding = '20px';
+                placeholder.textContent = 'Image not available';
+                this.parentNode.appendChild(placeholder);
+            };
+            
+            historyItem.appendChild(header);
+            historyItem.appendChild(img);
+            
+            return historyItem;
         }
 
         function updateImage(name, url) {
