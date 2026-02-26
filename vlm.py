@@ -232,6 +232,76 @@ class OpenAIVLM(VLM):
             "name": tool_name,
             "content": result_content
         })
+    
+    def get_conversation_history(self) -> str:
+        """
+        获取纯文本格式的对话历史（不含图片）
+        
+        Returns
+        -------
+        str
+            格式化的对话历史文本
+        """
+        lines = []
+        
+        # 添加系统指令
+        if self.system_instruction:
+            lines.append("=" * 80)
+            lines.append("SYSTEM INSTRUCTION")
+            lines.append("=" * 80)
+            lines.append(self.system_instruction)
+            lines.append("")
+        
+        # 添加初始prompt
+        if self.initial_prompt:
+            lines.append("=" * 80)
+            lines.append("INITIAL PROMPT")
+            lines.append("=" * 80)
+            lines.append(self.initial_prompt)
+            lines.append("")
+        
+        # 添加对话历史
+        lines.append("=" * 80)
+        lines.append("CONVERSATION HISTORY")
+        lines.append("=" * 80)
+        
+        for i, msg in enumerate(self.conversation_history):
+            role = msg.get("role", "unknown")
+            lines.append(f"\n[{i+1}] {role.upper()}")
+            lines.append("-" * 80)
+            
+            if role == "user":
+                # 提取文本内容（跳过图片）
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if item.get("type") == "text":
+                            lines.append(item.get("text", ""))
+                else:
+                    lines.append(str(content))
+            
+            elif role == "assistant":
+                # Assistant响应
+                content = msg.get("content", "")
+                if content:
+                    lines.append(content)
+                
+                # Tool calls
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    lines.append("\nTOOL CALLS:")
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        lines.append(f"  - {func.get('name')}({func.get('arguments', '')})")
+            
+            elif role == "tool":
+                # Tool结果
+                tool_name = msg.get("name", "unknown")
+                content = msg.get("content", "")
+                lines.append(f"Tool: {tool_name}")
+                lines.append(f"Result: {content}")
+        
+        return "\n".join(lines)
 
     def call_chat(self, history: int, images: list[np.array], text_prompt: str):
         """
@@ -272,14 +342,14 @@ class OpenAIVLM(VLM):
         if self.initial_prompt:
             messages.append({"role": "user", "content": self.initial_prompt})
             # Add a placeholder assistant acknowledgment if this is the first iteration
-            if len(self.history) == 0:
+            if len(self.conversation_history) == 0:
                 messages.append({"role": "assistant", "content": "Understood. I will follow these instructions for navigation."})
         
         # 3. Add recent conversation history (limited by history parameter)
         # Only keep the most recent N rounds of conversation
-        if len(self.history) > 2 * history:
-            self.history = self.history[-2 * history:]
-        messages.extend(self.history)
+        if len(self.conversation_history) > 2 * history:
+            self.conversation_history = self.conversation_history[-2 * history:]
+        messages.extend(self.conversation_history)
         
         # 4. Add current message
         messages.append(current_message)
@@ -293,9 +363,9 @@ class OpenAIVLM(VLM):
             )
             
             # Save current interaction to history
-            self.history.append(current_message)
-            self.history.append({
-                "role": "assistant", 
+            self.conversation_history.append(current_message)
+            self.conversation_history.append({
+                "role": "assistant",
                 "content": [{"type": "text", "text": response.choices[0].message.content}]
             })
 
@@ -378,8 +448,8 @@ class OpenAIVLM(VLM):
         """
         Rewind the chat history by one step.
         """
-        if len(self.history) > 1:
-            self.history = self.history[:-2]
+        if len(self.conversation_history) > 1:
+            self.conversation_history = self.conversation_history[:-2]
 
     def reset(self, initial_prompt: str = None):
         """

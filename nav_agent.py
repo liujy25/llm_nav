@@ -7,12 +7,19 @@ import ast
 from collections import deque
 
 from vlm import OpenAIVLM
+from obstacle_map import ObstacleMap
 from utils import (
     GREEN, RED, BLACK, WHITE, GREY,
     point_to_pixel, agent_frame_to_image_coords,
     unproject_2d, local_to_global_matrix,
     find_intersections, depth_to_height, put_text_on_image
 )
+
+
+def mat_to_yaw(T_4x4: np.ndarray) -> float:
+    """Extract yaw from 4x4 transformation matrix"""
+    Rm = T_4x4[:3, :3].astype(np.float64)
+    return math.atan2(Rm[1, 0], Rm[0, 0])
 
 
 class NavAgent:
@@ -32,6 +39,7 @@ class NavAgent:
         self.cfg.setdefault('num_theta', 40)
         self.cfg.setdefault('image_edge_threshold', 0.04)
         self.cfg.setdefault('clip_dist', 2.0)
+        self.cfg.setdefault('turn_angle_deg', 30.0)  # Turn left/right angle in degrees
         
         # Navigability configuration (obstacle height range)
         self.cfg.setdefault('obstacle_height_min', 0.15)  # Minimum obstacle height (m)
@@ -45,8 +53,13 @@ class NavAgent:
         self.cfg.setdefault('vlm_api_key', 'EMPTY')
         self.cfg.setdefault('vlm_base_url', 'http://10.15.89.71:34134/v1/')
         self.cfg.setdefault('vlm_timeout', 10)
+        
+        # ObstacleMap configuration
+        self.cfg.setdefault('agent_radius', 0.3)  # Robot radius in meters
+        self.cfg.setdefault('frontier_area_thresh', 3.0)  # Minimum frontier area in m^2
 
         self.clip_dist = self.cfg['clip_dist']
+        self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
         
         # Initialize goal attributes (will be set properly in reset())
         self.goal = None
@@ -55,6 +68,19 @@ class NavAgent:
         # Waypoint管理
         self.waypoint_registry = {}  # {wp_id: {'pos': np.array, 'rgb': np.array, 'iter': int, 'yaw': float}}
         self.next_wp_id = 1
+        
+        # Frontier管理（单个step内全局一致的ID）
+        self.frontier_registry = {}  # {frontier_id: (x, y)}
+        
+        # Initialize ObstacleMap for frontier-based navigation
+        self.obstacle_map = ObstacleMap(
+            min_height=self.cfg['obstacle_height_min'],
+            max_height=self.cfg['obstacle_height_max'],
+            agent_radius=self.cfg['agent_radius'],
+            area_thresh=self.cfg['frontier_area_thresh'],
+            size=self.map_size,
+            pixels_per_meter=self.scale,
+        )
         
         self._initialize_vlms()
         self.reset()
@@ -73,6 +99,21 @@ class NavAgent:
             timeout=self.cfg['vlm_timeout']
         )
 
+    def get_history_summary(self):
+        """
+        Get a summary of navigation history for debugging/logging.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing history statistics (simplified for Function Call mode)
+        """
+        return {
+            'keyframe_mode': False,  # Function Call mode doesn't use keyframes
+            'total_waypoints': len(self.waypoint_registry),
+            'waypoint_ids': list(self.waypoint_registry.keys())
+        }
+    
     def step(self, obs: dict):
         if self.step_ndx == 0:
             self.init_pos = obs['base_to_odom_matrix'][:3, 3]
@@ -94,8 +135,6 @@ class NavAgent:
         goal_description : str, optional
             Additional description about the goal location
         """
-        self.voxel_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
-        self.explored_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         self.scale = 100
         self.step_ndx = 0
         self.init_pos = None
@@ -107,6 +146,12 @@ class NavAgent:
         # Reset waypoint registry
         self.waypoint_registry = {}
         self.next_wp_id = 1
+        
+        # Reset frontier registry
+        self.frontier_registry = {}
+        
+        # Reset ObstacleMap
+        self.obstacle_map.reset()
         
         # Build initial prompt with goal information if provided
         if goal:
@@ -143,89 +188,135 @@ class NavAgent:
 OBJECTIVE: Navigate to the nearest {goal.upper()} and get as close to it as possible.
 
 ROBOT CAPABILITIES:
-- You have an RGB camera for observation
-- Omnidirectional (omni-wheel) base with small turning radius
-- Can rotate in place efficiently
-
-NAVIGATION ACTIONS:
-There are two types of actions available to you:
-
-1. MOVE ACTIONS (numbered 1, 2, 3, ...):
-   - Numbered circles in the image show potential destination waypoints
-   - Each waypoint is labeled with a POSITIVE number (1, 2, 3, ...) in a circle with red border
-   - The number indicates which waypoint you would move to
-   - These waypoints represent safe, reachable positions in different directions
-   - Selecting a MOVE action will navigate the robot to that waypoint
-
-2. ROTATION ACTIONS (always available):
-   - Action -1: TURN LEFT by {self.turn_angle_deg:.0f}° in place (shown on left side of image)
-   - Action -2: TURN RIGHT by {self.turn_angle_deg:.0f}° in place (shown on right side of image)
-   - These actions rotate the robot without changing position
+- RGB camera for first-person observation
+- Bird's-eye view (BEV) map showing explored areas
+- Omnidirectional base with efficient turning
+- Can revisit previously explored locations
 {description_text}
-DECISION STRATEGY:
-1. Use prior knowledge about where items like {goal.upper()} are typically located in rooms
-2. PRIORITIZE forward movement (MOVE actions) over rotation when possible
-3. Use rotation actions (TURN LEFT/RIGHT) only when you need to adjust your viewing angle
-4. Choose safe directions considering the robot's body size
-5. To check a place (desk, open area, etc.), move NEAR it first, then turn to check (avoid direct collision)
-6. Don't stay in one place too long; move to next area after checking
-7. For far destinations, explore nearby first (use actions at image edges to reveal new areas)
-8. Avoid paths near walls or obstacles
+VISUAL INFORMATION YOU WILL RECEIVE:
+1. BEV Map (Bird's-Eye View):
+   - Red circle = YOUR current position
+   - Blue circles with numbers = Historical waypoints you've visited
+   - Green dots = Frontiers (boundaries between explored and unexplored areas)
+   - Use this for global navigation planning
 
-ROTATION USAGE GUIDELINES:
-- Prefer MOVE actions for exploration (they cover more ground)
-- Use TURN LEFT/RIGHT when:
-  * You need to look around at your current position
-  * You want to check behind or beside you
-  * You need to align with a target before moving forward
-- Avoid excessive rotation; make progress through movement
+2. Current RGB View (First-Person Camera):
+   - Green circles with numbers = Visible frontiers you can navigate to
+   - Frontier IDs are consistent across all views
+   - These are exploration targets leading to new areas
+
+AVAILABLE ACTIONS:
+1. SELECT FRONTIER: Navigate to a visible frontier to explore new area
+   - Format: {{"action": "frontier", "id": <frontier_id>}}
+   - Frontiers lead to unexplored areas
+   - Prioritize frontiers that might lead toward the goal
+
+2. VIEW WAYPOINT: Check RGB view from a historical waypoint
+   - Use function: get_waypoint_rgb(wp_ids=[<id1>, <id2>, ...])
+   - Helps recall what you saw at that location
+   - Waypoint views also show visible frontiers with consistent IDs
+
+3. GO TO WAYPOINT: Navigate back to a historical waypoint
+   - Use function: go_to(wp_id=<id>)
+   - Useful for strategic repositioning or revisiting areas
+
+DECISION STRATEGY:
+1. Use prior knowledge about where {goal.upper()} is typically located
+2. PRIORITIZE exploring new frontiers over revisiting waypoints
+3. Use BEV map to understand global layout and avoid redundant exploration
+4. Check waypoint views if you need to recall specific areas
+5. Consider frontier directions that align with likely goal locations
+6. Balance between systematic exploration and goal-directed search
 
 CONSTRAINTS:
 - You CANNOT go through closed doors
 - You CANNOT go up or down stairs
-- Stay in the current room
+- Stay in the current room/floor
 
-Remember these instructions throughout the navigation episode. I will show you observations with iteration IDs, and you should apply these rules consistently to make navigation decisions.
+Remember these instructions throughout the navigation episode. Each iteration will show you updated BEV map and current view with frontier options.
 """
         return initial_prompt
     
-    def _generate_bev_with_waypoints(self, current_pos: np.ndarray) -> np.ndarray:
+    def _generate_bev_with_waypoints(self, current_pos: np.ndarray, frontiers: list = None) -> np.ndarray:
         """
-        生成标注了历史waypoints的BEV地图
+        生成标注了历史waypoints和当前frontiers的BEV地图（使用ObstacleMap）
         
         Parameters
         ----------
         current_pos : np.ndarray
             当前机器人位置（odom坐标系）
+        frontiers : list, optional
+            当前所有frontier点的全局坐标列表 [(x, y), ...]
             
         Returns
         -------
         np.ndarray
             标注后的BEV图像（RGB）
         """
-        # 复制explored_map作为基础
-        bev = self.explored_map.copy()
+        # 使用obstacle_map的可视化作为基础
+        bev = self.obstacle_map.visualize(robot_pos=current_pos[:2])
         
-        # 标注当前位置（红色大圆）
-        current_grid = self._global_to_grid(current_pos)
-        cv2.circle(bev, current_grid, 30, RED, -1)
-        cv2.putText(bev, "YOU", (current_grid[0]-20, current_grid[1]-35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, RED, 2)
+        # 先绘制frontiers（绿色小圆点）
+        if frontiers is not None and len(frontiers) > 0:
+            GREEN = (0, 255, 0)  # BGR格式
+            for frontier_xy in frontiers:
+                frontier_px = self.obstacle_map._xy_to_px(np.array([frontier_xy]))[0]
+                cv2.circle(bev, tuple(frontier_px.astype(int)), 5, GREEN, -1)  # 绿色填充
+                cv2.circle(bev, tuple(frontier_px.astype(int)), 5, WHITE, 1)  # 白色边框
         
-        # 标注历史waypoints（蓝色圆+编号）
+        # 标注历史waypoints（蓝色圆+FOV扇形+编号）
+        BLUE = (255, 0, 0)  # BGR格式
         for wp_id, wp_data in self.waypoint_registry.items():
             wp_pos = wp_data['pos']
-            wp_grid = self._global_to_grid(wp_pos)
+            wp_yaw = wp_data['yaw']
+            wp_px = self.obstacle_map._xy_to_px(wp_pos[:2].reshape(1, 2))[0]
             
-            # 画圆
-            cv2.circle(bev, wp_grid, 20, (255, 0, 0), -1)  # 蓝色
-            cv2.circle(bev, wp_grid, 20, WHITE, 2)  # 白色边框
+            # 绘制FOV扇形
+            fov_radius = 50  # 扇形半径（像素）
+            fov_angle = self.fov if hasattr(self, 'fov') else 60  # 使用相机FOV（度）
+            
+            # 计算扇形的起始和结束角度
+            # yaw是机器人朝向（弧度），OpenCV的角度是从x轴正方向逆时针
+            # 需要转换：OpenCV角度 = 90 - yaw_degrees
+            start_angle = 90 - np.rad2deg(wp_yaw) - fov_angle / 2
+            end_angle = 90 - np.rad2deg(wp_yaw) + fov_angle / 2
+            
+            # 绘制半透明扇形
+            overlay = bev.copy()
+            cv2.ellipse(
+                overlay,
+                tuple(wp_px.astype(int)),
+                (fov_radius, fov_radius),
+                0,  # 旋转角度
+                start_angle,
+                end_angle,
+                BLUE,
+                -1  # 填充
+            )
+            # 混合原图和扇形（半透明效果）
+            cv2.addWeighted(overlay, 0.3, bev, 0.7, 0, bev)
+            
+            # 绘制扇形边界线
+            cv2.ellipse(
+                bev,
+                tuple(wp_px.astype(int)),
+                (fov_radius, fov_radius),
+                0,
+                start_angle,
+                end_angle,
+                BLUE,
+                2
+            )
+            
+            # 画中心圆
+            cv2.circle(bev, tuple(wp_px.astype(int)), 15, BLUE, -1)  # 蓝色填充
+            cv2.circle(bev, tuple(wp_px.astype(int)), 15, WHITE, 2)  # 白色边框
             
             # 画编号
             text = str(wp_id)
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-            cv2.putText(bev, text, (wp_grid[0]-tw//2, wp_grid[1]+th//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, WHITE, 2)
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.putText(bev, text, (int(wp_px[0]-tw//2), int(wp_px[1]+th//2)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 2)
         
         # 添加图例
         legend_y = 50
@@ -236,61 +327,233 @@ Remember these instructions throughout the navigation episode. I will show you o
         
         return bev
     
-    def _annotate_frontiers(self, rgb: np.ndarray, a_final: list, K, T_cam_base):
+    def _get_visible_frontiers(self, obs: dict) -> list:
         """
-        在当前RGB图像上标注可选择的frontiers
+        获取当前视野内可见的frontier点
+        
+        Parameters
+        ----------
+        obs : dict
+            观测字典，包含intrinsic, extrinsic, base_to_odom_matrix等
+            
+        Returns
+        -------
+        list
+            可见frontier列表，每个元素为(frontier_xy, pixel_uv)
+            frontier_xy: 全局坐标(x, y)
+            pixel_uv: 图像坐标(u, v)
+        """
+        # 获取所有frontier（全局坐标）
+        all_frontiers = self.obstacle_map.frontiers
+        
+        if len(all_frontiers) == 0:
+            return []
+        
+        # 获取相机参数
+        K = obs['intrinsic']
+        T_cam_odom = obs['extrinsic']
+        T_odom_base = obs['base_to_odom_matrix']
+        T_cam_base = T_cam_odom @ T_odom_base
+        
+        # 机器人位置和朝向
+        robot_pos = T_odom_base[:3, 3]
+        robot_yaw = np.arctan2(T_odom_base[1, 0], T_odom_base[0, 0])
+        
+        # 图像尺寸
+        H, W = obs['rgb'].shape[:2]
+        
+        # FOV参数
+        fx = K[0, 0]
+        fov_horizontal = 2 * np.arctan(W / (2 * fx))
+        max_dist = self.clip_dist
+        
+        visible_frontiers = []
+        
+        for frontier_xy in all_frontiers:
+            frontier_3d = np.array([frontier_xy[0], frontier_xy[1], 0.0])
+            
+            # 1. 检查FOV角度
+            vec_to_frontier = frontier_3d[:2] - robot_pos[:2]
+            angle_to_frontier = np.arctan2(vec_to_frontier[1], vec_to_frontier[0])
+            angle_diff = np.abs(np.arctan2(
+                np.sin(angle_to_frontier - robot_yaw),
+                np.cos(angle_to_frontier - robot_yaw)
+            ))
+            
+            if angle_diff > fov_horizontal / 2:
+                continue
+            
+            # 2. 投影到图像
+            # frontier在base坐标系中的位置
+            frontier_homo = np.array([frontier_3d[0], frontier_3d[1], frontier_3d[2], 1.0])
+            frontier_base = np.linalg.inv(T_odom_base) @ frontier_homo
+            
+            uv = point_to_pixel(frontier_base[:3], K, T_cam_base)
+            
+            if uv is None:
+                continue
+            
+            pixel_pos = (int(round(uv[0][0])), int(round(uv[0][1])))
+            
+            # 3. 检查是否在图像范围内（留一些边距）
+            margin = int(0.05 * min(W, H))
+            if not (margin <= pixel_pos[0] < W - margin and margin <= pixel_pos[1] < H - margin):
+                continue
+            
+            visible_frontiers.append((frontier_xy, pixel_pos))
+        
+        return visible_frontiers
+    
+    def _get_visible_frontiers_from_pose(self, pose: np.ndarray, yaw: float, 
+                                         intrinsic: np.ndarray, extrinsic: np.ndarray,
+                                         rgb_shape: tuple, all_frontiers: list) -> list:
+        """
+        从指定位姿计算可见的frontiers
+        
+        Parameters
+        ----------
+        pose : np.ndarray
+            位置 (x, y, z) in odom frame
+        yaw : float
+            朝向角度（弧度）
+        intrinsic : np.ndarray
+            相机内参矩阵
+        extrinsic : np.ndarray
+            相机外参矩阵（cam to odom）
+        rgb_shape : tuple
+            RGB图像尺寸 (H, W, C)
+        all_frontiers : list
+            所有frontier点的全局坐标 [(x, y), ...]
+            
+        Returns
+        -------
+        list
+            可见frontier列表，每个元素为(frontier_xy, pixel_uv)
+        """
+        if len(all_frontiers) == 0:
+            return []
+        
+        # 构建base_to_odom矩阵
+        T_odom_base = np.eye(4)
+        T_odom_base[0, 0] = np.cos(yaw)
+        T_odom_base[0, 1] = -np.sin(yaw)
+        T_odom_base[1, 0] = np.sin(yaw)
+        T_odom_base[1, 1] = np.cos(yaw)
+        T_odom_base[:3, 3] = pose
+        
+        # 相机参数
+        K = intrinsic
+        T_cam_odom = extrinsic
+        T_cam_base = T_cam_odom @ T_odom_base
+        
+        # 图像尺寸
+        H, W = rgb_shape[:2]
+        
+        # FOV参数
+        fx = K[0, 0]
+        fov_horizontal = 2 * np.arctan(W / (2 * fx))
+        
+        visible_frontiers = []
+        
+        for frontier_xy in all_frontiers:
+            frontier_3d = np.array([frontier_xy[0], frontier_xy[1], 0.0])
+            
+            # 1. 检查FOV角度
+            vec_to_frontier = frontier_3d[:2] - pose[:2]
+            angle_to_frontier = np.arctan2(vec_to_frontier[1], vec_to_frontier[0])
+            angle_diff = np.abs(np.arctan2(
+                np.sin(angle_to_frontier - yaw),
+                np.cos(angle_to_frontier - yaw)
+            ))
+            
+            if angle_diff > fov_horizontal / 2:
+                continue
+            
+            # 2. 投影到图像
+            frontier_homo = np.array([frontier_3d[0], frontier_3d[1], frontier_3d[2], 1.0])
+            frontier_base = np.linalg.inv(T_odom_base) @ frontier_homo
+            
+            uv = point_to_pixel(frontier_base[:3], K, T_cam_base)
+            
+            if uv is None:
+                continue
+            
+            pixel_pos = (int(round(uv[0][0])), int(round(uv[0][1])))
+            
+            # 3. 检查是否在图像范围内（留一些边距）
+            margin = int(0.05 * min(W, H))
+            if not (margin <= pixel_pos[0] < W - margin and margin <= pixel_pos[1] < H - margin):
+                continue
+            
+            visible_frontiers.append((frontier_xy, pixel_pos))
+        
+        return visible_frontiers
+    
+    def _find_frontier_id(self, frontier_xy: tuple, threshold: float = 0.1) -> int:
+        """
+        通过坐标匹配找到frontier的全局ID
+        
+        Parameters
+        ----------
+        frontier_xy : tuple
+            Frontier坐标 (x, y)
+        threshold : float
+            匹配距离阈值（米）
+            
+        Returns
+        -------
+        int or None
+            匹配的frontier ID，如果未找到返回None
+        """
+        for fid, registered_xy in self.frontier_registry.items():
+            dist = np.linalg.norm(np.array(frontier_xy) - np.array(registered_xy))
+            if dist < threshold:
+                return fid
+        return None
+    
+    def _annotate_frontiers(self, rgb: np.ndarray, visible_frontiers: list, obs: dict):
+        """
+        在当前RGB图像上标注可见的frontiers（使用全局ID）
         
         Parameters
         ----------
         rgb : np.ndarray
             当前RGB图像
-        a_final : list
-            候选动作列表 [(r, theta), ...]
-        K : np.ndarray
-            相机内参
-        T_cam_base : np.ndarray
-            cam->base变换矩阵
+        visible_frontiers : list
+            可见frontier列表 [(frontier_xy, pixel_uv), ...]
+        obs : dict
+            观测字典
             
         Returns
         -------
         rgb_annotated : np.ndarray
             标注后的RGB图像
         frontier_map : dict
-            frontier映射 {frontier_id: (r, theta)}
+            frontier映射 {frontier_id: frontier_xy}
         """
         rgb_annotated = rgb.copy()
         frontier_map = {}
         
-        # 使用字母标识frontiers（A, B, C...）
-        for idx, (r, theta) in enumerate(a_final):
-            if idx >= 26:  # 最多26个frontiers
-                break
+        # 使用全局ID标识frontiers
+        for frontier_xy, pixel_pos in visible_frontiers:
+            # 找到对应的全局ID
+            frontier_id = self._find_frontier_id(frontier_xy)
             
-            label = chr(65 + idx)  # A-Z
-            
-            # 投影waypoint到图像（80%距离处）
-            r_waypoint = r * 0.8
-            p_base = np.array([r_waypoint * np.cos(theta), r_waypoint * np.sin(theta), 0.0])
-            uv = point_to_pixel(p_base, K, T_cam_base)
-            
-            if uv is None:
+            if frontier_id is None:
+                # 如果找不到ID（理论上不应该发生），跳过
                 continue
             
-            pixel_pos = (int(round(uv[0][0])), int(round(uv[0][1])))
-            H, W = rgb.shape[:2]
+            frontier_map[frontier_id] = frontier_xy
             
-            if not (0 <= pixel_pos[0] < W and 0 <= pixel_pos[1] < H):
-                continue
-            
-            frontier_map[label] = (r, theta)
-            
-            # 画绿色圆圈+字母
+            # 画绿色圆圈+全局ID
             cv2.circle(rgb_annotated, pixel_pos, 25, GREEN, 3)
-            cv2.putText(rgb_annotated, label, (pixel_pos[0]-10, pixel_pos[1]+10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, GREEN, 3)
+            text = str(frontier_id)
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+            cv2.putText(rgb_annotated, text, (pixel_pos[0]-tw//2, pixel_pos[1]+th//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, GREEN, 3)
         
         # 添加标题
-        cv2.putText(rgb_annotated, "Current View - Select Frontier", (20, 40),
+        cv2.putText(rgb_annotated, f"Frontiers: {len(visible_frontiers)} visible", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, WHITE, 2)
         
         return rgb_annotated, frontier_map
@@ -302,16 +565,17 @@ Remember these instructions throughout the navigation episode. I will show you o
                 "type": "function",
                 "function": {
                     "name": "get_waypoint_rgb",
-                    "description": "查看历史waypoint的第一人称RGB视角，帮助回忆该位置的环境",
+                    "description": "查看一个或多个历史waypoint的第一人称RGB视角，帮助回忆该位置的环境",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "wp_id": {
-                                "type": "integer",
-                                "description": f"waypoint编号，可选范围：{list(self.waypoint_registry.keys()) if self.waypoint_registry else 'none'}"
+                            "wp_ids": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": f"waypoint编号列表，可选范围：{list(self.waypoint_registry.keys()) if self.waypoint_registry else 'none'}"
                             }
                         },
-                        "required": ["wp_id"]
+                        "required": ["wp_ids"]
                     }
                 }
             },
@@ -351,18 +615,54 @@ Remember these instructions throughout the navigation episode. I will show you o
             {'success': bool, 'result': any, 'error': str}
         """
         if tool_name == 'get_waypoint_rgb':
-            wp_id = args.get('wp_id')
+            wp_ids = args.get('wp_ids', [])
             
-            if wp_id not in self.waypoint_registry:
+            if not wp_ids:
                 return {
                     'success': False,
                     'result': None,
-                    'error': f"Waypoint {wp_id} not found. Available: {list(self.waypoint_registry.keys())}"
+                    'error': "No waypoint IDs provided"
+                }
+            
+            # 收集所有有效的waypoint RGB图像（带frontier标注）
+            rgb_images = []
+            invalid_ids = []
+            
+            for wp_id in wp_ids:
+                if wp_id not in self.waypoint_registry:
+                    invalid_ids.append(wp_id)
+                    continue
+                
+                wp_data = self.waypoint_registry[wp_id]
+                rgb = wp_data['rgb'].copy()
+                
+                # 计算从该waypoint能看到的frontiers
+                visible_frontiers = self._get_visible_frontiers_from_pose(
+                    pose=wp_data['pos'],
+                    yaw=wp_data['yaw'],
+                    intrinsic=wp_data['intrinsic'],
+                    extrinsic=wp_data['extrinsic'],
+                    rgb_shape=rgb.shape,
+                    all_frontiers=list(self.frontier_registry.values())
+                )
+                
+                # 标注frontiers（使用全局ID）
+                # 创建一个临时obs字典用于_annotate_frontiers
+                temp_obs = {'rgb': rgb}
+                rgb_annotated, _ = self._annotate_frontiers(rgb, visible_frontiers, temp_obs)
+                
+                rgb_images.append(rgb_annotated)
+            
+            if invalid_ids:
+                return {
+                    'success': False,
+                    'result': None,
+                    'error': f"Waypoints {invalid_ids} not found. Available: {list(self.waypoint_registry.keys())}"
                 }
             
             return {
                 'success': True,
-                'result': self.waypoint_registry[wp_id]['rgb'],
+                'result': rgb_images,  # 返回标注后的图像列表
                 'error': None
             }
         
@@ -414,12 +714,14 @@ Remember these instructions throughout the navigation episode. I will show you o
         # 计算yaw
         yaw = mat_to_yaw(T_odom_base)
         
-        # 保存
+        # 保存（包括相机内参和外参）
         self.waypoint_registry[self.next_wp_id] = {
             'pos': p_odom[:3],
             'rgb': obs['rgb'].copy(),
             'iter': self.step_ndx,
-            'yaw': yaw
+            'yaw': yaw,
+            'intrinsic': obs['intrinsic'].copy(),  # 保存相机内参
+            'extrinsic': obs['extrinsic'].copy(),  # 保存相机外参
         }
         
         print(f"[NavAgent] Registered waypoint {self.next_wp_id} at {p_odom[:3]}")
@@ -427,48 +729,81 @@ Remember these instructions throughout the navigation episode. I will show you o
     
     def _nav_with_function_call(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
         """
-        支持Function Call的导航决策
+        支持Function Call的导航决策（使用frontier-based方法）
         
         Returns
         -------
         response : str
             VLM完整响应
         rgb_vis : np.ndarray
-            可视化图像
+            可视化图像（标注后的RGB）
         action : tuple/dict
             动作（可能是frontier或waypoint）
         timing_info : dict
-            时序信息
+            时序信息，包含：
+            - total_time: 总时间
+            - fc_iterations: Function Call迭代次数
+            - bev_map: BEV地图
+            - rgb_original: 原始RGB图像
+            - prompt: 初始prompt
+            - conversation: 完整对话历史（不含图片）
         """
         t_start = time.time()
         
-        # 1. 计算可导航性
-        a_initial = self._navigability(obs)
-        a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
+        # 1. 更新ObstacleMap
+        self._navigability(obs)
         
-        # 2. 生成BEV和标注frontiers
+        # 2. 获取可见的frontiers
+        visible_frontiers = self._get_visible_frontiers(obs)
+        
+        # 3. 生成BEV和标注frontiers
         current_pos = obs['base_to_odom_matrix'][:3, 3]
-        bev_map = self._generate_bev_with_waypoints(current_pos)
+        all_frontiers = self.obstacle_map.frontiers  # 获取所有frontier
+        bev_map = self._generate_bev_with_waypoints(current_pos, all_frontiers)
         
-        K = obs['intrinsic']
-        T_cam_base = obs['extrinsic'] @ obs['base_to_odom_matrix']
-        rgb_annotated, frontier_map = self._annotate_frontiers(obs['rgb'], a_final, K, T_cam_base)
+        rgb_annotated, frontier_map = self._annotate_frontiers(obs['rgb'], visible_frontiers, obs)
         
-        # 3. 构建prompt
-        frontier_list = ', '.join(frontier_map.keys()) if frontier_map else 'none'
+        # 4. 构建prompt
+        frontier_list = ', '.join(map(str, frontier_map.keys())) if frontier_map else 'none'
         wp_list = ', '.join(map(str, self.waypoint_registry.keys())) if self.waypoint_registry else 'none'
         
         prompt = f"""Iteration {iter}: Finding {goal}
 
-Image 1: BEV map (YOU=red, waypoints={wp_list})
-Image 2: Current view (frontiers={frontier_list})
+IMAGE DESCRIPTIONS:
+- Image 1 (BEV Map): Bird's-eye view showing explored area
+  * Red circle = YOUR current position
+  * Blue circles with numbers = Historical waypoints (IDs: {wp_list})
+  * Green dots = Frontiers (unexplored boundaries)
+  * Use this for global navigation planning
 
-Actions:
-1. Select frontier: {{"action": "frontier", "id": "A"}}
-2. View waypoint: call get_waypoint_rgb(wp_id)
-3. Go to waypoint: call go_to(wp_id)
+- Image 2 (Current RGB View): First-person camera view
+  * Green circles with numbers = Visible frontiers (IDs: {frontier_list})
+  * These are exploration targets you can navigate to
+  * Frontier IDs are consistent across all views
 
-Decide based on BEV global info and current view."""
+AVAILABLE ACTIONS:
+1. SELECT FRONTIER: Navigate to a visible frontier to explore new area
+   Format: {{"action": "frontier", "id": <frontier_id>}}
+   Example: {{"action": "frontier", "id": 1}}
+
+2. VIEW WAYPOINT: Check RGB view from a historical waypoint (shows frontiers visible from there)
+   Use function: get_waypoint_rgb(wp_ids=[<id1>, <id2>, ...])
+   This helps you recall what you saw at that location
+
+3. GO TO WAYPOINT: Navigate back to a historical waypoint
+   Use function: go_to(wp_id=<id>)
+   Useful for revisiting areas or strategic repositioning
+
+DECISION STRATEGY:
+- Prioritize exploring new frontiers over revisiting waypoints
+- Use BEV map to understand global layout and avoid redundant exploration
+- Check waypoint views if you need to recall specific areas
+- Frontier IDs remain consistent across current view and waypoint views
+
+Make your decision now."""
+        
+        # 保存初始prompt（用于log）
+        initial_prompt = prompt
         
         # 4. Function Call循环
         tools = self._get_function_definitions()
@@ -500,22 +835,31 @@ Decide based on BEV global info and current view."""
                         images = []
                     else:
                         if tool_name == 'get_waypoint_rgb':
-                            # 返回waypoint视角
+                            # 返回waypoint视角（支持多个）
+                            wp_ids = tool_args['wp_ids']
                             self.actionVLM.add_tool_result(
                                 tool_id, tool_name,
-                                f"Showing waypoint {tool_args['wp_id']} view"
+                                f"Showing waypoint {wp_ids} views"
                             )
-                            prompt = f"This is waypoint {tool_args['wp_id']}. Continue decision."
-                            images = [result['result']]
+                            prompt = f"These are waypoints {wp_ids}. Continue decision."
+                            images = result['result']  # 已经是列表
                         
                         elif tool_name == 'go_to':
                             # 直接返回
                             t_end = time.time()
+                            timing_info = {
+                                'total_time': t_end - t_start,
+                                'fc_iterations': fc_iter + 1,
+                                'bev_map': bev_map,
+                                'rgb_original': obs['rgb'],
+                                'prompt': initial_prompt,
+                                'conversation': self.actionVLM.get_conversation_history()
+                            }
                             return (
                                 response['content'],
                                 rgb_annotated,
                                 result['result'],
-                                {'total_time': t_end - t_start, 'fc_iterations': fc_iter + 1}
+                                timing_info
                             )
             else:
                 # 最终决策
@@ -524,34 +868,75 @@ Decide based on BEV global info and current view."""
                     if decision.get('action') == 'frontier':
                         frontier_id = decision['id']
                         if frontier_id in frontier_map:
-                            action = frontier_map[frontier_id]
+                            # frontier_map[frontier_id] 是全局坐标 (x, y)
+                            frontier_xy = frontier_map[frontier_id]
+                            
+                            # 转换为极坐标动作 (r, theta)
+                            robot_pos = obs['base_to_odom_matrix'][:3, 3]
+                            vec = frontier_xy - robot_pos[:2]
+                            r = np.linalg.norm(vec)
+                            
+                            # 计算相对于机器人朝向的角度
+                            robot_yaw = np.arctan2(obs['base_to_odom_matrix'][1, 0],
+                                                   obs['base_to_odom_matrix'][0, 0])
+                            frontier_angle = np.arctan2(vec[1], vec[0])
+                            theta = frontier_angle - robot_yaw
+                            
+                            # 归一化到[-pi, pi]
+                            theta = np.arctan2(np.sin(theta), np.cos(theta))
+                            
+                            action = (r, theta)
                             self._register_waypoint(obs, action)
                             
                             t_end = time.time()
+                            timing_info = {
+                                'total_time': t_end - t_start,
+                                'fc_iterations': fc_iter + 1,
+                                'bev_map': bev_map,
+                                'rgb_original': obs['rgb'],
+                                'prompt': initial_prompt,
+                                'conversation': self.actionVLM.get_conversation_history()
+                            }
                             return (
                                 response['content'],
                                 rgb_annotated,
                                 action,
-                                {'total_time': t_end - t_start, 'fc_iterations': fc_iter + 1}
+                                timing_info
                             )
                 except Exception as e:
                     print(f"[NavAgent] Parse error: {e}")
                 
                 t_end = time.time()
+                timing_info = {
+                    'total_time': t_end - t_start,
+                    'fc_iterations': fc_iter + 1,
+                    'bev_map': bev_map,
+                    'rgb_original': obs['rgb'],
+                    'prompt': initial_prompt,
+                    'conversation': self.actionVLM.get_conversation_history()
+                }
                 return (
                     None,
                     rgb_annotated,
                     None,
-                    {'total_time': t_end - t_start, 'fc_iterations': fc_iter + 1}
+                    timing_info
                 )
         
         # 超时
         t_end = time.time()
+        timing_info = {
+            'total_time': t_end - t_start,
+            'fc_iterations': self.cfg['max_fc_iterations'],
+            'bev_map': bev_map,
+            'rgb_original': obs['rgb'],
+            'prompt': prompt,
+            'conversation': self.actionVLM.get_conversation_history()
+        }
         return (
             None,
             rgb_annotated,
             None,
-            {'total_time': t_end - t_start, 'fc_iterations': self.cfg['max_fc_iterations']}
+            timing_info
         )
     
     def cal_fov(self, intrinsics: np.ndarray, W: int):
@@ -603,148 +988,49 @@ Decide based on BEV global info and current view."""
         
         return navigability_mask.astype(bool)
 
-    def _get_radial_distance(
-        self,
-        start_pxl: tuple,
-        theta_i: float,
-        navigability_mask: np.ndarray,
-        depth_image: np.ndarray,
-        intrinsics: np.ndarray,
-        T_cam_base: np.ndarray,
-        clip_dist: float = None,
-    ):
-        H, W = navigability_mask.shape
-        
-        # Use provided clip_dist or fall back to self.clip_dist
-        if clip_dist is None:
-            clip_dist = self.clip_dist
-
-        agent_point_base = np.array([clip_dist * np.cos(theta_i), clip_dist * np.sin(theta_i), 0.0], dtype=np.float64)
-        end_pxl = point_to_pixel(agent_point_base, intrinsics, T_cam_base)
-        if end_pxl is None:
-            return None, None
-        end_pxl = end_pxl[0]
-        if start_pxl is None:
-            return None, None
-
-        x0, y0 = start_pxl
-        x1, y1 = int(round(end_pxl[0])), int(round(end_pxl[1]))
-        if y1 < 0 or y1 >= H:
-            return None, None
-
-        intersections = find_intersections(x0, y0, x1, y1, W, H)
-        if intersections is None:
-            return None, None
-
-        (xa, ya), (xb, yb) = intersections
-        num_points = max(abs(xb - xa), abs(yb - ya)) + 1
-        x_coords = np.linspace(xa, xb, num_points)
-        y_coords = np.linspace(ya, yb, num_points)
-
-        # 如果起点就不可通行，返回 0
-        if not navigability_mask[int(np.clip(y_coords[0], 0, H - 1)), int(np.clip(x_coords[0], 0, W - 1))]:
-            return 0.0, theta_i
-
-        out = (int(x_coords[-1]), int(y_coords[-1]))
-        stop_i = None
-        for i in range(num_points - 4):
-            y = int(y_coords[i])
-            x = int(x_coords[i])
-            if sum([navigability_mask[int(y_coords[j]), int(x_coords[j])] for j in range(i, i + 4)]) <= 2:
-                out = (x, y)
-                stop_i = i
-                break
-
-        if stop_i is not None and stop_i < 5:
-            return 0.0, theta_i
-
-        # 用 depth 取距离
-        u = int(np.clip(out[0], 0, W - 1))
-        v = int(np.clip(out[1], 0, H - 1))
-        d = float(depth_image[v, u])
-        if not np.isfinite(d) or d <= 1e-6:
-            return None, None
-
-        cam_coords = unproject_2d(u, v, d, intrinsics)  # camera frame
-        base_coords = local_to_global_matrix(np.linalg.inv(T_cam_base), cam_coords)  # cam->base
-        r_i = float(np.linalg.norm(base_coords[:2]))
-        return r_i, theta_i
-
-    def _update_voxel(self, r: float, theta: float, T_odom_base: np.ndarray, clip_dist: float, clip_frac: float):
-        agent_coords = self._global_to_grid(T_odom_base[:3, 3])
-
-        unclipped = max(r - 0.5, 0.0)
-        local_coords = np.array([unclipped * np.cos(theta), unclipped * np.sin(theta), 0.0], dtype=np.float64)
-        global_coords = local_to_global_matrix(T_odom_base, local_coords)
-        point = self._global_to_grid(global_coords)
-        cv2.line(self.voxel_map, agent_coords, point, self.unexplored_color, self.voxel_ray_size)
-
-        clipped = min(clip_frac * r, clip_dist)
-        local_coords = np.array([clipped * np.cos(theta), clipped * np.sin(theta), 0.0], dtype=np.float64)
-        global_coords = local_to_global_matrix(T_odom_base, local_coords)
-        point = self._global_to_grid(global_coords)
-        cv2.line(self.explored_map, agent_coords, point, self.explored_color, self.voxel_ray_size)
-
-    def _navigability(self, obs: dict, angle_range=None, clip_dist_override=None):
+    def _update_frontier_registry(self):
         """
-        Compute navigable directions.
+        更新frontier注册表，为当前step的所有frontier分配简单的递增ID
+        每个step重新分配ID，只需要在当前step内保持一致
+        """
+        current_frontiers = self.obstacle_map.frontiers  # [(x, y), ...]
+        
+        # 清空并重新分配ID（每个step独立）
+        self.frontier_registry = {}
+        
+        # 为当前所有frontier分配ID（从1开始）
+        for idx, frontier_xy in enumerate(current_frontiers):
+            self.frontier_registry[idx + 1] = frontier_xy
+    
+    def _navigability(self, obs: dict):
+        """
+        Update ObstacleMap with current observation.
         
         Parameters
         ----------
         obs : dict
             Observation dictionary
-        angle_range : tuple, optional
-            (theta_min, theta_max) to limit angle search range (in radians)
-            If None, use full sensor range
-        clip_dist_override : float, optional
-            Override self.clip_dist for ray casting
-            If None, use self.clip_dist
-            
-        Returns
-        -------
-        a_initial : list
-            List of (r, theta) tuples
         """
-        rgb_image = obs['rgb'].copy()
         depth_image = obs['depth']
         K = obs['intrinsic']
         T_cam_odom = obs['extrinsic']
         T_odom_base = obs['base_to_odom_matrix']
 
-        # cam<-base
-        T_cam_base = T_cam_odom @ T_odom_base
-
-        self.fov = self.cal_fov(K, rgb_image.shape[1])
         if self.init_pos is None:
             self.init_pos = T_odom_base[:3, 3].copy()
 
-        navigability_mask = self._get_navigability_mask(depth_image, K, T_cam_odom)
-
-        # Determine angle range
-        if angle_range is not None:
-            # Use specified range
-            theta_min, theta_max = angle_range
-            all_thetas = np.linspace(theta_min, theta_max, int(self.cfg['num_theta']))
-        else:
-            # Use full sensor range
-            sensor_range = np.deg2rad(self.fov / 2) * 1.5
-            all_thetas = np.linspace(-sensor_range, sensor_range, int(self.cfg['num_theta']))
-
-        start = agent_frame_to_image_coords([0.0, 0.0, 0.0], K, T_cam_base)
+        # Update ObstacleMap with current observation
+        self.obstacle_map.update_map(
+            depth=depth_image,
+            intrinsic=K,
+            extrinsic=T_cam_odom,
+            base_to_odom=T_odom_base,
+            min_depth=0.5,
+            max_depth=self.clip_dist,
+        )
         
-        # Determine clip_dist to use
-        clip_dist = clip_dist_override if clip_dist_override is not None else self.clip_dist
-
-        a_initial = []
-        for theta_i in all_thetas:
-            r_i, theta_i = self._get_radial_distance(
-                start, theta_i, navigability_mask, depth_image, K, T_cam_base, clip_dist
-            )
-            if r_i is not None:
-                self._update_voxel(r_i, theta_i, T_odom_base, clip_dist=clip_dist, clip_frac=0.66)
-                a_initial.append((r_i, theta_i))
-
-        return a_initial
+        # Update frontier registry with persistent IDs
+        self._update_frontier_registry()
 
     def _action_proposer(self, a_initial: list, T_odom_base: np.ndarray):
         min_angle = self.fov / 360

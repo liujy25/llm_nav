@@ -197,116 +197,16 @@
 
         .content {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            grid-template-rows: auto auto;
+            grid-template-columns: repeat(3, 1fr);
             gap: 15px;
             margin-bottom: 15px;
         }
         
-        /* Row 1: RGB Vis spans 2 columns, LLM Response spans 2 columns */
-        .content > .image-card:first-child {
-            grid-column: span 2;
-        }
-        
+        /* RGB Vis, BEV Map, and LLM Response in one row */
+        .content > .image-card,
         .content > .response-card {
-            grid-column: span 2;
+            grid-column: span 1;
         }
-        
-        /* Row 2: History spans all 4 columns */
-        .content > .history-section {
-            grid-column: span 4;
-        }
-        
-        .history-section {
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
-            border-radius: 12px;
-            padding: 15px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-        }
-        
-        .history-section h3 {
-            font-size: 14px;
-            font-weight: 600;
-            margin-bottom: 10px;
-            color: #667eea;
-        }
-        
-        .history-container {
-            display: flex;
-            gap: 12px;
-            overflow-x: auto;
-            overflow-y: hidden;
-            padding-bottom: 10px;
-            height: 100%;
-            align-items: flex-start;
-        }
-        
-        .history-container::-webkit-scrollbar {
-            height: 8px;
-        }
-        
-        .history-container::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 4px;
-        }
-        
-        .history-container::-webkit-scrollbar-thumb {
-            background: rgba(102, 126, 234, 0.5);
-            border-radius: 4px;
-        }
-        
-        .history-item {
-            flex: 0 0 auto;
-            width: 280px;
-            background: rgba(0, 0, 0, 0.3);
-            border-radius: 8px;
-            overflow: hidden;
-            border: 2px solid rgba(255, 255, 255, 0.1);
-            transition: transform 0.3s ease, border-color 0.3s ease;
-        }
-        
-        .history-item:hover {
-            transform: translateY(-3px);
-            border-color: rgba(102, 126, 234, 0.5);
-        }
-        
-        .history-item-header {
-            background: rgba(102, 126, 234, 0.2);
-            padding: 8px 12px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 13px;
-            font-weight: 600;
-        }
-        
-        .history-item-header .iteration {
-            color: #667eea;
-        }
-        
-        .history-item-header .action {
-            background: rgba(102, 126, 234, 0.3);
-            padding: 3px 8px;
-            border-radius: 4px;
-            color: #fff;
-        }
-        
-        .history-item-image {
-            width: 100%;
-            aspect-ratio: 16/10;
-            object-fit: contain;
-            background: rgba(0, 0, 0, 0.5);
-        }
-        
-        .history-empty {
-            color: rgba(255, 255, 255, 0.4);
-            text-align: center;
-            padding: 30px;
-            font-size: 14px;
-        }
-
 
         .image-card {
             background: rgba(255, 255, 255, 0.05);
@@ -494,7 +394,7 @@
         </div>
 
         <div class="content">
-            <!-- Row 1: RGB Visualization + LLM Response -->
+            <!-- RGB Visualization -->
             <div class="image-card">
                 <h3>RGB Visualization</h3>
                 <div class="image-container">
@@ -503,6 +403,16 @@
                 </div>
             </div>
 
+            <!-- BEV Map -->
+            <div class="image-card">
+                <h3>BEV Map</h3>
+                <div class="image-container">
+                    <img id="bevMapImg" style="display: none;">
+                    <span class="image-placeholder" id="bevMapPlaceholder">Waiting for data...</span>
+                </div>
+            </div>
+
+            <!-- LLM Response -->
             <div class="response-card">
                 <h3>LLM Response</h3>
                 <div class="goal-info" id="goalInfo" style="display: none;">
@@ -512,22 +422,6 @@
                     </div>
                 </div>
                 <div class="response-content" id="llmResponse">Waiting for data...</div>
-            </div>
-
-            <!-- Row 2: Current Cycle (Current Keyframe + Non-keyframes) -->
-            <div class="history-section">
-                <h3>Current Cycle (当前周期)</h3>
-                <div class="history-container" id="currentCycleContainer">
-                    <div class="history-empty">No current cycle data yet...</div>
-                </div>
-            </div>
-            
-            <!-- Row 3: Historical Keyframes -->
-            <div class="history-section">
-                <h3>Historical Keyframes (历史关键帧)</h3>
-                <div class="history-container" id="historicalKeyframesContainer">
-                    <div class="history-empty">No historical keyframes yet...</div>
-                </div>
             </div>
         </div>
     </div>
@@ -601,7 +495,7 @@
 
         function clearDisplay() {
             // Clear images
-            ['rgbVis'].forEach(name => {
+            ['rgbVis', 'bevMap'].forEach(name => {
                 const img = document.getElementById(`${name}Img`);
                 const placeholder = document.getElementById(`${name}Placeholder`);
                 img.style.display = 'none';
@@ -616,12 +510,6 @@
             // Clear goal info
             document.getElementById('goalInfo').style.display = 'none';
             document.getElementById('descriptionInfo').style.display = 'none';
-            
-            // Clear history
-            document.getElementById('currentCycleContainer').innerHTML =
-                '<div class="history-empty">No current cycle data yet...</div>';
-            document.getElementById('historicalKeyframesContainer').innerHTML =
-                '<div class="history-empty">No historical keyframes yet...</div>';
         }
 
         function loadLogs() {
@@ -720,6 +608,7 @@
             
             // Update images
             updateImage('rgbVis', data.images?.rgb_vis);
+            updateImage('bevMap', data.images?.bev_map);
             
             // Update LLM response
             const responseDiv = document.getElementById('llmResponse');
@@ -728,73 +617,6 @@
                 // Auto scroll to bottom
                 responseDiv.scrollTop = responseDiv.scrollHeight;
             }
-            
-            // Update history (split into current cycle and historical keyframes)
-            updateHistory(data.current_cycle, data.historical_keyframes);
-        }
-        
-        function updateHistory(currentCycle, historicalKeyframes) {
-            // Update current cycle container
-            const currentCycleContainer = document.getElementById('currentCycleContainer');
-            if (!currentCycle || currentCycle.length === 0) {
-                currentCycleContainer.innerHTML = '<div class="history-empty">No current cycle data yet...</div>';
-            } else {
-                currentCycleContainer.innerHTML = '';
-                currentCycle.forEach((item) => {
-                    currentCycleContainer.appendChild(createHistoryItem(item));
-                });
-                currentCycleContainer.scrollLeft = currentCycleContainer.scrollWidth;
-            }
-            
-            // Update historical keyframes container
-            const historicalContainer = document.getElementById('historicalKeyframesContainer');
-            if (!historicalKeyframes || historicalKeyframes.length === 0) {
-                historicalContainer.innerHTML = '<div class="history-empty">No historical keyframes yet...</div>';
-            } else {
-                historicalContainer.innerHTML = '';
-                historicalKeyframes.forEach((item) => {
-                    historicalContainer.appendChild(createHistoryItem(item));
-                });
-                historicalContainer.scrollLeft = historicalContainer.scrollWidth;
-            }
-        }
-        
-        function createHistoryItem(item) {
-            const historyItem = document.createElement('div');
-            historyItem.className = 'history-item';
-            
-            const header = document.createElement('div');
-            header.className = 'history-item-header';
-            
-            // Add frame type indicator (keyframe or non-keyframe)
-            const frameType = item.is_keyframe ? 'K' : 'N';
-            const frameTypeColor = item.is_keyframe ? '#667eea' : '#4caf50';
-            
-            header.innerHTML = `
-                <span class="iteration">
-                    <span style="background: ${frameTypeColor}; padding: 2px 6px; border-radius: 3px; margin-right: 4px;">${frameType}</span>
-                    Iter #${item.iteration}
-                </span>
-                <span class="action">Action ${item.action}</span>
-            `;
-            
-            const img = document.createElement('img');
-            img.className = 'history-item-image';
-            img.src = item.image_path + '?t=' + new Date().getTime();
-            img.alt = `History iteration ${item.iteration}`;
-            img.onerror = function() {
-                this.style.display = 'none';
-                const placeholder = document.createElement('div');
-                placeholder.className = 'history-empty';
-                placeholder.style.padding = '20px';
-                placeholder.textContent = 'Image not available';
-                this.parentNode.appendChild(placeholder);
-            };
-            
-            historyItem.appendChild(header);
-            historyItem.appendChild(img);
-            
-            return historyItem;
         }
 
         function updateImage(name, url) {

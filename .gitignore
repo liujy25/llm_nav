@@ -28,6 +28,7 @@ Thumbs.db
 NavDP/
 InternNav/
 logs/
+vlfm/
 
 # Test output files
 test_results.json
