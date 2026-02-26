@@ -623,6 +623,19 @@ class LLMNavClient(Node):
                         self.get_logger().error(f'Failed to execute turn right: {e}')
                     continue
                 
+                # Handle go to waypoint
+                if action_type == 'go_to_waypoint':
+                    self.get_logger().info('Executing GO TO WAYPOINT')
+                    try:
+                        self.navigate_to_pose(goal_pose_stamped)
+                        self.get_logger().info('Waypoint navigation completed.')
+                    except NavigationStoppedException:
+                        self.get_logger().info('Waypoint navigation stopped by stop detection')
+                        break
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to navigate to waypoint: {e}')
+                    continue
+                
                 # Handle normal navigation step
                 if action_type == 'nav_step':
                     self.get_logger().info(f'Executing NAV STEP to ({pose_dict["position"]["x"]:.2f}, '

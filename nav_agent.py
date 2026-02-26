@@ -32,18 +32,13 @@ class NavAgent:
         self.cfg.setdefault('num_theta', 40)
         self.cfg.setdefault('image_edge_threshold', 0.04)
         self.cfg.setdefault('clip_dist', 2.0)
-        self.cfg.setdefault('turn_angle_deg', 30.0)  # Turn left/right angle in degrees
         
         # Navigability configuration (obstacle height range)
         self.cfg.setdefault('obstacle_height_min', 0.15)  # Minimum obstacle height (m)
         self.cfg.setdefault('obstacle_height_max', 2.0)   # Maximum obstacle height (m)
         
-        # Prompt mode: 'reasoning' or 'action_only'
-        self.cfg.setdefault('prompt_mode', 'reasoning')  # 'reasoning' or 'action_only'
-        
-        # Keyframe mode configuration
-        self.cfg.setdefault('keyframe_mode', False)  # Enable keyframe-based navigation
-        self.cfg.setdefault('keyframe_angle_range', 25.0)  # Angle range for non-keyframes (degrees)
+        # Function Call configuration
+        self.cfg.setdefault('max_fc_iterations', 5)  # Maximum Function Call iterations
         
         # VLM configuration defaults
         self.cfg.setdefault('vlm_model', '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/')
@@ -51,23 +46,24 @@ class NavAgent:
         self.cfg.setdefault('vlm_base_url', 'http://10.15.89.71:34134/v1/')
         self.cfg.setdefault('vlm_timeout', 10)
 
-        self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
         self.clip_dist = self.cfg['clip_dist']
-        self.prompt_mode = self.cfg['prompt_mode']
         
         # Initialize goal attributes (will be set properly in reset())
         self.goal = None
         self.goal_description = ''
+        
+        # Waypoint管理
+        self.waypoint_registry = {}  # {wp_id: {'pos': np.array, 'rgb': np.array, 'iter': int, 'yaw': float}}
+        self.next_wp_id = 1
         
         self._initialize_vlms()
         self.reset()
 
     def _initialize_vlms(self):
         system_instruction = (
-            "You are an embodied robotic assistant, with an RGB image sensor. You observe the image and instructions "
-            "given to you and output a textual response, which is converted into actions that physically move you "
-            "within the environment. You are only allowed to search for the goal object in the room you are in now. You cannot go to other rooms."
-            "You cannot move through doors. "
+            "You are a robot navigation assistant with RGB camera and BEV map. "
+            "You can view historical waypoints and make navigation decisions. "
+            "You cannot go through doors or to other rooms."
         )
         self.actionVLM = OpenAIVLM(
             model=self.cfg['vlm_model'],
@@ -76,265 +72,6 @@ class NavAgent:
             base_url=self.cfg['vlm_base_url'],
             timeout=self.cfg['vlm_timeout']
         )
-
-    def _construct_keyframe_prompt(self, num_actions: int, iter: int):
-        """
-        构建关键帧prompt：5个问题 + 统一输出格式
-        
-        关键帧是战略决策点，需要VLM进行深度推理：
-        1. 回顾历史探索
-        2. 分析当前观测
-        3. 制定战略方向
-        4. 选择最佳动作
-        5. 解释决策理由
-        
-        Parameters
-        ----------
-        num_actions : int
-            当前可用的MOVE动作数量
-        iter : int
-            当前迭代编号
-            
-        Returns
-        -------
-        str
-            关键帧prompt文本
-        """
-        num_keyframes = len(self.keyframe_history)
-        
-        prompt = f"""--- Iteration {iter} (KEYFRAME #{num_keyframes + 1}) ---
-
-CRITICAL DECISION POINT: This is a keyframe where you need to make a strategic decision.
-
-Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).
-Additionally, there are always two TURN actions:
-- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place
-- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place
-
-================================================================================
-
-Please think step by step and answer the following questions. 
-In your response, you should: first, give your answer of all the questions, 
-then provide your final decision in this exact format: {{'action': <action_number>}}.
-
-Question 1: Historical Review
-Review the {num_keyframes} previous keyframes in your conversation history:
-- What areas have you explored at each keyframe?
-- What strategic decisions did you make?
-- Are there any unexplored areas you should prioritize?
-Provide a brief summary of your exploration history and strategy.
-
-Question 2: Current Observation
-What do you see in the current image?
-- Navigable areas (floor, corridors, open spaces)
-- Obstacles (walls, furniture, objects)
-- Potential target objects related to "{self.goal}"
-- Unexplored directions
-
-Question 3: Strategic Reasoning
-Based on your historical review (Q1) and current observation (Q2):
-- Should you continue your previous strategy or change direction?
-- Which areas are most promising for finding "{self.goal}"?
-- How does this decision fit into your overall exploration plan?
-
-Question 4: Action Selection
-Which action number achieves your strategic goal best?
-Consider all available actions (1 to {num_actions}, -1, -2).
-
-Question 5: Action Justification
-Why did you choose this specific action?
-- How does it align with your strategy from Q3?
-- What do you expect to discover or achieve?
-"""
-        
-        return prompt
-
-    def _construct_nonkeyframe_prompt(self, num_actions: int, iter: int):
-        """
-        构建非关键帧prompt：回顾提示 + 直接输出action
-        
-        非关键帧是执行模式，继续执行父关键帧的战略决策。
-        VLM只需要快速选择动作，无需深度推理。
-        
-        Parameters
-        ----------
-        num_actions : int
-            当前可用的MOVE动作数量
-        iter : int
-            当前迭代编号
-            
-        Returns
-        -------
-        str
-            非关键帧prompt文本
-        """
-        num_nonkeyframes = len(self.current_cycle_nonkeyframes)
-        parent_kf_iter = self.keyframe_history[self.current_keyframe_idx]['iter'] if self.current_keyframe_idx >= 0 else 0
-        
-        prompt = f"""--- Iteration {iter} (NON-KEYFRAME, step {num_nonkeyframes + 1} in current cycle) ---
-
-EXECUTION MODE: Continue following the strategy from keyframe #{self.current_keyframe_idx + 1} (iter {parent_kf_iter}).
-
-Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).
-Additionally, there are always two TURN actions:
-- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place
-- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place
-
-================================================================================
-
-CONTEXT REVIEW:
-Review your conversation history (parent keyframe + {num_nonkeyframes} non-keyframes):
-- What was the strategic decision at the parent keyframe?
-- What actions have you taken since then?
-- Are you still on track with the plan?
-
-Based on the parent keyframe's strategy and your current observation, select the best action to continue the plan.
-
-================================================================================
-
-Provide your action selection in this exact format:
-{{'action': <action_number>}}
-"""
-        
-        return prompt
-
-    def _encode_image_to_base64(self, image):
-        """
-        将numpy图片编码为base64 URL格式
-        
-        Parameters
-        ----------
-        image : np.ndarray
-            RGB图片数组
-            
-        Returns
-        -------
-        str
-            base64编码的图片URL
-        """
-        import base64
-        from io import BytesIO
-        from PIL import Image
-        
-        # 转换numpy数组为PIL Image
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-        
-        # 编码为base64
-        buffered = BytesIO()
-        image.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        
-        return f"data:image/jpeg;base64,{img_str}"
-
-    def _build_vlm_history_for_keyframe(self):
-        """
-        为关键帧构建VLM历史：所有历史关键帧的对话
-        
-        关键帧需要看到所有历史关键帧的决策，以便：
-        1. 避免重复探索已访问区域
-        2. 保持长期探索策略的连贯性
-        3. 基于历史经验做出更好的战略决策
-        
-        Returns
-        -------
-        list
-            VLM消息历史，格式为[{"role": "user", "content": [...]}, {"role": "assistant", "content": "..."}, ...]
-        """
-        history = []
-        
-        for kf in self.keyframe_history:
-            # User message（关键帧的标注图片 + prompt）
-            history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": self._encode_image_to_base64(kf['rgb_vis'])
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": kf['prompt']
-                    }
-                ]
-            })
-            
-            # Assistant response
-            history.append({
-                "role": "assistant",
-                "content": kf['response']
-            })
-        
-        return history
-
-    def _build_vlm_history_for_nonkeyframe(self):
-        """
-        为非关键帧构建VLM历史：当前关键帧 + 该周期内的所有非关键帧
-        
-        非关键帧只需要看到：
-        1. 父关键帧的战略决策（作为执行依据）
-        2. 该周期内已执行的非关键帧（了解执行进度）
-        
-        这样可以在保持上下文连贯性的同时，避免token消耗过大。
-        
-        Returns
-        -------
-        list
-            VLM消息历史
-        """
-        history = []
-        
-        # 1. 当前所属的关键帧
-        if self.current_keyframe_idx >= 0:
-            kf = self.keyframe_history[self.current_keyframe_idx]
-            
-            history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": self._encode_image_to_base64(kf['rgb_vis'])
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": kf['prompt']
-                    }
-                ]
-            })
-            
-            history.append({
-                "role": "assistant",
-                "content": kf['response']
-            })
-        
-        # 2. 该周期内的所有非关键帧
-        for nkf in self.current_cycle_nonkeyframes:
-            history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": self._encode_image_to_base64(nkf['rgb_vis'])
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": nkf['prompt']
-                    }
-                ]
-            })
-            
-            history.append({
-                "role": "assistant",
-                "content": nkf['response']
-            })
-        
-        return history
 
     def step(self, obs: dict):
         if self.step_ndx == 0:
@@ -360,7 +97,6 @@ Provide your action selection in this exact format:
         self.voxel_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         self.explored_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         self.scale = 100
-        self.stopping_calls = [-2]
         self.step_ndx = 0
         self.init_pos = None
         
@@ -368,20 +104,15 @@ Provide your action selection in this exact format:
         self.goal = goal
         self.goal_description = goal_description
         
-        # Keyframe mode state
-        self.current_waypoint_P_global = None  # (x, y, z) in odom frame
-        self.is_keyframe = True  # First frame is always keyframe
-        
-        # Memory管理：分层历史结构
-        self.keyframe_history = []  # 所有关键帧记录（用于构建关键帧VLM历史）
-        self.current_cycle_nonkeyframes = []  # 当前关键帧周期内的非关键帧
-        self.current_keyframe_idx = -1  # 当前所属的关键帧索引
+        # Reset waypoint registry
+        self.waypoint_registry = {}
+        self.next_wp_id = 1
         
         # Build initial prompt with goal information if provided
         if goal:
             initial_prompt = self._build_initial_prompt(goal, goal_description)
             self.actionVLM.reset(initial_prompt=initial_prompt)
-            print(f"[NavAgent] Reset with goal='{goal}', VLM initialized with full task briefing")
+            print(f"[NavAgent] Reset with goal='{goal}', VLM initialized with Function Call mode")
         else:
             self.actionVLM.reset()
             print("[NavAgent] Reset without goal, VLM history cleared")
@@ -458,184 +189,375 @@ Remember these instructions throughout the navigation episode. I will show you o
 """
         return initial_prompt
     
-    def get_history_summary(self):
+    def _generate_bev_with_waypoints(self, current_pos: np.ndarray) -> np.ndarray:
         """
-        Get a summary of navigation history for debugging/logging.
-        Attaches current non-keyframe buffer to the last keyframe before returning.
+        生成标注了历史waypoints的BEV地图
         
+        Parameters
+        ----------
+        current_pos : np.ndarray
+            当前机器人位置（odom坐标系）
+            
+        Returns
+        -------
+        np.ndarray
+            标注后的BEV图像（RGB）
+        """
+        # 复制explored_map作为基础
+        bev = self.explored_map.copy()
+        
+        # 标注当前位置（红色大圆）
+        current_grid = self._global_to_grid(current_pos)
+        cv2.circle(bev, current_grid, 30, RED, -1)
+        cv2.putText(bev, "YOU", (current_grid[0]-20, current_grid[1]-35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, RED, 2)
+        
+        # 标注历史waypoints（蓝色圆+编号）
+        for wp_id, wp_data in self.waypoint_registry.items():
+            wp_pos = wp_data['pos']
+            wp_grid = self._global_to_grid(wp_pos)
+            
+            # 画圆
+            cv2.circle(bev, wp_grid, 20, (255, 0, 0), -1)  # 蓝色
+            cv2.circle(bev, wp_grid, 20, WHITE, 2)  # 白色边框
+            
+            # 画编号
+            text = str(wp_id)
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            cv2.putText(bev, text, (wp_grid[0]-tw//2, wp_grid[1]+th//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, WHITE, 2)
+        
+        # 添加图例
+        legend_y = 50
+        cv2.putText(bev, "BEV Map with Waypoints", (20, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, WHITE, 2)
+        cv2.putText(bev, f"Total Waypoints: {len(self.waypoint_registry)}", (20, legend_y+40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, WHITE, 2)
+        
+        return bev
+    
+    def _annotate_frontiers(self, rgb: np.ndarray, a_final: list, K, T_cam_base):
+        """
+        在当前RGB图像上标注可选择的frontiers
+        
+        Parameters
+        ----------
+        rgb : np.ndarray
+            当前RGB图像
+        a_final : list
+            候选动作列表 [(r, theta), ...]
+        K : np.ndarray
+            相机内参
+        T_cam_base : np.ndarray
+            cam->base变换矩阵
+            
+        Returns
+        -------
+        rgb_annotated : np.ndarray
+            标注后的RGB图像
+        frontier_map : dict
+            frontier映射 {frontier_id: (r, theta)}
+        """
+        rgb_annotated = rgb.copy()
+        frontier_map = {}
+        
+        # 使用字母标识frontiers（A, B, C...）
+        for idx, (r, theta) in enumerate(a_final):
+            if idx >= 26:  # 最多26个frontiers
+                break
+            
+            label = chr(65 + idx)  # A-Z
+            
+            # 投影waypoint到图像（80%距离处）
+            r_waypoint = r * 0.8
+            p_base = np.array([r_waypoint * np.cos(theta), r_waypoint * np.sin(theta), 0.0])
+            uv = point_to_pixel(p_base, K, T_cam_base)
+            
+            if uv is None:
+                continue
+            
+            pixel_pos = (int(round(uv[0][0])), int(round(uv[0][1])))
+            H, W = rgb.shape[:2]
+            
+            if not (0 <= pixel_pos[0] < W and 0 <= pixel_pos[1] < H):
+                continue
+            
+            frontier_map[label] = (r, theta)
+            
+            # 画绿色圆圈+字母
+            cv2.circle(rgb_annotated, pixel_pos, 25, GREEN, 3)
+            cv2.putText(rgb_annotated, label, (pixel_pos[0]-10, pixel_pos[1]+10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, GREEN, 3)
+        
+        # 添加标题
+        cv2.putText(rgb_annotated, "Current View - Select Frontier", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, WHITE, 2)
+        
+        return rgb_annotated, frontier_map
+    
+    def _get_function_definitions(self) -> list:
+        """返回Function定义"""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_waypoint_rgb",
+                    "description": "查看历史waypoint的第一人称RGB视角，帮助回忆该位置的环境",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "wp_id": {
+                                "type": "integer",
+                                "description": f"waypoint编号，可选范围：{list(self.waypoint_registry.keys()) if self.waypoint_registry else 'none'}"
+                            }
+                        },
+                        "required": ["wp_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "go_to",
+                    "description": "导航回到某个历史waypoint位置",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "wp_id": {
+                                "type": "integer",
+                                "description": "目标waypoint编号"
+                            }
+                        },
+                        "required": ["wp_id"]
+                    }
+                }
+            }
+        ]
+    
+    def _handle_function_call(self, tool_name: str, args: dict) -> dict:
+        """
+        处理Function Call
+        
+        Parameters
+        ----------
+        tool_name : str
+            函数名称
+        args : dict
+            函数参数
+            
         Returns
         -------
         dict
-            Dictionary containing history statistics and full history
+            {'success': bool, 'result': any, 'error': str}
         """
-        if not self.cfg['keyframe_mode']:
-            return {'keyframe_mode': False}
-        
-        # Attach current non-keyframe buffer to the last keyframe
-        if len(self.keyframe_history) > 0 and len(self.current_cycle_nonkeyframes) > 0:
-            self.keyframe_history[-1]['non_keyframes'] = self.current_cycle_nonkeyframes.copy()
-        
-        # Build full history for serialization (without rgb_vis to save space)
-        full_history = []
-        for kf in self.keyframe_history:
-            kf_record = {
-                'iter': kf['iter'],
-                'is_keyframe': True,
-                'action': kf['action'],
-                'action_number': kf['action_number'],
-                'response': kf['response'],
-                'timestamp': kf.get('timestamp'),
-                'non_keyframes': []
-            }
-            # Add non-keyframes for this keyframe
-            for nkf in kf.get('non_keyframes', []):
-                nkf_record = {
-                    'iter': nkf['iter'],
-                    'is_keyframe': False,
-                    'action': nkf['action'],
-                    'action_number': nkf['action_number'],
-                    'response': nkf['response'],
-                    'timestamp': nkf.get('timestamp')
+        if tool_name == 'get_waypoint_rgb':
+            wp_id = args.get('wp_id')
+            
+            if wp_id not in self.waypoint_registry:
+                return {
+                    'success': False,
+                    'result': None,
+                    'error': f"Waypoint {wp_id} not found. Available: {list(self.waypoint_registry.keys())}"
                 }
-                kf_record['non_keyframes'].append(nkf_record)
-            full_history.append(kf_record)
+            
+            return {
+                'success': True,
+                'result': self.waypoint_registry[wp_id]['rgb'],
+                'error': None
+            }
+        
+        elif tool_name == 'go_to':
+            wp_id = args.get('wp_id')
+            
+            if wp_id not in self.waypoint_registry:
+                return {
+                    'success': False,
+                    'result': None,
+                    'error': f"Waypoint {wp_id} not found"
+                }
+            
+            wp_data = self.waypoint_registry[wp_id]
+            return {
+                'success': True,
+                'result': {
+                    'action_type': 'go_to_waypoint',
+                    'target_pos': wp_data['pos'],
+                    'target_yaw': wp_data['yaw']
+                },
+                'error': None
+            }
         
         return {
-            'keyframe_mode': True,
-            'total_keyframes': len(self.keyframe_history),
-            'nonkeyframe_buffer_size': len(self.current_cycle_nonkeyframes),
-            'current_waypoint_P': self.current_waypoint_P_global.tolist() if self.current_waypoint_P_global is not None else None,
-            'keyframe_iters': [kf['iter'] for kf in self.keyframe_history],
-            'nonkeyframe_iters': [nkf['iter'] for nkf in self.current_cycle_nonkeyframes],
-            'full_history': full_history
+            'success': False,
+            'result': None,
+            'error': f"Unknown function: {tool_name}"
         }
+    
+    def _register_waypoint(self, obs: dict, action: tuple):
+        """
+        注册新waypoint到registry
+        
+        Parameters
+        ----------
+        obs : dict
+            当前观测
+        action : tuple
+            (r, theta) 动作
+        """
+        r, theta = action
+        T_odom_base = obs['base_to_odom_matrix']
+        
+        # 计算waypoint全局位置
+        p_base = np.array([r * np.cos(theta), r * np.sin(theta), 0.0, 1.0])
+        p_odom = T_odom_base @ p_base
+        
+        # 计算yaw
+        yaw = mat_to_yaw(T_odom_base)
+        
+        # 保存
+        self.waypoint_registry[self.next_wp_id] = {
+            'pos': p_odom[:3],
+            'rgb': obs['rgb'].copy(),
+            'iter': self.step_ndx,
+            'yaw': yaw
+        }
+        
+        print(f"[NavAgent] Registered waypoint {self.next_wp_id} at {p_odom[:3]}")
+        self.next_wp_id += 1
+    
+    def _nav_with_function_call(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
+        """
+        支持Function Call的导航决策
+        
+        Returns
+        -------
+        response : str
+            VLM完整响应
+        rgb_vis : np.ndarray
+            可视化图像
+        action : tuple/dict
+            动作（可能是frontier或waypoint）
+        timing_info : dict
+            时序信息
+        """
+        t_start = time.time()
+        
+        # 1. 计算可导航性
+        a_initial = self._navigability(obs)
+        a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
+        
+        # 2. 生成BEV和标注frontiers
+        current_pos = obs['base_to_odom_matrix'][:3, 3]
+        bev_map = self._generate_bev_with_waypoints(current_pos)
+        
+        K = obs['intrinsic']
+        T_cam_base = obs['extrinsic'] @ obs['base_to_odom_matrix']
+        rgb_annotated, frontier_map = self._annotate_frontiers(obs['rgb'], a_final, K, T_cam_base)
+        
+        # 3. 构建prompt
+        frontier_list = ', '.join(frontier_map.keys()) if frontier_map else 'none'
+        wp_list = ', '.join(map(str, self.waypoint_registry.keys())) if self.waypoint_registry else 'none'
+        
+        prompt = f"""Iteration {iter}: Finding {goal}
 
+Image 1: BEV map (YOU=red, waypoints={wp_list})
+Image 2: Current view (frontiers={frontier_list})
+
+Actions:
+1. Select frontier: {{"action": "frontier", "id": "A"}}
+2. View waypoint: call get_waypoint_rgb(wp_id)
+3. Go to waypoint: call go_to(wp_id)
+
+Decide based on BEV global info and current view."""
+        
+        # 4. Function Call循环
+        tools = self._get_function_definitions()
+        images = [bev_map, rgb_annotated]
+        
+        for fc_iter in range(self.cfg['max_fc_iterations']):
+            print(f"[NavAgent] FC iteration {fc_iter+1}/{self.cfg['max_fc_iterations']}")
+            
+            response = self.actionVLM.call_with_tools(images, prompt, tools)
+            
+            if response['type'] == 'tool_call':
+                # VLM调用函数
+                for tool_call in response['tool_calls']:
+                    tool_name = tool_call['name']
+                    tool_args = tool_call['args']
+                    tool_id = tool_call['id']
+                    
+                    print(f"[NavAgent] VLM called: {tool_name}({tool_args})")
+                    
+                    # 执行函数
+                    result = self._handle_function_call(tool_name, tool_args)
+                    
+                    if not result['success']:
+                        # 添加错误结果
+                        self.actionVLM.add_tool_result(
+                            tool_id, tool_name, f"Error: {result['error']}"
+                        )
+                        prompt = f"Error occurred. Please try again or make direct decision."
+                        images = []
+                    else:
+                        if tool_name == 'get_waypoint_rgb':
+                            # 返回waypoint视角
+                            self.actionVLM.add_tool_result(
+                                tool_id, tool_name,
+                                f"Showing waypoint {tool_args['wp_id']} view"
+                            )
+                            prompt = f"This is waypoint {tool_args['wp_id']}. Continue decision."
+                            images = [result['result']]
+                        
+                        elif tool_name == 'go_to':
+                            # 直接返回
+                            t_end = time.time()
+                            return (
+                                response['content'],
+                                rgb_annotated,
+                                result['result'],
+                                {'total_time': t_end - t_start, 'fc_iterations': fc_iter + 1}
+                            )
+            else:
+                # 最终决策
+                try:
+                    decision = self._eval_response(response['content'])
+                    if decision.get('action') == 'frontier':
+                        frontier_id = decision['id']
+                        if frontier_id in frontier_map:
+                            action = frontier_map[frontier_id]
+                            self._register_waypoint(obs, action)
+                            
+                            t_end = time.time()
+                            return (
+                                response['content'],
+                                rgb_annotated,
+                                action,
+                                {'total_time': t_end - t_start, 'fc_iterations': fc_iter + 1}
+                            )
+                except Exception as e:
+                    print(f"[NavAgent] Parse error: {e}")
+                
+                t_end = time.time()
+                return (
+                    None,
+                    rgb_annotated,
+                    None,
+                    {'total_time': t_end - t_start, 'fc_iterations': fc_iter + 1}
+                )
+        
+        # 超时
+        t_end = time.time()
+        return (
+            None,
+            rgb_annotated,
+            None,
+            {'total_time': t_end - t_start, 'fc_iterations': self.cfg['max_fc_iterations']}
+        )
+    
     def cal_fov(self, intrinsics: np.ndarray, W: int):
         fx = intrinsics[0, 0]
         return 2 * np.arctan(W / (2 * fx)) * 180 / np.pi
     
-    def _transform_waypoint_to_current_base(self, P_global, T_odom_base_current):
-        """
-        Transform waypoint P from global (odom) coordinates to current base frame.
-        
-        Parameters
-        ----------
-        P_global : np.ndarray
-            Waypoint position in odom frame (x, y, z)
-        T_odom_base_current : np.ndarray
-            Current base pose (4x4 matrix, base->odom)
-            
-        Returns
-        -------
-        r : float
-            Distance from current base to P
-        theta : float
-            Angle from current base to P (radians)
-        """
-        # Transform P from odom to current base frame
-        # T_odom_base: base->odom, so we need odom->base = inv(T_odom_base)
-        T_base_odom = np.linalg.inv(T_odom_base_current)
-        
-        # P in homogeneous coordinates
-        P_homo = np.array([P_global[0], P_global[1], P_global[2], 1.0], dtype=np.float64)
-        
-        # Transform to base frame
-        P_base = T_base_odom @ P_homo
-        
-        # Calculate r and theta in base frame (x-forward, y-left)
-        r = float(np.sqrt(P_base[0]**2 + P_base[1]**2))
-        theta = float(np.arctan2(P_base[1], P_base[0]))
-        
-        return r, theta
-    
-    def _can_project_waypoint(self, P_global, obs):
-        """
-        Check if waypoint P can be projected to current frame.
-        
-        Parameters
-        ----------
-        P_global : np.ndarray
-            Waypoint position in odom frame (x, y, z)
-        obs : dict
-            Current observation with intrinsic, extrinsic, base_to_odom_matrix
-            
-        Returns
-        -------
-        can_project : bool
-            Whether P can be projected to image
-        pixel_coords : tuple or None
-            (u, v) pixel coordinates if projectable, None otherwise
-        """
-        if P_global is None:
-            return False, None
-        
-        # Transform P to current base frame
-        r, theta = self._transform_waypoint_to_current_base(P_global, obs['base_to_odom_matrix'])
-        
-        # Try to project to image
-        K = obs['intrinsic']
-        T_cam_odom = obs['extrinsic']
-        T_odom_base = obs['base_to_odom_matrix']
-        T_cam_base = T_cam_odom @ T_odom_base
-        
-        # Check if can project (using existing method)
-        pixel_coords = self._can_project(r, theta, obs['rgb'].shape[:2], K, T_cam_base)
-        
-        if pixel_coords is not None:
-            return True, pixel_coords
-        else:
-            return False, None
-    
-    def _determine_frame_type(self, obs):
-        """
-        Determine if current frame is keyframe or non-keyframe.
-        
-        Parameters
-        ----------
-        obs : dict
-            Current observation
-            
-        Returns
-        -------
-        is_keyframe : bool
-            True if keyframe, False if non-keyframe
-        angle_range : tuple or None
-            (theta_min, theta_max) for non-keyframe, None for keyframe
-        clip_dist_override : float or None
-            Distance override for non-keyframe, None for keyframe
-        r_P : float or None
-            Distance to waypoint P in current base frame (for non-keyframe)
-        theta_P : float or None
-            Angle to waypoint P in current base frame (for non-keyframe)
-        """
-        if not self.cfg['keyframe_mode']:
-            # Keyframe mode disabled, always treat as keyframe
-            return True, None, None, None, None
-        
-        # First frame is always keyframe
-        if self.current_waypoint_P_global is None:
-            return True, None, None, None, None
-        
-        # Check if P can be projected to current frame
-        can_project, _ = self._can_project_waypoint(self.current_waypoint_P_global, obs)
-        
-        if can_project:
-            # Non-keyframe: P is visible
-            r_P, theta_P = self._transform_waypoint_to_current_base(
-                self.current_waypoint_P_global, obs['base_to_odom_matrix']
-            )
-            
-            # Calculate angle range: P ± keyframe_angle_range
-            angle_range_deg = self.cfg['keyframe_angle_range']
-            angle_range_rad = np.deg2rad(angle_range_deg)
-            theta_min = theta_P - angle_range_rad
-            theta_max = theta_P + angle_range_rad
-            
-            return False, (theta_min, theta_max), r_P, r_P, theta_P
-        else:
-            # Keyframe: P is not visible
-            return True, None, None, None, None
-
     def _global_to_grid(self, position: np.ndarray):
         dx = position[0] - self.init_pos[0]
         dy = position[1] - self.init_pos[1]
@@ -1089,144 +1011,8 @@ Remember these instructions throughout the navigation episode. I will show you o
         return projected
 
     def _nav(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
-        # Determine frame type (keyframe or non-keyframe)
-        is_keyframe, angle_range, clip_dist_override, r_P, theta_P = self._determine_frame_type(obs)
-        
-        # Store frame type for prompt generation
-        self.is_keyframe = is_keyframe
-        
-        print(f"[NavAgent] Frame type: {'KEYFRAME' if is_keyframe else 'NON-KEYFRAME'}")
-        if not is_keyframe:
-            print(f"[NavAgent] Non-keyframe: P at r={r_P:.2f}m, theta={np.degrees(theta_P):.1f}°, "
-                  f"angle_range={np.degrees(angle_range[0]):.1f}° to {np.degrees(angle_range[1]):.1f}°, "
-                  f"clip_dist={clip_dist_override:.2f}m")
-        
-        # Compute navigability with appropriate parameters
-        a_initial = self._navigability(obs, angle_range=angle_range, clip_dist_override=clip_dist_override)
-        a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
-
-        # Start timing for projection (image annotation)
-        t_projection_start = time.time()
-        
-        # Generate visualization without highlighting (for initial display)
-        a_final_projected, rgb_vis = self._projection(a_final, obs)
-
-        # Only send current image (VLM manages history internally)
-        images = [rgb_vis]
-
-        # 根据帧类型构建prompt和历史
-        if is_keyframe:
-            prompt = self._construct_keyframe_prompt(
-                num_actions=len(a_final_projected),
-                iter=iter
-            )
-            vlm_history = self._build_vlm_history_for_keyframe()
-            print(f"[NavAgent] Keyframe {len(self.keyframe_history) + 1}: VLM sees {len(self.keyframe_history)} historical keyframes")
-        else:
-            prompt = self._construct_nonkeyframe_prompt(
-                num_actions=len(a_final_projected),
-                iter=iter
-            )
-            vlm_history = self._build_vlm_history_for_nonkeyframe()
-            print(f"[NavAgent] Non-keyframe: VLM sees 1 parent keyframe + {len(self.current_cycle_nonkeyframes)} non-keyframes")
-        
-        t_projection_end = time.time()
-        projection_time = t_projection_end - t_projection_start
-
-        # Start timing for VLM inference
-        t_vlm_start = time.time()
-        
-        # 调用VLM（使用自定义历史，由NavAgent控制Memory）
-        response = self.actionVLM.call_chat_with_custom_history(
-            custom_history=vlm_history,
-            images=images,
-            text_prompt=prompt
-        )
-        
-        t_vlm_end = time.time()
-        vlm_inference_time = t_vlm_end - t_vlm_start
-        
-        frame_type = "KEYFRAME" if is_keyframe else "NON-KEYFRAME"
-        print(f'[NavAgent] Frame type: {frame_type}')
-        print(f'[NavAgent] Timing - Projection: {projection_time:.3f}s, VLM inference: {vlm_inference_time:.3f}s')
-        print(f'[NavAgent] Prompt length: {len(prompt)} chars')
-        print(f'Response: {response}')
-
-        rev = {v: k for k, v in a_final_projected.items()}
-        try:
-            response_dict = self._eval_response(response)
-            action_number = int(response_dict['action'])
-            
-            # Re-generate visualization with chosen action highlighted in GREEN
-            _, rgb_vis_final = self._projection(
-                a_final,
-                obs,
-                chosen_action=action_number
-            )
-            
-            # Prepare timing information (include prompt for debugging)
-            timing_info = {
-                'projection_time': float(projection_time),
-                'vlm_inference_time': float(vlm_inference_time),
-                'prompt': prompt,  # Include prompt for server to save
-                'is_keyframe': is_keyframe
-            }
-            
-            # Handle rotation actions
-            if action_number == -1:
-                # Turn left: return positive angle (counter-clockwise)
-                return response, rgb_vis_final, ('turn', self.turn_angle_deg), timing_info
-            elif action_number == -2:
-                # Turn right: return negative angle (clockwise)
-                return response, rgb_vis_final, ('turn', -self.turn_angle_deg), timing_info
-            else:
-                # Forward movement action
-                action = rev.get(action_number)
-                
-                # History management for keyframe mode
-                if self.cfg['keyframe_mode']:
-                    # Create frame record（保存prompt用于构建VLM历史）
-                    frame_record = {
-                        'iter': iter,
-                        'is_keyframe': is_keyframe,
-                        'action': action,
-                        'action_number': action_number,
-                        'response': response,
-                        'prompt': prompt,  # 保存prompt用于重建VLM对话历史
-                        'rgb_vis': rgb_vis_final.copy() if rgb_vis_final is not None else None,
-                        'timestamp': obs.get('timestamp', None)
-                    }
-                    
-                    if is_keyframe:
-                        # 关键帧：保存waypoint P并开始新周期
-                        if action is not None:
-                            r, theta = action
-                            # Convert (r, theta) in current base frame to global (odom) coordinates
-                            T_odom_base = obs['base_to_odom_matrix']
-                            # Point in base frame
-                            p_base = np.array([r * np.cos(theta), r * np.sin(theta), 0.0, 1.0], dtype=np.float64)
-                            # Transform to odom frame
-                            p_odom = T_odom_base @ p_base
-                            self.current_waypoint_P_global = p_odom[:3]
-                            print(f"[NavAgent] Keyframe: Saved waypoint P at global position: {self.current_waypoint_P_global}")
-                        
-                        # 将当前关键帧添加到历史
-                        self.keyframe_history.append(frame_record)
-                        self.current_keyframe_idx = len(self.keyframe_history) - 1
-                        
-                        # 清空当前周期的非关键帧列表（开始新周期）
-                        self.current_cycle_nonkeyframes = []
-                        
-                        print(f"[NavAgent] Memory: Added keyframe #{self.current_keyframe_idx + 1} (total keyframes: {len(self.keyframe_history)})")
-                    else:
-                        # 非关键帧：添加到当前周期
-                        self.current_cycle_nonkeyframes.append(frame_record)
-                        print(f"[NavAgent] Memory: Added non-keyframe to current cycle (cycle size: {len(self.current_cycle_nonkeyframes)})")
-                
-                return response, rgb_vis_final, action, timing_info
-        except (IndexError, KeyError, TypeError, ValueError) as e:
-            print(f'Error parsing response {e}')
-            return None, None, None, {'projection_time': 0.0, 'vlm_inference_time': 0.0}
+        """主导航逻辑 - 使用Function Call模式"""
+        return self._nav_with_function_call(obs, goal, iter, goal_description)
 
     def _eval_response(self, response: str):
         """Converts the VLM response string into a dictionary, if possible"""

@@ -432,6 +432,55 @@ def navigation_step():
             'timing': timing_info
         })
     
+    # Handle go_to_waypoint action (from Function Call)
+    if isinstance(action, dict) and action.get('action_type') == 'go_to_waypoint':
+        target_pos = action['target_pos']
+        target_yaw = action['target_yaw']
+        
+        print(f"[Server] Action is GO TO WAYPOINT: pos={target_pos}, yaw={target_yaw:.2f}")
+        
+        goal_pose = build_goal_pose(
+            target_pos[0], target_pos[1], target_pos[2], target_yaw
+        )
+        
+        # Update visualization state
+        viz_state['action_type'] = 'go_to_waypoint'
+        nav_state['latest_state'] = viz_state
+        socketio.emit('navigation_update', viz_state)
+        
+        # Calculate timing
+        t_server_end = time.time()
+        total_server_time = t_server_end - t_server_start
+        
+        timing_info = {
+            'total_server_time': float(total_server_time),
+            'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
+            'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+        }
+        
+        # Update timing file
+        timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+        if os.path.exists(timing_path):
+            with open(timing_path, 'r') as f:
+                timing_data = json.load(f)
+            timing_data['total_server_time'] = float(total_server_time)
+            timing_data['action_type'] = 'go_to_waypoint'
+            with open(timing_path, 'w') as f:
+                json.dump(timing_data, f, indent=2)
+        
+        print(f"[Server] Timing - Total: {total_server_time:.3f}s")
+        
+        return jsonify({
+            'action_type': 'go_to_waypoint',
+            'goal_pose': {
+                'frame_id': 'odom',
+                'pose': goal_pose
+            },
+            'iteration': iteration,
+            'finished': False,
+            'timing': timing_info
+        })
+    
     # Current base state
     T_odom_base = obs['base_to_odom_matrix'].astype(np.float64)
     x0 = float(T_odom_base[0, 3])

@@ -1,4 +1,5 @@
 import logging
+import json
 import numpy as np
 
 from PIL import Image
@@ -98,9 +99,139 @@ class OpenAIVLM(VLM):
         self.model = model
         self.system_instruction = system_instruction  # Store system instruction
         self.initial_prompt = None  # Will be set during reset with goal info
-        self.history = []  # Conversation history (user+assistant pairs)
+        self.conversation_history = []  # Full conversation history including tool calls
         self.max_image_res = max_image_res
 
+
+    def call_with_tools(self, images: list[np.array], text_prompt: str, tools: list):
+        """
+        支持Function Calling的VLM调用（单轮）
+        
+        Parameters
+        ----------
+        images : list[np.array]
+            图像列表（可能为空，如果是tool result的后续轮次）
+        text_prompt : str
+            文本提示
+        tools : list
+            Function定义列表
+            
+        Returns
+        -------
+        dict
+            {'type': 'final_answer'/'tool_call', 'content': str, 'tool_calls': list}
+        """
+        # 构建当前用户消息
+        text_contents = [{"type": "text", "text": text_prompt}]
+        image_contents = self._image_contents_from_images(images) if images else []
+        
+        current_message = {
+            "role": "user",
+            "content": text_contents + image_contents
+        }
+        
+        # 构建完整消息列表
+        messages = []
+        
+        # 1. 添加系统指令
+        if self.system_instruction:
+            messages.append({"role": "system", "content": self.system_instruction})
+        
+        # 2. 添加初始prompt
+        if self.initial_prompt:
+            messages.append({"role": "user", "content": self.initial_prompt})
+            messages.append({"role": "assistant", "content": "Understood. I will follow these instructions."})
+        
+        # 3. 添加对话历史
+        messages.extend(self.conversation_history)
+        
+        # 4. 添加当前消息
+        messages.append(current_message)
+        
+        try:
+            # 调用API
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=2048,
+                temperature=0.0
+            )
+            
+            message = response.choices[0].message
+            
+            # 保存当前用户消息到历史
+            self.conversation_history.append(current_message)
+            
+            # 检查是否有tool_calls
+            if message.tool_calls:
+                # 保存assistant的tool_call消息
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        } for tc in message.tool_calls
+                    ]
+                })
+                
+                return {
+                    'type': 'tool_call',
+                    'content': message.content or "",
+                    'tool_calls': [
+                        {
+                            'id': tc.id,
+                            'name': tc.function.name,
+                            'args': json.loads(tc.function.arguments)
+                        } for tc in message.tool_calls
+                    ]
+                }
+            else:
+                # 最终答案
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": message.content
+                })
+                return {
+                    'type': 'final_answer',
+                    'content': message.content,
+                    'tool_calls': None
+                }
+        
+        except Exception as e:
+            logging.error(f"OPENAI API ERROR: {e}")
+            return {
+                'type': 'final_answer',
+                'content': "OPENAI API ERROR",
+                'tool_calls': None
+            }
+    
+    def add_tool_result(self, tool_call_id: str, tool_name: str, result_content: str):
+        """
+        添加tool执行结果到对话历史
+        
+        Parameters
+        ----------
+        tool_call_id : str
+            Tool call的ID（用于关联）
+        tool_name : str
+            函数名称
+        result_content : str
+            执行结果的文本描述
+        """
+        self.conversation_history.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": result_content
+        })
 
     def call_chat(self, history: int, images: list[np.array], text_prompt: str):
         """
@@ -260,7 +391,7 @@ class OpenAIVLM(VLM):
             Initial prompt containing task briefing (e.g., goal description, rules).
             This will be added to history after system instruction.
         """
-        self.history = []
+        self.conversation_history = []
         self.initial_prompt = initial_prompt
 
 
