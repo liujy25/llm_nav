@@ -284,7 +284,13 @@ class OpenAIVLM(VLM):
                 # Assistant响应
                 content = msg.get("content", "")
                 if content:
-                    lines.append(content)
+                    # content可能是字符串或列表
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                lines.append(item.get("text", ""))
+                    else:
+                        lines.append(str(content))
                 
                 # Tool calls
                 tool_calls = msg.get("tool_calls", [])

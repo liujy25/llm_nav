@@ -27,10 +27,7 @@ class NavAgent:
     explored_color = GREY
     unexplored_color = GREEN
 
-    map_size = 5000
-    explore_threshold = 3
-    voxel_ray_size = 60
-    e_i_scaling = 0.8
+    map_size = 200  # 20m x 20m at 10 pixels/meter
 
     def __init__(self, cfg=None):
         self.cfg = cfg or {}
@@ -38,12 +35,11 @@ class NavAgent:
         # defaults
         self.cfg.setdefault('num_theta', 40)
         self.cfg.setdefault('image_edge_threshold', 0.04)
-        self.cfg.setdefault('clip_dist', 2.0)
-        self.cfg.setdefault('turn_angle_deg', 30.0)  # Turn left/right angle in degrees
+        self.cfg.setdefault('clip_dist', 5.0)
         
         # Navigability configuration (obstacle height range)
-        self.cfg.setdefault('obstacle_height_min', 0.15)  # Minimum obstacle height (m)
-        self.cfg.setdefault('obstacle_height_max', 2.0)   # Maximum obstacle height (m)
+        self.cfg.setdefault('obstacle_height_min', 0.2)  # Minimum obstacle height (m)
+        self.cfg.setdefault('obstacle_height_max', 1.5)   # Maximum obstacle height (m)
         
         # Function Call configuration
         self.cfg.setdefault('max_fc_iterations', 5)  # Maximum Function Call iterations
@@ -56,10 +52,12 @@ class NavAgent:
         
         # ObstacleMap configuration
         self.cfg.setdefault('agent_radius', 0.3)  # Robot radius in meters
-        self.cfg.setdefault('frontier_area_thresh', 3.0)  # Minimum frontier area in m^2
+        self.cfg.setdefault('frontier_area_thresh', 1.0)  # Minimum frontier area in m^2
 
         self.clip_dist = self.cfg['clip_dist']
-        self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
+        
+        # Initialize scale (pixels per meter): 10cm voxel size = 10 pixels/meter
+        self.scale = 10
         
         # Initialize goal attributes (will be set properly in reset())
         self.goal = None
@@ -271,8 +269,8 @@ Remember these instructions throughout the navigation episode. Each iteration wi
             wp_yaw = wp_data['yaw']
             wp_px = self.obstacle_map._xy_to_px(wp_pos[:2].reshape(1, 2))[0]
             
-            # 绘制FOV扇形
-            fov_radius = 50  # 扇形半径（像素）
+            # 绘制FOV扇形（根据地图大小调整）
+            fov_radius = 2  # 扇形半径（像素），适配200x200地图
             fov_angle = self.fov if hasattr(self, 'fov') else 60  # 使用相机FOV（度）
             
             # 计算扇形的起始和结束角度
@@ -308,22 +306,22 @@ Remember these instructions throughout the navigation episode. Each iteration wi
                 2
             )
             
-            # 画中心圆
-            cv2.circle(bev, tuple(wp_px.astype(int)), 15, BLUE, -1)  # 蓝色填充
-            cv2.circle(bev, tuple(wp_px.astype(int)), 15, WHITE, 2)  # 白色边框
+            # 画中心圆（根据地图大小调整）
+            cv2.circle(bev, tuple(wp_px.astype(int)), 1, BLUE, -1)  # 蓝色填充
+            cv2.circle(bev, tuple(wp_px.astype(int)), 1, WHITE, 1)  # 白色边框
             
-            # 画编号
+            # 画编号（缩小字体）
             text = str(wp_id)
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1)
             cv2.putText(bev, text, (int(wp_px[0]-tw//2), int(wp_px[1]+th//2)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, WHITE, 1)
         
-        # 添加图例
-        legend_y = 50
-        cv2.putText(bev, "BEV Map with Waypoints", (20, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, WHITE, 2)
-        cv2.putText(bev, f"Total Waypoints: {len(self.waypoint_registry)}", (20, legend_y+40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, WHITE, 2)
+        # 添加图例（缩小字体）
+        legend_y = 10
+        cv2.putText(bev, "BEV Map", (5, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, WHITE, 1)
+        cv2.putText(bev, f"WP: {len(self.waypoint_registry)}", (5, legend_y+10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, WHITE, 1)
         
         return bev
     
@@ -346,6 +344,8 @@ Remember these instructions throughout the navigation episode. Each iteration wi
         # 获取所有frontier（全局坐标）
         all_frontiers = self.obstacle_map.frontiers
         
+        print(f"[_get_visible_frontiers] Total frontiers: {len(all_frontiers)}")
+        
         if len(all_frontiers) == 0:
             return []
         
@@ -367,10 +367,12 @@ Remember these instructions throughout the navigation episode. Each iteration wi
         fov_horizontal = 2 * np.arctan(W / (2 * fx))
         max_dist = self.clip_dist
         
+        print(f"[_get_visible_frontiers] Robot pos: {robot_pos[:2]}, yaw: {np.rad2deg(robot_yaw):.1f}°, FOV: {np.rad2deg(fov_horizontal):.1f}°")
+        
         visible_frontiers = []
         
-        for frontier_xy in all_frontiers:
-            frontier_3d = np.array([frontier_xy[0], frontier_xy[1], 0.0])
+        for i, frontier_xy in enumerate(all_frontiers):
+            frontier_3d = np.array([frontier_xy[0], frontier_xy[1], -0.10])
             
             # 1. 检查FOV角度
             vec_to_frontier = frontier_3d[:2] - robot_pos[:2]
@@ -381,6 +383,7 @@ Remember these instructions throughout the navigation episode. Each iteration wi
             ))
             
             if angle_diff > fov_horizontal / 2:
+                print(f"  Frontier {i} at {frontier_xy}: angle_diff={np.rad2deg(angle_diff):.1f}° > FOV/2, SKIP (FOV check)")
                 continue
             
             # 2. 投影到图像
@@ -391,6 +394,7 @@ Remember these instructions throughout the navigation episode. Each iteration wi
             uv = point_to_pixel(frontier_base[:3], K, T_cam_base)
             
             if uv is None:
+                print(f"  Frontier {i} at {frontier_xy}: projection failed, SKIP")
                 continue
             
             pixel_pos = (int(round(uv[0][0])), int(round(uv[0][1])))
@@ -398,10 +402,13 @@ Remember these instructions throughout the navigation episode. Each iteration wi
             # 3. 检查是否在图像范围内（留一些边距）
             margin = int(0.05 * min(W, H))
             if not (margin <= pixel_pos[0] < W - margin and margin <= pixel_pos[1] < H - margin):
+                print(f"  Frontier {i} at {frontier_xy}: pixel {pixel_pos} out of bounds [{margin}, {W-margin}]x[{margin}, {H-margin}], SKIP")
                 continue
             
+            print(f"  Frontier {i} at {frontier_xy}: VISIBLE at pixel {pixel_pos}")
             visible_frontiers.append((frontier_xy, pixel_pos))
         
+        print(f"[_get_visible_frontiers] Result: {len(visible_frontiers)} visible frontiers")
         return visible_frontiers
     
     def _get_visible_frontiers_from_pose(self, pose: np.ndarray, yaw: float, 
@@ -514,6 +521,7 @@ Remember these instructions throughout the navigation episode. Each iteration wi
     def _annotate_frontiers(self, rgb: np.ndarray, visible_frontiers: list, obs: dict):
         """
         在当前RGB图像上标注可见的frontiers（使用全局ID）
+        添加黑边以显示所有frontier投影位置（包括超出原始图像边界的）
         
         Parameters
         ----------
@@ -527,36 +535,86 @@ Remember these instructions throughout the navigation episode. Each iteration wi
         Returns
         -------
         rgb_annotated : np.ndarray
-            标注后的RGB图像
+            标注后的RGB图像（带黑边）
         frontier_map : dict
             frontier映射 {frontier_id: frontier_xy}
         """
-        rgb_annotated = rgb.copy()
+        H, W = rgb.shape[:2]
+        padding = 200  # 黑边宽度（像素）
+        
+        # 创建带黑边的图像
+        rgb_padded = np.zeros((H + 2*padding, W + 2*padding, 3), dtype=np.uint8)
+        rgb_padded[padding:padding+H, padding:padding+W] = rgb
         frontier_map = {}
         
-        # 使用全局ID标识frontiers
-        for frontier_xy, pixel_pos in visible_frontiers:
+        # 获取所有frontiers并投影（不仅是visible的）
+        all_frontiers = self.obstacle_map.frontiers
+        K = obs['intrinsic']
+        T_cam_odom = obs['extrinsic']
+        T_odom_base = obs['base_to_odom_matrix']
+        T_cam_base = T_cam_odom @ T_odom_base
+        
+        print(f"[_annotate_frontiers] Total frontiers: {len(all_frontiers)}, padding: {padding}")
+        
+        for frontier_xy in all_frontiers:
             # 找到对应的全局ID
             frontier_id = self._find_frontier_id(frontier_xy)
-            
             if frontier_id is None:
-                # 如果找不到ID（理论上不应该发生），跳过
                 continue
             
-            frontier_map[frontier_id] = frontier_xy
+            # 投影到图像
+            frontier_3d = np.array([frontier_xy[0], frontier_xy[1], 0.0])
+            frontier_homo = np.array([frontier_3d[0], frontier_3d[1], frontier_3d[2], 1.0])
+            frontier_base = np.linalg.inv(T_odom_base) @ frontier_homo
             
-            # 画绿色圆圈+全局ID
-            cv2.circle(rgb_annotated, pixel_pos, 25, GREEN, 3)
+            uv = point_to_pixel(frontier_base[:3], K, T_cam_base)
+            
+            if uv is None:
+                print(f"  Frontier {frontier_id} at {frontier_xy}: projection failed")
+                continue
+            
+            # 调整坐标到padded图像
+            pixel_x = int(round(uv[0][0])) + padding
+            pixel_y = int(round(uv[0][1])) + padding
+            pixel_pos = (pixel_x, pixel_y)
+            
+            # 检查是否在原始图像范围内（用于区分颜色）
+            in_original = (padding <= pixel_x < W + padding and
+                          padding <= pixel_y < H + padding)
+            
+            # 检查是否在padded图像范围内
+            in_padded = (0 <= pixel_x < W + 2*padding and
+                        0 <= pixel_y < H + 2*padding)
+            
+            if not in_padded:
+                print(f"  Frontier {frontier_id} at {frontier_xy}: pixel {pixel_pos} outside padded bounds")
+                continue
+            
+            # 如果在原始图像范围内，记录到frontier_map
+            if in_original:
+                frontier_map[frontier_id] = frontier_xy
+            
+            # 绘制frontier：原始范围内用绿色，范围外用黄色
+            color = GREEN if in_original else (0, 255, 255)  # 绿色或黄色
+            cv2.circle(rgb_padded, pixel_pos, 25, color, 3)
+            
+            print(f"  Frontier {frontier_id}: drawn at {pixel_pos}, in_original={in_original}")
+            
+            # 绘制ID
             text = str(frontier_id)
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
-            cv2.putText(rgb_annotated, text, (pixel_pos[0]-tw//2, pixel_pos[1]+th//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, GREEN, 3)
+            cv2.putText(rgb_padded, text, (pixel_pos[0]-tw//2, pixel_pos[1]+th//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
         
-        # 添加标题
-        cv2.putText(rgb_annotated, f"Frontiers: {len(visible_frontiers)} visible", (20, 40),
+        # 添加标题（在padded图像上）
+        cv2.putText(rgb_padded, f"Frontiers: {len(frontier_map)} in view, {len(all_frontiers)} total",
+                    (padding + 20, padding + 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, WHITE, 2)
         
-        return rgb_annotated, frontier_map
+        # 绘制原始图像边界（白色矩形）
+        cv2.rectangle(rgb_padded, (padding, padding), (padding + W - 1, padding + H - 1), WHITE, 2)
+        
+        return rgb_padded, frontier_map
     
     def _get_function_definitions(self) -> list:
         """返回Function定义"""
@@ -1008,3 +1066,4 @@ if __name__ == "__main__":
     data = pickle.load(open('/home/liujy/nav_ws/src/llm_nav/captured_data/test_data.pkl', 'rb'))
     agent = NavAgent()
     agent._nav(data, 'banana', iter=1)
+

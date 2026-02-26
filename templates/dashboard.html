@@ -197,13 +197,19 @@
 
         .content {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: 1fr 1fr;
             gap: 15px;
             margin-bottom: 15px;
         }
         
-        /* RGB Vis, BEV Map, and LLM Response in one row */
-        .content > .image-card,
+        /* 左列：图像容器 */
+        .images-column {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        
+        /* 右列：LLM Response占满整列 */
         .content > .response-card {
             grid-column: span 1;
         }
@@ -394,25 +400,28 @@
         </div>
 
         <div class="content">
-            <!-- RGB Visualization -->
-            <div class="image-card">
-                <h3>RGB Visualization</h3>
-                <div class="image-container">
-                    <img id="rgbVisImg" style="display: none;">
-                    <span class="image-placeholder" id="rgbVisPlaceholder">Waiting for data...</span>
+            <!-- 左列：图像 -->
+            <div class="images-column">
+                <!-- RGB Visualization -->
+                <div class="image-card">
+                    <h3>RGB Visualization</h3>
+                    <div class="image-container">
+                        <img id="rgbVisImg" style="display: none;">
+                        <span class="image-placeholder" id="rgbVisPlaceholder">Waiting for data...</span>
+                    </div>
+                </div>
+
+                <!-- BEV Map -->
+                <div class="image-card">
+                    <h3>BEV Map</h3>
+                    <div class="image-container">
+                        <img id="bevMapImg" style="display: none;">
+                        <span class="image-placeholder" id="bevMapPlaceholder">Waiting for data...</span>
+                    </div>
                 </div>
             </div>
 
-            <!-- BEV Map -->
-            <div class="image-card">
-                <h3>BEV Map</h3>
-                <div class="image-container">
-                    <img id="bevMapImg" style="display: none;">
-                    <span class="image-placeholder" id="bevMapPlaceholder">Waiting for data...</span>
-                </div>
-            </div>
-
-            <!-- LLM Response -->
+            <!-- 右列：LLM Response -->
             <div class="response-card">
                 <h3>LLM Response</h3>
                 <div class="goal-info" id="goalInfo" style="display: none;">

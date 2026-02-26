@@ -424,3 +424,114 @@ fov_horizontal = 2 * arctan(W / (2 * fx))
 - 简化了实现逻辑
 - 提高了系统鲁棒性
 - 不影响VLM的决策能力
+
+---
+
+## 2026-02-26 更新记录
+
+### 11. Log保存重构完成 ✅
+
+#### 新增功能
+**[`vlm.py`](vlm.py:236-304)**: 添加`get_conversation_history()`方法
+- 返回纯文本格式的完整对话历史
+- 包含系统指令、初始prompt和所有对话轮次
+- 自动过滤图片内容，只保留文本
+- 正确处理assistant content的list和string两种格式
+
+**[`nav_agent.py`](nav_agent.py:807-920)**: 修复prompt保存
+- 在Function Call循环前保存`initial_prompt`
+- 所有`timing_info`中使用初始prompt而非被修改的prompt
+
+**[`nav_server.py`](nav_server.py:285-318,636-673)**: 更新显示逻辑
+- 实时显示和历史查看都读取`conversation.txt`
+- 修复图像路径：使用`rgb_annotated.jpg`和`bev_map.jpg`
+- web端显示完整VLM对话历史
+
+#### Bug修复
+1. **[`nav_agent.py`](nav_agent.py:62)**: 修复初始化顺序错误
+   - 在`__init__`中提前定义`self.scale`
+   - 避免在初始化`ObstacleMap`时访问未定义的属性
+
+2. **[`obstacle_map.py`](obstacle_map.py:168)**: 修复类型错误
+   - 将`current_point`从tuple转换为numpy数组
+
+3. **[`vlm.py`](vlm.py:285-295)**: 修复content类型错误
+   - 正确处理assistant content的list和string格式
+
+4. **[`nav_server.py`](nav_server.py:437)**: 修复机器人朝向
+   - 机器人到达frontier后朝向移动方向（`yawg = yaw0 + theta`）
+
+5. **[`nav_server.py`](nav_server.py:493-512)**: 禁用VLM stop check
+   - 直接返回False，不调用VLM
+   - 减少VLM调用次数
+
+#### Web端优化
+**[`templates/dashboard.html`](templates/dashboard.html:196-428)**: 修改为两列布局
+- 左列：RGB Visualization和BEV Map垂直排列
+- 右列：LLM Response占满整列
+- 使用CSS Grid实现响应式布局
+
+#### 调试信息添加
+**[`obstacle_map.py`](obstacle_map.py:112-189)**: 地图更新调试
+- 打印点云生成统计
+- 打印障碍物检测统计
+- 打印探索区域统计
+- 打印frontier检测数量
+
+**[`nav_agent.py`](nav_agent.py:349-415)**: Frontier可见性调试
+- 打印总frontier数量
+- 打印机器人位置和FOV信息
+- 打印每个frontier的检查结果（FOV、投影、边界）
+- 打印最终可见frontier数量
+
+**[`obstacle_map.py`](obstacle_map.py:342-352)**: 可视化调试
+- 打印机器人位置的坐标转换
+- 检查机器人位置是否在地图范围内
+- 警告超出边界的情况
+
+---
+
+### 12. 地图配置优化 ✅
+
+#### 配置变更
+**[`nav_agent.py`](nav_agent.py:30,62)**: 调整地图参数
+- **Voxel size**: 1cm → 10cm
+- **Pixels per meter**: 100 → 10
+- **地图尺寸**: 5000x5000 pixels (50m x 50m) → 200x200 pixels (20m x 20m)
+- **实际覆盖范围**: ±25m → ±10m
+
+#### 优势
+1. **降低内存占用**：从25M像素降至40K像素（减少99.8%）
+2. **提高处理速度**：更小的地图尺寸加快frontier检测
+3. **适合室内导航**：20m x 20m足够覆盖单个房间或楼层
+4. **保持精度**：10cm分辨率对于机器人导航足够精确
+
+---
+
+### 保存的Log文件
+
+每个iteration保存以下文件：
+1. **`iter_XXXX_rgb_original.jpg`**: 原始RGB观测（未标注）
+2. **`iter_XXXX_rgb_annotated.jpg`**: 标注后的RGB（带frontier ID）
+3. **`iter_XXXX_bev_map.jpg`**: 传递给VLM的BEV地图
+4. **`iter_XXXX_conversation.txt`**: VLM完整对话历史（纯文本，不含图片）
+5. **`iter_XXXX_timing.json`**: 时序和元数据
+   - `total_time`: 总耗时
+   - `fc_iterations`: Function Call迭代次数
+
+---
+
+### 已知问题和待解决
+
+1. **Frontier可见性问题**：
+   - 地图更新正常，检测到frontier
+   - 但frontier可能不在相机FOV内，导致VLM看不到
+   - 需要通过调试信息确认具体原因
+
+2. **VLM超时问题**：
+   - 阿里云Qwen3.5-plus推理时间较长
+   - 建议在agent_cfg中设置`'vlm_timeout': 120`
+
+3. **ROS 2共享内存问题**：
+   - `RTPS_TRANSPORError`
+   - 解决方法：`rm -rf /dev/shm/fastrtps_*`

@@ -248,6 +248,86 @@ class LLMNavClient(Node):
             'T_odom_base': T_odom_base
         }
     
+    def save_observation_snapshot(self, save_dir: str = 'test_data', prefix: str = 'snapshot') -> str:
+        """
+        保存当前观测数据用于离线测试
+        
+        Parameters
+        ----------
+        save_dir : str
+            保存目录
+        prefix : str
+            文件名前缀
+            
+        Returns
+        -------
+        str
+            保存的目录路径
+        """
+        import os
+        from datetime import datetime
+        
+        # 获取观测数据
+        obs = self.get_obs_snapshot()
+        
+        # 创建保存目录
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        snapshot_dir = os.path.join(save_dir, f'{prefix}_{timestamp}')
+        os.makedirs(snapshot_dir, exist_ok=True)
+        
+        # 保存RGB图像
+        rgb_path = os.path.join(snapshot_dir, 'rgb.png')
+        rgb_pil = Image.fromarray(obs['rgb'])
+        rgb_pil.save(rgb_path)
+        self.get_logger().info(f'Saved RGB to {rgb_path}')
+        
+        # 保存Depth图像（16位PNG）
+        depth_path = os.path.join(snapshot_dir, 'depth.png')
+        depth_mm = (obs['depth'] * 1000.0).astype(np.uint16)
+        depth_pil = Image.fromarray(depth_mm, mode='I;16')
+        depth_pil.save(depth_path)
+        self.get_logger().info(f'Saved Depth to {depth_path}')
+        
+        # 保存相机参数和TF变换
+        params_path = os.path.join(snapshot_dir, 'params.npz')
+        np.savez(
+            params_path,
+            intrinsic=obs['intrinsic'],
+            T_cam_odom=obs['T_cam_odom'],
+            T_odom_base=obs['T_odom_base'],
+            rgb_shape=obs['rgb'].shape,
+            depth_shape=obs['depth'].shape
+        )
+        self.get_logger().info(f'Saved parameters to {params_path}')
+        
+        # 保存可读的文本信息
+        info_path = os.path.join(snapshot_dir, 'info.txt')
+        with open(info_path, 'w') as f:
+            f.write(f'Snapshot captured at: {timestamp}\n')
+            f.write(f'RGB shape: {obs["rgb"].shape}\n')
+            f.write(f'Depth shape: {obs["depth"].shape}\n')
+            f.write(f'Depth range: [{obs["depth"].min():.3f}, {obs["depth"].max():.3f}] meters\n\n')
+            
+            f.write('Camera Intrinsic Matrix:\n')
+            f.write(f'{obs["intrinsic"]}\n\n')
+            
+            f.write('T_cam_odom (odom->cam):\n')
+            f.write(f'{obs["T_cam_odom"]}\n\n')
+            
+            f.write('T_odom_base (base->odom):\n')
+            f.write(f'{obs["T_odom_base"]}\n\n')
+            
+            # 提取位置和姿态
+            base_pos = obs['T_odom_base'][:3, 3]
+            base_yaw = np.arctan2(obs['T_odom_base'][1, 0], obs['T_odom_base'][0, 0])
+            f.write(f'Robot position (odom): [{base_pos[0]:.3f}, {base_pos[1]:.3f}, {base_pos[2]:.3f}]\n')
+            f.write(f'Robot yaw: {base_yaw:.3f} rad ({np.rad2deg(base_yaw):.1f} deg)\n')
+        
+        self.get_logger().info(f'Saved info to {info_path}')
+        self.get_logger().info(f'Snapshot saved to {snapshot_dir}')
+        
+        return snapshot_dir
+    
     # ========== Robot Control ==========
     def pre_nav(self):
         """Set robot to navigation pose"""

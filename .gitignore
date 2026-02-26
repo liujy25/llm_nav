@@ -29,6 +29,7 @@ NavDP/
 InternNav/
 logs/
 vlfm/
+frontier_exploration/
 
 # Test output files
 test_results.json

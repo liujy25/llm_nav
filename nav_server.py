@@ -121,12 +121,19 @@ def navigation_reset():
     nav_state['log_dir'] = setup_log_directory(goal, goal_description or '')
     
     # Build agent config
-    agent_cfg = {
-        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/',
-        'vlm_api_key': 'EMPTY',
-        'vlm_base_url': 'http://10.15.89.71:34134/v1/',
-    }
+    # agent_cfg = {
+    #     'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/',
+    #     'vlm_api_key': 'EMPTY',
+    #     'vlm_base_url': 'http://10.15.89.71:34134/v1/',
+    # }
     
+    agent_cfg = {
+        'vlm_model': 'qwen3.5-plus',
+        'vlm_api_key': 'sk-87fb11f7a8eb4eb0835718bd31c44d74',
+        'vlm_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        'vlm_timeout': 120
+    }
+
     # Initialize NavAgent (or reset if already exists)
     if nav_state['agent'] is None:
         nav_state['agent'] = NavAgent(cfg=agent_cfg)
@@ -305,10 +312,10 @@ def navigation_step():
     }
     
     # Add image paths
-    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg')):
-        viz_state['images']['rgb_vis'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb_vis.jpg'
-    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_explored_map.jpg')):
-        viz_state['images']['explored_map'] = f'/logs/{log_name}/iter_{iteration:04d}_explored_map.jpg'
+    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_annotated.jpg')):
+        viz_state['images']['rgb_vis'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb_annotated.jpg'
+    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg')):
+        viz_state['images']['bev_map'] = f'/logs/{log_name}/iter_{iteration:04d}_bev_map.jpg'
     
     if action is None:
         viz_state['action_type'] = 'none'
@@ -486,7 +493,7 @@ def navigation_step():
 @app.route('/check_stop', methods=['POST'])
 def check_stop():
     """
-    轻量级stop检测 - 只判断是否到达目标
+    轻量级stop检测 - 暂时禁用VLM检测
     供stop detection线程调用，2Hz频率
     
     Request:
@@ -502,70 +509,13 @@ def check_stop():
     if nav_state['goal'] is None or nav_state['agent'] is None:
         return jsonify({'error': 'Navigation not initialized. Call /navigation_reset first.'}), 400
     
-    try:
-        # 加载RGB
-        rgb_file = request.files['rgb']
-        rgb_pil = Image.open(rgb_file.stream).convert('RGB')
-        rgb = np.asarray(rgb_pil)
-    except Exception as e:
-        return jsonify({'error': f'Failed to load image: {str(e)}'}), 400
+    # 暂时禁用VLM stop检测，直接返回False
+    print(f"[StopCheck] Disabled - always returning False")
     
-    goal = nav_state['goal']
-    goal_desc = nav_state['goal_description']
-    
-    prompt = f"""
-    You are a robot navigation stop classifier.
-
-    Goal: {goal}
-
-    Answer 'yes' ONLY when you are confident we should stop now.
-
-    There are two valid stop situations:
-
-    1) Direct stop (APPROACHABLE goal):
-    - The goal object is clearly visible (not tiny/far/ambiguous), AND
-    - It appears near (If you think you are less than 1 meter to it.)
-
-    2) Furniture stop (SURFACE goal, e.g., on a table/shelf/counter or inside cabinet):
-    - The goal object is clearly visible, AND
-    - You can see the supporting furniture (tabletop / shelf / counter / cabinet) indicating the robot cannot drive right up to the object, AND
-    - You look close enough to the furniture edge (near the table/counter), even if the goal is not centered.
-
-    If unsure, if the goal is far, answer 'no'.
-    Answer ONLY 'yes' or 'no'.
-    """
-    
-    try:
-        action_vlm = nav_state['agent'].actionVLM
-        
-        # call_chat接口: call_chat(history: int, images: list[np.array], text_prompt: str)
-        # history=0表示不使用历史对话
-        response = action_vlm.call_chat(
-            history=0,  # 不使用历史
-            images=[rgb],  # 单张图片的列表
-            text_prompt=prompt
-        )
-        
-        # 解析yes/no
-        response_lower = response.lower().strip()
-        # 判断逻辑：包含yes且不包含no（避免"no, not yet"这种情况）
-        should_stop = 'yes' in response_lower and 'no' not in response_lower
-        
-        print(f"[StopCheck] Goal: {goal}, VLM response: '{response}' -> should_stop={should_stop}")
-        
-        return jsonify({
-            'should_stop': should_stop,
-            'raw_response': response
-        })
-    
-    except Exception as e:
-        print(f"[StopCheck] VLM call failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'should_stop': False,
-            'error': str(e)
-        })
+    return jsonify({
+        'should_stop': False,
+        'raw_response': 'Stop check disabled'
+    })
 
 
 @app.route('/health', methods=['GET'])
