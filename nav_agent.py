@@ -7,6 +7,7 @@ import ast
 from collections import deque
 
 from vlm import OpenAIVLM
+from obstacle_map import ObstacleMap
 from utils import (
     GREEN, RED, BLACK, WHITE, GREY,
     point_to_pixel, agent_frame_to_image_coords,
@@ -50,6 +51,11 @@ class NavAgent:
         self.cfg.setdefault('vlm_api_key', 'EMPTY')
         self.cfg.setdefault('vlm_base_url', 'http://10.15.89.71:34134/v1/')
         self.cfg.setdefault('vlm_timeout', 10)
+        
+        # BEV map configuration
+        self.cfg.setdefault('enable_bev_map', True)  # Enable BEV map visualization
+        self.cfg.setdefault('bev_map_size', 200)  # BEV map size (200x200 for 20m x 20m)
+        self.cfg.setdefault('bev_pixels_per_meter', 10)  # 10 pixels per meter
 
         self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
         self.clip_dist = self.cfg['clip_dist']
@@ -58,6 +64,21 @@ class NavAgent:
         # Initialize goal attributes (will be set properly in reset())
         self.goal = None
         self.goal_description = ''
+        
+        # Initialize ObstacleMap for BEV visualization
+        if self.cfg['enable_bev_map']:
+            self.obstacle_map = ObstacleMap(
+                min_height=self.cfg['obstacle_height_min'],
+                max_height=self.cfg['obstacle_height_max'],
+                agent_radius=0.3,
+                area_thresh=0.3,
+                size=self.cfg['bev_map_size'],
+                pixels_per_meter=self.cfg['bev_pixels_per_meter'],
+            )
+            self.bev_scale = self.cfg['bev_pixels_per_meter']
+        else:
+            self.obstacle_map = None
+            self.bev_scale = None
         
         self._initialize_vlms()
         self.reset()
@@ -106,6 +127,10 @@ class NavAgent:
 
 CRITICAL DECISION POINT: This is a keyframe where you need to make a strategic decision.
 
+You are provided with TWO images:
+1. RGB Image (First): Your current first-person view showing {num_actions} available MOVE waypoints (numbered 1..{num_actions})
+2. BEV Map (Second): Bird's-eye view showing explored areas (gray) and unexplored areas (green), with your current position marked
+
 Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).
 Additionally, there are always two TURN actions:
 - Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place
@@ -125,9 +150,9 @@ Review the {num_keyframes} previous keyframes in your conversation history:
 Provide a brief summary of your exploration history and strategy.
 
 Question 2: Current Observation
-What do you see in the current image?
-- Navigable areas (floor, corridors, open spaces)
-- Obstacles (walls, furniture, objects)
+What do you see in the RGB image (first image) and BEV map (second image)?
+- RGB: Navigable areas (floor, corridors, open spaces), obstacles (walls, furniture, objects)
+- BEV: Explored vs unexplored regions, your current position and orientation
 - Potential target objects related to "{self.goal}"
 - Unexplored directions
 
@@ -175,6 +200,10 @@ Why did you choose this specific action?
 
 EXECUTION MODE: Continue following the strategy from keyframe #{self.current_keyframe_idx + 1} (iter {parent_kf_iter}).
 
+You are provided with TWO images:
+1. RGB Image (First): Your current first-person view showing {num_actions} available MOVE waypoints (numbered 1..{num_actions})
+2. BEV Map (Second): Bird's-eye view showing explored areas (gray) and unexplored areas (green), with your current position marked
+
 Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).
 Additionally, there are always two TURN actions:
 - Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place
@@ -188,7 +217,7 @@ Review your conversation history (parent keyframe + {num_nonkeyframes} non-keyfr
 - What actions have you taken since then?
 - Are you still on track with the plan?
 
-Based on the parent keyframe's strategy and your current observation, select the best action to continue the plan.
+Based on the parent keyframe's strategy and your current observation (RGB + BEV), select the best action to continue the plan.
 
 ================================================================================
 
@@ -1088,6 +1117,68 @@ Remember these instructions throughout the navigation episode. I will show you o
 
         return projected
 
+    def _generate_bev_with_waypoints(self, base_to_odom: np.ndarray, waypoints: list = None) -> np.ndarray:
+        """
+        生成标注了waypoints的BEV地图（使用ObstacleMap）
+        
+        Parameters
+        ----------
+        base_to_odom : np.ndarray
+            机器人base到odom的变换矩阵 (4x4)
+        waypoints : list, optional
+            Waypoint列表，每个元素为(r, theta)元组，theta相对于机器人base坐标系
+            
+        Returns
+        -------
+        np.ndarray
+            标注后的BEV图像（RGB）
+        """
+        if self.obstacle_map is None:
+            # If BEV map is disabled, return a blank image
+            return np.zeros((200, 200, 3), dtype=np.uint8)
+        
+        # 提取机器人位置和朝向
+        current_pos = base_to_odom[:3, 3]
+        
+        # 从旋转矩阵提取yaw角
+        robot_yaw = np.arctan2(base_to_odom[1, 0], base_to_odom[0, 0])
+        
+        # 使用obstacle_map的可视化作为基础（不显示frontiers）
+        bev = self.obstacle_map.visualize(robot_pos=current_pos[:2], show_frontiers=False)
+        
+        # 标注waypoints
+        if waypoints is not None and len(waypoints) > 0:
+            for i, (r, theta) in enumerate(waypoints, start=1):
+                # 计算waypoint在odom坐标系中的位置
+                # theta是相对于机器人base坐标系的角度
+                absolute_theta = robot_yaw + theta
+                waypoint_x = current_pos[0] + r * np.cos(absolute_theta)
+                waypoint_y = current_pos[1] + r * np.sin(absolute_theta)
+                
+                # 转换为像素坐标
+                waypoint_px = self.obstacle_map._xy_to_px(np.array([[waypoint_x, waypoint_y]]))
+                if len(waypoint_px) > 0:
+                    px_x, px_y = int(waypoint_px[0, 0]), int(waypoint_px[0, 1])
+                    
+                    # 检查是否在图像范围内
+                    if 0 <= px_x < bev.shape[1] and 0 <= px_y < bev.shape[0]:
+                        # 绘制蓝色圆圈标注waypoint
+                        cv2.circle(bev, (px_x, px_y), 3, (255, 0, 0), -1)  # 蓝色填充圆
+                        # 添加"W"前缀的ID标签
+                        cv2.putText(bev, f"W{i}", (px_x + 5, px_y - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+        
+        # 添加图例
+        legend_y = 10
+        cv2.putText(bev, "BEV Map", (5, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, WHITE, 1)
+        cv2.putText(bev, "Gray: Explored", (5, legend_y+12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, WHITE, 1)
+        cv2.putText(bev, "Blue: Waypoints", (5, legend_y+24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, WHITE, 1)
+        
+        return bev
+
     def _nav(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
         # Determine frame type (keyframe or non-keyframe)
         is_keyframe, angle_range, clip_dist_override, r_P, theta_P = self._determine_frame_type(obs)
@@ -1105,14 +1196,27 @@ Remember these instructions throughout the navigation episode. I will show you o
         a_initial = self._navigability(obs, angle_range=angle_range, clip_dist_override=clip_dist_override)
         a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
+        # Update ObstacleMap with current observation
+        if self.obstacle_map is not None:
+            self.obstacle_map.update_map(
+                depth=obs['depth'],
+                intrinsic=obs['intrinsic'],
+                extrinsic=obs['extrinsic'],
+                base_to_odom=obs['base_to_odom_matrix']
+            )
+
         # Start timing for projection (image annotation)
         t_projection_start = time.time()
         
         # Generate visualization without highlighting (for initial display)
         a_final_projected, rgb_vis = self._projection(a_final, obs)
 
-        # Only send current image (VLM manages history internally)
-        images = [rgb_vis]
+        # Generate BEV map with waypoints
+        if self.obstacle_map is not None:
+            bev_map = self._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=a_final)
+            images = [rgb_vis, bev_map]  # Send both RGB and BEV to VLM
+        else:
+            images = [rgb_vis]  # Only RGB if BEV is disabled
 
         # 根据帧类型构建prompt和历史
         if is_keyframe:

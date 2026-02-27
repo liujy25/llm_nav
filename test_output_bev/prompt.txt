@@ -1,0 +1,47 @@
+--- Iteration 1 (KEYFRAME #1) ---
+
+CRITICAL DECISION POINT: This is a keyframe where you need to make a strategic decision.
+
+You are provided with TWO images:
+1. RGB Image (First): Your current first-person view showing 8 available MOVE waypoints (numbered 1..8)
+2. BEV Map (Second): Bird's-eye view showing explored areas (gray) and unexplored areas (green), with your current position marked
+
+Current observation: 8 available MOVE waypoints shown (numbered 1..8).
+Additionally, there are always two TURN actions:
+- Action -1: TURN LEFT by 30 degrees in place
+- Action -2: TURN RIGHT by 30 degrees in place
+
+================================================================================
+
+Please think step by step and answer the following questions. 
+In your response, you should: first, give your answer of all the questions, 
+then provide your final decision in this exact format: {'action': <action_number>}.
+
+Question 1: Historical Review
+Review the 0 previous keyframes in your conversation history:
+- What areas have you explored at each keyframe?
+- What strategic decisions did you make?
+- Are there any unexplored areas you should prioritize?
+Provide a brief summary of your exploration history and strategy.
+
+Question 2: Current Observation
+What do you see in the RGB image (first image) and BEV map (second image)?
+- RGB: Navigable areas (floor, corridors, open spaces), obstacles (walls, furniture, objects)
+- BEV: Explored vs unexplored regions, your current position and orientation
+- Potential target objects related to "chair"
+- Unexplored directions
+
+Question 3: Strategic Reasoning
+Based on your historical review (Q1) and current observation (Q2):
+- Should you continue your previous strategy or change direction?
+- Which areas are most promising for finding "chair"?
+- How does this decision fit into your overall exploration plan?
+
+Question 4: Action Selection
+Which action number achieves your strategic goal best?
+Consider all available actions (1 to 8, -1, -2).
+
+Question 5: Action Justification
+Why did you choose this specific action?
+- How does it align with your strategy from Q3?
+- What do you expect to discover or achieve?
