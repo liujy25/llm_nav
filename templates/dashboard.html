@@ -197,24 +197,21 @@
 
         .content {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            grid-template-rows: auto auto;
+            grid-template-columns: 1fr 2fr;
             gap: 15px;
             margin-bottom: 15px;
         }
         
-        /* Row 1: RGB Vis spans 2 columns, LLM Response spans 2 columns */
-        .content > .image-card:first-child {
-            grid-column: span 2;
+        /* Left column: RGB and BEV stacked vertically */
+        .images-column {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
         }
         
-        .content > .response-card {
-            grid-column: span 2;
-        }
-        
-        /* Row 2: History spans all 4 columns */
-        .content > .history-section {
-            grid-column: span 4;
+        /* Right column: LLM Response */
+        .response-column {
+            display: flex;
         }
         
         .history-section {
@@ -494,39 +491,36 @@
         </div>
 
         <div class="content">
-            <!-- Row 1: RGB Visualization + LLM Response -->
-            <div class="image-card">
-                <h3>RGB Visualization</h3>
-                <div class="image-container">
-                    <img id="rgbVisImg" style="display: none;">
-                    <span class="image-placeholder" id="rgbVisPlaceholder">Waiting for data...</span>
-                </div>
-            </div>
-
-            <div class="response-card">
-                <h3>LLM Response</h3>
-                <div class="goal-info" id="goalInfo" style="display: none;">
-                    <div><strong>Goal:</strong> <span id="goalInfoText">-</span></div>
-                    <div id="descriptionInfo" style="display: none; margin-top: 5px;">
-                        <strong>Description:</strong> <span id="descriptionInfoText"></span>
+            <!-- Left column: RGB and BEV stacked vertically -->
+            <div class="images-column">
+                <div class="image-card">
+                    <h3>RGB Visualization</h3>
+                    <div class="image-container">
+                        <img id="rgbVisImg" style="display: none;">
+                        <span class="image-placeholder" id="rgbVisPlaceholder">Waiting for data...</span>
                     </div>
                 </div>
-                <div class="response-content" id="llmResponse">Waiting for data...</div>
-            </div>
 
-            <!-- Row 2: Current Cycle (Current Keyframe + Non-keyframes) -->
-            <div class="history-section">
-                <h3>Current Cycle (当前周期)</h3>
-                <div class="history-container" id="currentCycleContainer">
-                    <div class="history-empty">No current cycle data yet...</div>
+                <div class="image-card">
+                    <h3>BEV Map</h3>
+                    <div class="image-container">
+                        <img id="bevMapImg" style="display: none;">
+                        <span class="image-placeholder" id="bevMapPlaceholder">Waiting for data...</span>
+                    </div>
                 </div>
             </div>
-            
-            <!-- Row 3: Historical Keyframes -->
-            <div class="history-section">
-                <h3>Historical Keyframes (历史关键帧)</h3>
-                <div class="history-container" id="historicalKeyframesContainer">
-                    <div class="history-empty">No historical keyframes yet...</div>
+
+            <!-- Right column: LLM Response -->
+            <div class="response-column">
+                <div class="response-card">
+                    <h3>LLM Response</h3>
+                    <div class="goal-info" id="goalInfo" style="display: none;">
+                        <div><strong>Goal:</strong> <span id="goalInfoText">-</span></div>
+                        <div id="descriptionInfo" style="display: none; margin-top: 5px;">
+                            <strong>Description:</strong> <span id="descriptionInfoText"></span>
+                        </div>
+                    </div>
+                    <div class="response-content" id="llmResponse">Waiting for data...</div>
                 </div>
             </div>
         </div>
@@ -601,7 +595,7 @@
 
         function clearDisplay() {
             // Clear images
-            ['rgbVis'].forEach(name => {
+            ['rgbVis', 'bevMap'].forEach(name => {
                 const img = document.getElementById(`${name}Img`);
                 const placeholder = document.getElementById(`${name}Placeholder`);
                 img.style.display = 'none';
@@ -616,12 +610,6 @@
             // Clear goal info
             document.getElementById('goalInfo').style.display = 'none';
             document.getElementById('descriptionInfo').style.display = 'none';
-            
-            // Clear history
-            document.getElementById('currentCycleContainer').innerHTML =
-                '<div class="history-empty">No current cycle data yet...</div>';
-            document.getElementById('historicalKeyframesContainer').innerHTML =
-                '<div class="history-empty">No historical keyframes yet...</div>';
         }
 
         function loadLogs() {
@@ -720,6 +708,7 @@
             
             // Update images
             updateImage('rgbVis', data.images?.rgb_vis);
+            updateImage('bevMap', data.images?.bev_map);
             
             // Update LLM response
             const responseDiv = document.getElementById('llmResponse');
@@ -728,73 +717,6 @@
                 // Auto scroll to bottom
                 responseDiv.scrollTop = responseDiv.scrollHeight;
             }
-            
-            // Update history (split into current cycle and historical keyframes)
-            updateHistory(data.current_cycle, data.historical_keyframes);
-        }
-        
-        function updateHistory(currentCycle, historicalKeyframes) {
-            // Update current cycle container
-            const currentCycleContainer = document.getElementById('currentCycleContainer');
-            if (!currentCycle || currentCycle.length === 0) {
-                currentCycleContainer.innerHTML = '<div class="history-empty">No current cycle data yet...</div>';
-            } else {
-                currentCycleContainer.innerHTML = '';
-                currentCycle.forEach((item) => {
-                    currentCycleContainer.appendChild(createHistoryItem(item));
-                });
-                currentCycleContainer.scrollLeft = currentCycleContainer.scrollWidth;
-            }
-            
-            // Update historical keyframes container
-            const historicalContainer = document.getElementById('historicalKeyframesContainer');
-            if (!historicalKeyframes || historicalKeyframes.length === 0) {
-                historicalContainer.innerHTML = '<div class="history-empty">No historical keyframes yet...</div>';
-            } else {
-                historicalContainer.innerHTML = '';
-                historicalKeyframes.forEach((item) => {
-                    historicalContainer.appendChild(createHistoryItem(item));
-                });
-                historicalContainer.scrollLeft = historicalContainer.scrollWidth;
-            }
-        }
-        
-        function createHistoryItem(item) {
-            const historyItem = document.createElement('div');
-            historyItem.className = 'history-item';
-            
-            const header = document.createElement('div');
-            header.className = 'history-item-header';
-            
-            // Add frame type indicator (keyframe or non-keyframe)
-            const frameType = item.is_keyframe ? 'K' : 'N';
-            const frameTypeColor = item.is_keyframe ? '#667eea' : '#4caf50';
-            
-            header.innerHTML = `
-                <span class="iteration">
-                    <span style="background: ${frameTypeColor}; padding: 2px 6px; border-radius: 3px; margin-right: 4px;">${frameType}</span>
-                    Iter #${item.iteration}
-                </span>
-                <span class="action">Action ${item.action}</span>
-            `;
-            
-            const img = document.createElement('img');
-            img.className = 'history-item-image';
-            img.src = item.image_path + '?t=' + new Date().getTime();
-            img.alt = `History iteration ${item.iteration}`;
-            img.onerror = function() {
-                this.style.display = 'none';
-                const placeholder = document.createElement('div');
-                placeholder.className = 'history-empty';
-                placeholder.style.padding = '20px';
-                placeholder.textContent = 'Image not available';
-                this.parentNode.appendChild(placeholder);
-            };
-            
-            historyItem.appendChild(header);
-            historyItem.appendChild(img);
-            
-            return historyItem;
         }
 
         function updateImage(name, url) {

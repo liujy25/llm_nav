@@ -144,17 +144,40 @@ def test_bev_integration(snapshot_dir, output_dir='test_output'):
     
     # 保存第一次生成的BEV地图（仅更新一次ObstacleMap后）
     bev_map_path = os.path.join(output_dir, 'bev_map_step7.png')
-    cv2.imwrite(bev_map_path, bev_map)
+    # bev_map已经是RGB格式，cv2.imwrite需要BGR格式
+    cv2.imwrite(bev_map_path, cv2.cvtColor(bev_map, cv2.COLOR_RGB2BGR))
     print(f"  保存BEV地图（Step 7，探索区域较少）: {bev_map_path}")
+    
+    # 7.5. 测试历史轨迹可视化（模拟几个轨迹点）
+    print("\n[Step 7.5] 测试历史轨迹可视化...")
+    # 获取当前机器人位置
+    current_pos = obs['base_to_odom_matrix'][:3, 3]
+    print(f"  当前机器人位置: ({current_pos[0]:.2f}, {current_pos[1]:.2f})")
+    
+    # 模拟3-4个历史轨迹点（在机器人周围，间距3-4米）
+    agent.trajectory_history = [
+        (current_pos[0] - 4.0, current_pos[1] - 3.0),  # 起点（后左）
+        (current_pos[0] - 2.5, current_pos[1] - 1.5),  # 中间点1
+        (current_pos[0] - 1.0, current_pos[1] - 0.5),  # 中间点2
+        (current_pos[0], current_pos[1]),              # 当前位置
+    ]
+    print(f"  模拟了 {len(agent.trajectory_history)} 个历史轨迹点")
+    for i, (x, y) in enumerate(agent.trajectory_history):
+        print(f"    点{i+1}: ({x:.2f}, {y:.2f})")
+    
+    # 重新生成BEV地图，包含轨迹
+    bev_with_trajectory = agent._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=a_final)
+    bev_trajectory_path = os.path.join(output_dir, 'bev_with_trajectory.png')
+    # bev_with_trajectory已经是RGB格式，cv2.imwrite需要BGR格式
+    cv2.imwrite(bev_trajectory_path, cv2.cvtColor(bev_with_trajectory, cv2.COLOR_RGB2BGR))
+    print(f"  保存带轨迹的BEV地图: {bev_trajectory_path}")
+
     
     # 8. 测试完整的_nav流程（不调用VLM）
     print("\n[Step 8] 测试完整的_nav流程（模拟）...")
     
     # 模拟_nav的前半部分（到VLM调用之前）
-    is_keyframe, angle_range, clip_dist_override, r_P, theta_P = agent._determine_frame_type(obs)
-    print(f"  Frame type: {'KEYFRAME' if is_keyframe else 'NON-KEYFRAME'}")
-    
-    a_initial = agent._navigability(obs, angle_range=angle_range, clip_dist_override=clip_dist_override)
+    a_initial = agent._navigability(obs)
     a_final = agent._action_proposer(a_initial, obs['base_to_odom_matrix'])
     
     if agent.obstacle_map is not None:
@@ -179,16 +202,10 @@ def test_bev_integration(snapshot_dir, output_dir='test_output'):
     
     # 9. 测试prompt生成
     print("\n[Step 9] 测试prompt生成...")
-    if is_keyframe:
-        prompt = agent._construct_keyframe_prompt(
-            num_actions=len(a_final_projected),
-            iter=1
-        )
-    else:
-        prompt = agent._construct_nonkeyframe_prompt(
-            num_actions=len(a_final_projected),
-            iter=1
-        )
+    prompt = agent._construct_prompt(
+        num_actions=len(a_final_projected),
+        iter=1
+    )
     
     print(f"  Prompt长度: {len(prompt)} 字符")
     print(f"  Prompt前200字符:\n{prompt[:200]}...")
@@ -204,7 +221,8 @@ def test_bev_integration(snapshot_dir, output_dir='test_output'):
     for i, img in enumerate(images):
         img_name = ['rgb_to_vlm.png', 'bev_to_vlm.png'][i]
         img_path = os.path.join(output_dir, img_name)
-        cv2.imwrite(img_path, img)
+        # images数组中的图像已经是RGB格式，cv2.imwrite需要BGR格式
+        cv2.imwrite(img_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         print(f"  保存图像 {i+1}: {img_path}")
     print(f"  注意：bev_to_vlm.png包含更多探索区域（ObstacleMap更新了2次）")
     

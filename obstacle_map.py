@@ -462,16 +462,22 @@ class ObstacleMap:
             for frontier_px in self._frontiers_px:
                 cv2.circle(vis_img, tuple(frontier_px.astype(int)), 5, (0, 0, 200), 2)
         
-        # Draw robot position in red (RGB format)
+        # Draw robot position in orange-red (RGB format) with black outline
         if robot_pos is not None:
             robot_px = self._xy_to_px(robot_pos.reshape(1, 2))[0]
             print(f"[ObstacleMap.visualize] Robot pos (odom): {robot_pos}, pixel: {robot_px}, map size: {self.size}")
             
             # Check if robot is within map bounds
             if 0 <= robot_px[0] < self.size and 0 <= robot_px[1] < self.size:
-                cv2.circle(vis_img, tuple(robot_px.astype(int)), 10, (255, 0, 0), -1)
+                # Draw orange-red filled circle (BGR: 0, 69, 255)
+                cv2.circle(vis_img, tuple(robot_px.astype(int)), 4, (0, 69, 255), -1)
+                # Draw black outline
+                cv2.circle(vis_img, tuple(robot_px.astype(int)), 4, (0, 0, 0), 1)
                 print(f"[ObstacleMap.visualize] Robot drawn at pixel {robot_px}")
             else:
-                print(f"[ObstacleMap.visualize] WARNING: Robot position {robot_px} is outside map bounds [0, {self.size}]")
+                print(f"[ObstacleMap.visualize] WARNING: Robot position {robot_px} ide map bounds [0, {self.size}]")
+        
+        # 转换BGR到RGB，确保返回的图像颜色正确
+        vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
         
         return vis_img

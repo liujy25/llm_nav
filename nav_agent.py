@@ -42,10 +42,6 @@ class NavAgent:
         # Prompt mode: 'reasoning' or 'action_only'
         self.cfg.setdefault('prompt_mode', 'reasoning')  # 'reasoning' or 'action_only'
         
-        # Keyframe mode configuration
-        self.cfg.setdefault('keyframe_mode', False)  # Enable keyframe-based navigation
-        self.cfg.setdefault('keyframe_angle_range', 25.0)  # Angle range for non-keyframes (degrees)
-        
         # VLM configuration defaults
         self.cfg.setdefault('vlm_model', '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/')
         self.cfg.setdefault('vlm_api_key', 'EMPTY')
@@ -98,16 +94,12 @@ class NavAgent:
             timeout=self.cfg['vlm_timeout']
         )
 
-    def _construct_keyframe_prompt(self, num_actions: int, iter: int):
+    def _construct_prompt(self, num_actions: int, iter: int):
         """
-        构建关键帧prompt：5个问题 + 统一输出格式
+        构建统一的prompt：利用BEV地图+RGB做决策
         
-        关键帧是战略决策点，需要VLM进行深度推理：
-        1. 回顾历史探索
-        2. 分析当前观测
-        3. 制定战略方向
-        4. 选择最佳动作
-        5. 解释决策理由
+        BEV地图已经提供了全局信息（探索区域、未探索区域、障碍物），
+        不需要关键帧机制来维护长期记忆。每帧都能看到完整地图，直接做决策。
         
         Parameters
         ----------
@@ -119,13 +111,10 @@ class NavAgent:
         Returns
         -------
         str
-            关键帧prompt文本
+            prompt文本
         """
-        num_keyframes = len(self.keyframe_history)
         
-        prompt = f"""--- Iteration {iter} (KEYFRAME #{num_keyframes + 1}) ---
-
-CRITICAL DECISION POINT: This is a keyframe where you need to make a strategic decision.
+        prompt = f"""--- Iteration {iter} ---
 
 You are provided with TWO images:
 1. RGB Image (First): Your current first-person view showing {num_actions} available MOVE waypoints (numbered 1..{num_actions})
@@ -138,91 +127,31 @@ Additionally, there are always two TURN actions:
 
 ================================================================================
 
-Please think step by step and answer the following questions. 
+Please analyze the situation and answer the following questions. 
 In your response, you should: first, give your answer of all the questions, 
 then provide your final decision in this exact format: {{'action': <action_number>}}.
 
-Question 1: Historical Review
-Review the {num_keyframes} previous keyframes in your conversation history:
-- What areas have you explored at each keyframe?
-- What strategic decisions did you make?
-- Are there any unexplored areas you should prioritize?
-Provide a brief summary of your exploration history and strategy.
-
-Question 2: Current Observation
+Question 1: Current Observation
 What do you see in the RGB image (first image) and BEV map (second image)?
 - RGB: Navigable areas (floor, corridors, open spaces), obstacles (walls, furniture, objects)
 - BEV: Explored vs unexplored regions, your current position and orientation
 - Potential target objects related to "{self.goal}"
-- Unexplored directions
+- Unexplored directions that might lead to the target
 
-Question 3: Strategic Reasoning
-Based on your historical review (Q1) and current observation (Q2):
-- Should you continue your previous strategy or change direction?
+Question 2: Strategic Reasoning
+Based on your observation and the BEV map:
 - Which areas are most promising for finding "{self.goal}"?
-- How does this decision fit into your overall exploration plan?
+- Should you explore new areas or search more carefully in explored regions?
+- Which direction offers the best balance between exploration and target search?
 
-Question 4: Action Selection
-Which action number achieves your strategic goal best?
+Question 3: Action Selection
+Which action number achieves your goal best?
 Consider all available actions (1 to {num_actions}, -1, -2).
 
-Question 5: Action Justification
+Question 4: Action Justification
 Why did you choose this specific action?
-- How does it align with your strategy from Q3?
+- How does it help you find "{self.goal}"?
 - What do you expect to discover or achieve?
-"""
-        
-        return prompt
-
-    def _construct_nonkeyframe_prompt(self, num_actions: int, iter: int):
-        """
-        构建非关键帧prompt：回顾提示 + 直接输出action
-        
-        非关键帧是执行模式，继续执行父关键帧的战略决策。
-        VLM只需要快速选择动作，无需深度推理。
-        
-        Parameters
-        ----------
-        num_actions : int
-            当前可用的MOVE动作数量
-        iter : int
-            当前迭代编号
-            
-        Returns
-        -------
-        str
-            非关键帧prompt文本
-        """
-        num_nonkeyframes = len(self.current_cycle_nonkeyframes)
-        parent_kf_iter = self.keyframe_history[self.current_keyframe_idx]['iter'] if self.current_keyframe_idx >= 0 else 0
-        
-        prompt = f"""--- Iteration {iter} (NON-KEYFRAME, step {num_nonkeyframes + 1} in current cycle) ---
-
-EXECUTION MODE: Continue following the strategy from keyframe #{self.current_keyframe_idx + 1} (iter {parent_kf_iter}).
-
-You are provided with TWO images:
-1. RGB Image (First): Your current first-person view showing {num_actions} available MOVE waypoints (numbered 1..{num_actions})
-2. BEV Map (Second): Bird's-eye view showing explored areas (gray) and unexplored areas (green), with your current position marked
-
-Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).
-Additionally, there are always two TURN actions:
-- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place
-- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place
-
-================================================================================
-
-CONTEXT REVIEW:
-Review your conversation history (parent keyframe + {num_nonkeyframes} non-keyframes):
-- What was the strategic decision at the parent keyframe?
-- What actions have you taken since then?
-- Are you still on track with the plan?
-
-Based on the parent keyframe's strategy and your current observation (RGB + BEV), select the best action to continue the plan.
-
-================================================================================
-
-Provide your action selection in this exact format:
-{{'action': <action_number>}}
 """
         
         return prompt
@@ -256,115 +185,6 @@ Provide your action selection in this exact format:
         
         return f"data:image/jpeg;base64,{img_str}"
 
-    def _build_vlm_history_for_keyframe(self):
-        """
-        为关键帧构建VLM历史：所有历史关键帧的对话
-        
-        关键帧需要看到所有历史关键帧的决策，以便：
-        1. 避免重复探索已访问区域
-        2. 保持长期探索策略的连贯性
-        3. 基于历史经验做出更好的战略决策
-        
-        Returns
-        -------
-        list
-            VLM消息历史，格式为[{"role": "user", "content": [...]}, {"role": "assistant", "content": "..."}, ...]
-        """
-        history = []
-        
-        for kf in self.keyframe_history:
-            # User message（关键帧的标注图片 + prompt）
-            history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": self._encode_image_to_base64(kf['rgb_vis'])
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": kf['prompt']
-                    }
-                ]
-            })
-            
-            # Assistant response
-            history.append({
-                "role": "assistant",
-                "content": kf['response']
-            })
-        
-        return history
-
-    def _build_vlm_history_for_nonkeyframe(self):
-        """
-        为非关键帧构建VLM历史：当前关键帧 + 该周期内的所有非关键帧
-        
-        非关键帧只需要看到：
-        1. 父关键帧的战略决策（作为执行依据）
-        2. 该周期内已执行的非关键帧（了解执行进度）
-        
-        这样可以在保持上下文连贯性的同时，避免token消耗过大。
-        
-        Returns
-        -------
-        list
-            VLM消息历史
-        """
-        history = []
-        
-        # 1. 当前所属的关键帧
-        if self.current_keyframe_idx >= 0:
-            kf = self.keyframe_history[self.current_keyframe_idx]
-            
-            history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": self._encode_image_to_base64(kf['rgb_vis'])
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": kf['prompt']
-                    }
-                ]
-            })
-            
-            history.append({
-                "role": "assistant",
-                "content": kf['response']
-            })
-        
-        # 2. 该周期内的所有非关键帧
-        for nkf in self.current_cycle_nonkeyframes:
-            history.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": self._encode_image_to_base64(nkf['rgb_vis'])
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": nkf['prompt']
-                    }
-                ]
-            })
-            
-            history.append({
-                "role": "assistant",
-                "content": nkf['response']
-            })
-        
-        return history
-
     def step(self, obs: dict):
         if self.step_ndx == 0:
             self.init_pos = obs['base_to_odom_matrix'][:3, 3]
@@ -397,14 +217,8 @@ Provide your action selection in this exact format:
         self.goal = goal
         self.goal_description = goal_description
         
-        # Keyframe mode state
-        self.current_waypoint_P_global = None  # (x, y, z) in odom frame
-        self.is_keyframe = True  # First frame is always keyframe
-        
-        # Memory管理：分层历史结构
-        self.keyframe_history = []  # 所有关键帧记录（用于构建关键帧VLM历史）
-        self.current_cycle_nonkeyframes = []  # 当前关键帧周期内的非关键帧
-        self.current_keyframe_idx = -1  # 当前所属的关键帧索引
+        # Initialize trajectory history for visualization
+        self.trajectory_history = []  # List of (x, y) positions in odom frame
         
         # Build initial prompt with goal information if provided
         if goal:
@@ -490,180 +304,17 @@ Remember these instructions throughout the navigation episode. I will show you o
     def get_history_summary(self):
         """
         Get a summary of navigation history for debugging/logging.
-        Attaches current non-keyframe buffer to the last keyframe before returning.
         
         Returns
         -------
         dict
-            Dictionary containing history statistics and full history
+            Dictionary containing basic history info
         """
-        if not self.cfg['keyframe_mode']:
-            return {'keyframe_mode': False}
-        
-        # Attach current non-keyframe buffer to the last keyframe
-        if len(self.keyframe_history) > 0 and len(self.current_cycle_nonkeyframes) > 0:
-            self.keyframe_history[-1]['non_keyframes'] = self.current_cycle_nonkeyframes.copy()
-        
-        # Build full history for serialization (without rgb_vis to save space)
-        full_history = []
-        for kf in self.keyframe_history:
-            kf_record = {
-                'iter': kf['iter'],
-                'is_keyframe': True,
-                'action': kf['action'],
-                'action_number': kf['action_number'],
-                'response': kf['response'],
-                'timestamp': kf.get('timestamp'),
-                'non_keyframes': []
-            }
-            # Add non-keyframes for this keyframe
-            for nkf in kf.get('non_keyframes', []):
-                nkf_record = {
-                    'iter': nkf['iter'],
-                    'is_keyframe': False,
-                    'action': nkf['action'],
-                    'action_number': nkf['action_number'],
-                    'response': nkf['response'],
-                    'timestamp': nkf.get('timestamp')
-                }
-                kf_record['non_keyframes'].append(nkf_record)
-            full_history.append(kf_record)
-        
-        return {
-            'keyframe_mode': True,
-            'total_keyframes': len(self.keyframe_history),
-            'nonkeyframe_buffer_size': len(self.current_cycle_nonkeyframes),
-            'current_waypoint_P': self.current_waypoint_P_global.tolist() if self.current_waypoint_P_global is not None else None,
-            'keyframe_iters': [kf['iter'] for kf in self.keyframe_history],
-            'nonkeyframe_iters': [nkf['iter'] for nkf in self.current_cycle_nonkeyframes],
-            'full_history': full_history
-        }
+        return {'keyframe_mode': False}
 
     def cal_fov(self, intrinsics: np.ndarray, W: int):
         fx = intrinsics[0, 0]
         return 2 * np.arctan(W / (2 * fx)) * 180 / np.pi
-    
-    def _transform_waypoint_to_current_base(self, P_global, T_odom_base_current):
-        """
-        Transform waypoint P from global (odom) coordinates to current base frame.
-        
-        Parameters
-        ----------
-        P_global : np.ndarray
-            Waypoint position in odom frame (x, y, z)
-        T_odom_base_current : np.ndarray
-            Current base pose (4x4 matrix, base->odom)
-            
-        Returns
-        -------
-        r : float
-            Distance from current base to P
-        theta : float
-            Angle from current base to P (radians)
-        """
-        # Transform P from odom to current base frame
-        # T_odom_base: base->odom, so we need odom->base = inv(T_odom_base)
-        T_base_odom = np.linalg.inv(T_odom_base_current)
-        
-        # P in homogeneous coordinates
-        P_homo = np.array([P_global[0], P_global[1], P_global[2], 1.0], dtype=np.float64)
-        
-        # Transform to base frame
-        P_base = T_base_odom @ P_homo
-        
-        # Calculate r and theta in base frame (x-forward, y-left)
-        r = float(np.sqrt(P_base[0]**2 + P_base[1]**2))
-        theta = float(np.arctan2(P_base[1], P_base[0]))
-        
-        return r, theta
-    
-    def _can_project_waypoint(self, P_global, obs):
-        """
-        Check if waypoint P can be projected to current frame.
-        
-        Parameters
-        ----------
-        P_global : np.ndarray
-            Waypoint position in odom frame (x, y, z)
-        obs : dict
-            Current observation with intrinsic, extrinsic, base_to_odom_matrix
-            
-        Returns
-        -------
-        can_project : bool
-            Whether P can be projected to image
-        pixel_coords : tuple or None
-            (u, v) pixel coordinates if projectable, None otherwise
-        """
-        if P_global is None:
-            return False, None
-        
-        # Transform P to current base frame
-        r, theta = self._transform_waypoint_to_current_base(P_global, obs['base_to_odom_matrix'])
-        
-        # Try to project to image
-        K = obs['intrinsic']
-        T_cam_odom = obs['extrinsic']
-        T_odom_base = obs['base_to_odom_matrix']
-        T_cam_base = T_cam_odom @ T_odom_base
-        
-        # Check if can project (using existing method)
-        pixel_coords = self._can_project(r, theta, obs['rgb'].shape[:2], K, T_cam_base)
-        
-        if pixel_coords is not None:
-            return True, pixel_coords
-        else:
-            return False, None
-    
-    def _determine_frame_type(self, obs):
-        """
-        Determine if current frame is keyframe or non-keyframe.
-        
-        Parameters
-        ----------
-        obs : dict
-            Current observation
-            
-        Returns
-        -------
-        is_keyframe : bool
-            True if keyframe, False if non-keyframe
-        angle_range : tuple or None
-            (theta_min, theta_max) for non-keyframe, None for keyframe
-        clip_dist_override : float or None
-            Distance override for non-keyframe, None for keyframe
-        r_P : float or None
-            Distance to waypoint P in current base frame (for non-keyframe)
-        theta_P : float or None
-            Angle to waypoint P in current base frame (for non-keyframe)
-        """
-        if not self.cfg['keyframe_mode']:
-            # Keyframe mode disabled, always treat as keyframe
-            return True, None, None, None, None
-        
-        # First frame is always keyframe
-        if self.current_waypoint_P_global is None:
-            return True, None, None, None, None
-        
-        # Check if P can be projected to current frame
-        can_project, _ = self._can_project_waypoint(self.current_waypoint_P_global, obs)
-        
-        if can_project:
-            # Non-keyframe: P is visible
-            r_P, theta_P = self._transform_waypoint_to_current_base(
-                self.current_waypoint_P_global, obs['base_to_odom_matrix']
-            )
-            
-            # Calculate angle range: P ± keyframe_angle_range
-            angle_range_deg = self.cfg['keyframe_angle_range']
-            angle_range_rad = np.deg2rad(angle_range_deg)
-            theta_min = theta_P - angle_range_rad
-            theta_max = theta_P + angle_range_rad
-            
-            return False, (theta_min, theta_max), r_P, r_P, theta_P
-        else:
-            # Keyframe: P is not visible
-            return True, None, None, None, None
 
     def _global_to_grid(self, position: np.ndarray):
         dx = position[0] - self.init_pos[0]
@@ -1143,57 +794,112 @@ Remember these instructions throughout the navigation episode. I will show you o
         # 从旋转矩阵提取yaw角
         robot_yaw = np.arctan2(base_to_odom[1, 0], base_to_odom[0, 0])
         
-        # 使用obstacle_map的可视化作为基础（不显示frontiers）
-        bev = self.obstacle_map.visualize(robot_pos=current_pos[:2], show_frontiers=False)
+        # 使用obstacle_map的可视化作为基础（不显示frontiers，不显示机器人）
+        # 我们会在放大后再绘制机器人和其他标记
+        bev = self.obstacle_map.visualize(robot_pos=None, show_frontiers=False)
         
-        # 标注waypoints
+        # 提高可视化分辨率（先放大地图，再绘制标记）
+        scale_factor = 2
+        bev = cv2.resize(bev, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_NEAREST)
+        
+        # 获取机器人在像素坐标系中的位置（放大后）
+        robot_px = self.obstacle_map._xy_to_px(np.array([[current_pos[0], current_pos[1]]]))
+        if len(robot_px) > 0:
+            robot_px_x, robot_px_y = int(robot_px[0, 0] * scale_factor), int(robot_px[0, 1] * scale_factor)
+        else:
+            robot_px_x, robot_px_y = None, None
+        
+        # 绘制历史轨迹（在放大后的地图上）
+        if len(self.trajectory_history) > 1:
+            # 转换所有历史位置到像素坐标（放大后）
+            trajectory_array = np.array(self.trajectory_history)
+            trajectory_px = self.obstacle_map._xy_to_px(trajectory_array) * scale_factor
+            
+            # 绘制轨迹线（黑色细线）
+            for i in range(len(trajectory_px) - 1):
+                pt1 = (int(trajectory_px[i, 0]), int(trajectory_px[i, 1]))
+                pt2 = (int(trajectory_px[i+1, 0]), int(trajectory_px[i+1, 1]))
+                # 检查点是否在图像范围内
+                if (0 <= pt1[0] < bev.shape[1] and 0 <= pt1[1] < bev.shape[0] and
+                    0 <= pt2[0] < bev.shape[1] and 0 <= pt2[1] < bev.shape[0]):
+                    cv2.line(bev, pt1, pt2, (0, 0, 0), 2)  # 黑色线，放大后用2像素
+            
+            # 绘制轨迹点（浅蓝色圆圈，带黑色轮廓和序号）
+            for i in range(len(trajectory_px)):
+                pt = (int(trajectory_px[i, 0]), int(trajectory_px[i, 1]))
+                if 0 <= pt[0] < bev.shape[1] and 0 <= pt[1] < bev.shape[0]:
+                    # 浅蓝色填充 (BGR: 230, 216, 173)，半径12能容纳两位数
+                    cv2.circle(bev, pt, 12, (230, 216, 173), -1)
+                    # 黑色轮廓
+                    cv2.circle(bev, pt, 12, (0, 0, 0), 2)
+                    # 在圆圈内添加黑色序号（居中）
+                    text = str(i + 1)
+                    font_scale = 0.5
+                    thickness = 2
+                    (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                    text_x = pt[0] - text_width // 2
+                    text_y = pt[1] + text_height // 2
+                    cv2.putText(bev, text, (text_x, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
+        
+        # 绘制机器人位置（浅蓝色圆圈，和轨迹点一样，显示序号）
+        if robot_px_x is not None and robot_px_y is not None:
+            if 0 <= robot_px_x < bev.shape[1] and 0 <= robot_px_y < bev.shape[0]:
+                # 浅蓝色填充 (BGR: 230, 216, 173)，和轨迹点一样
+                cv2.circle(bev, (robot_px_x, robot_px_y), 12, (230, 216, 173), -1)
+                # 黑色轮廓
+                cv2.circle(bev, (robot_px_x, robot_px_y), 12, (0, 0, 0), 2)
+                # 在圆圈内添加黑色序号（当前位置是最后一个轨迹点）
+                text = str(len(self.trajectory_history))
+                font_scale = 0.5
+                thickness = 2
+                (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                text_x = robot_px_x - text_width // 2
+                text_y = robot_px_y + text_height // 2
+                cv2.putText(bev, text, (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
+        
+        # 标注waypoints（带黑色轮廓和序号）
         if waypoints is not None and len(waypoints) > 0:
             for i, (r, theta) in enumerate(waypoints, start=1):
                 # 计算waypoint在odom坐标系中的位置
-                # theta是相对于机器人base坐标系的角度
                 absolute_theta = robot_yaw + theta
                 waypoint_x = current_pos[0] + r * np.cos(absolute_theta)
                 waypoint_y = current_pos[1] + r * np.sin(absolute_theta)
                 
-                # 转换为像素坐标
-                waypoint_px = self.obstacle_map._xy_to_px(np.array([[waypoint_x, waypoint_y]]))
+                # 转换为像素坐标（放大后）
+                waypoint_px = self.obstacle_map._xy_to_px(np.array([[waypoint_x, waypoint_y]])) * scale_factor
                 if len(waypoint_px) > 0:
                     px_x, px_y = int(waypoint_px[0, 0]), int(waypoint_px[0, 1])
                     
                     # 检查是否在图像范围内
                     if 0 <= px_x < bev.shape[1] and 0 <= px_y < bev.shape[0]:
-                        # 绘制蓝色圆圈标注waypoint
-                        cv2.circle(bev, (px_x, px_y), 3, (255, 0, 0), -1)  # 蓝色填充圆
-                        # 添加"W"前缀的ID标签
-                        cv2.putText(bev, f"W{i}", (px_x + 5, px_y - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                        # 浅绿色填充 (BGR: 144, 238, 144)，半径12能容纳两位数
+                        cv2.circle(bev, (px_x, px_y), 12, (144, 238, 144), -1)
+                        # 黑色轮廓
+                        cv2.circle(bev, (px_x, px_y), 12, (0, 0, 0), 2)
+                        # 在圆圈内添加黑色序号（居中）
+                        text = str(i)
+                        font_scale = 0.5
+                        thickness = 2
+                        (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                        text_x = px_x - text_width // 2
+                        text_y = px_y + text_height // 2
+                        cv2.putText(bev, text, (text_x, text_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
         
-        # 添加图例
-        legend_y = 10
-        cv2.putText(bev, "BEV Map", (5, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, WHITE, 1)
-        cv2.putText(bev, "Gray: Explored", (5, legend_y+12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, WHITE, 1)
-        cv2.putText(bev, "Blue: Waypoints", (5, legend_y+24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, WHITE, 1)
+        # 转换BGR到RGB，确保VLM能正确解析颜色
+        bev = cv2.cvtColor(bev, cv2.COLOR_BGR2RGB)
         
         return bev
 
     def _nav(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
-        # Determine frame type (keyframe or non-keyframe)
-        is_keyframe, angle_range, clip_dist_override, r_P, theta_P = self._determine_frame_type(obs)
+        # Record current position to trajectory history
+        current_pos = obs['base_to_odom_matrix'][:3, 3]
+        self.trajectory_history.append((current_pos[0], current_pos[1]))
         
-        # Store frame type for prompt generation
-        self.is_keyframe = is_keyframe
-        
-        print(f"[NavAgent] Frame type: {'KEYFRAME' if is_keyframe else 'NON-KEYFRAME'}")
-        if not is_keyframe:
-            print(f"[NavAgent] Non-keyframe: P at r={r_P:.2f}m, theta={np.degrees(theta_P):.1f}°, "
-                  f"angle_range={np.degrees(angle_range[0]):.1f}° to {np.degrees(angle_range[1]):.1f}°, "
-                  f"clip_dist={clip_dist_override:.2f}m")
-        
-        # Compute navigability with appropriate parameters
-        a_initial = self._navigability(obs, angle_range=angle_range, clip_dist_override=clip_dist_override)
+        # Compute navigability (no angle_range or clip_dist_override needed)
+        a_initial = self._navigability(obs)
         a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
         # Update ObstacleMap with current observation
@@ -1218,21 +924,11 @@ Remember these instructions throughout the navigation episode. I will show you o
         else:
             images = [rgb_vis]  # Only RGB if BEV is disabled
 
-        # 根据帧类型构建prompt和历史
-        if is_keyframe:
-            prompt = self._construct_keyframe_prompt(
-                num_actions=len(a_final_projected),
-                iter=iter
-            )
-            vlm_history = self._build_vlm_history_for_keyframe()
-            print(f"[NavAgent] Keyframe {len(self.keyframe_history) + 1}: VLM sees {len(self.keyframe_history)} historical keyframes")
-        else:
-            prompt = self._construct_nonkeyframe_prompt(
-                num_actions=len(a_final_projected),
-                iter=iter
-            )
-            vlm_history = self._build_vlm_history_for_nonkeyframe()
-            print(f"[NavAgent] Non-keyframe: VLM sees 1 parent keyframe + {len(self.current_cycle_nonkeyframes)} non-keyframes")
+        # 构建统一的prompt（不再区分关键帧/非关键帧）
+        prompt = self._construct_prompt(
+            num_actions=len(a_final_projected),
+            iter=iter
+        )
         
         t_projection_end = time.time()
         projection_time = t_projection_end - t_projection_start
@@ -1240,9 +936,8 @@ Remember these instructions throughout the navigation episode. I will show you o
         # Start timing for VLM inference
         t_vlm_start = time.time()
         
-        # 调用VLM（使用自定义历史，由NavAgent控制Memory）
-        response = self.actionVLM.call_chat_with_custom_history(
-            custom_history=vlm_history,
+        # 调用VLM（使用VLM自己的历史管理）
+        response = self.actionVLM.call_chat(
             images=images,
             text_prompt=prompt
         )
@@ -1250,8 +945,6 @@ Remember these instructions throughout the navigation episode. I will show you o
         t_vlm_end = time.time()
         vlm_inference_time = t_vlm_end - t_vlm_start
         
-        frame_type = "KEYFRAME" if is_keyframe else "NON-KEYFRAME"
-        print(f'[NavAgent] Frame type: {frame_type}')
         print(f'[NavAgent] Timing - Projection: {projection_time:.3f}s, VLM inference: {vlm_inference_time:.3f}s')
         print(f'[NavAgent] Prompt length: {len(prompt)} chars')
         print(f'Response: {response}')
@@ -1272,8 +965,8 @@ Remember these instructions throughout the navigation episode. I will show you o
             timing_info = {
                 'projection_time': float(projection_time),
                 'vlm_inference_time': float(vlm_inference_time),
-                'prompt': prompt,  # Include prompt for server to save
-                'is_keyframe': is_keyframe
+                'prompt': prompt,
+                'is_keyframe': False  # No longer using keyframe mode
             }
             
             # Handle rotation actions
@@ -1286,47 +979,6 @@ Remember these instructions throughout the navigation episode. I will show you o
             else:
                 # Forward movement action
                 action = rev.get(action_number)
-                
-                # History management for keyframe mode
-                if self.cfg['keyframe_mode']:
-                    # Create frame record（保存prompt用于构建VLM历史）
-                    frame_record = {
-                        'iter': iter,
-                        'is_keyframe': is_keyframe,
-                        'action': action,
-                        'action_number': action_number,
-                        'response': response,
-                        'prompt': prompt,  # 保存prompt用于重建VLM对话历史
-                        'rgb_vis': rgb_vis_final.copy() if rgb_vis_final is not None else None,
-                        'timestamp': obs.get('timestamp', None)
-                    }
-                    
-                    if is_keyframe:
-                        # 关键帧：保存waypoint P并开始新周期
-                        if action is not None:
-                            r, theta = action
-                            # Convert (r, theta) in current base frame to global (odom) coordinates
-                            T_odom_base = obs['base_to_odom_matrix']
-                            # Point in base frame
-                            p_base = np.array([r * np.cos(theta), r * np.sin(theta), 0.0, 1.0], dtype=np.float64)
-                            # Transform to odom frame
-                            p_odom = T_odom_base @ p_base
-                            self.current_waypoint_P_global = p_odom[:3]
-                            print(f"[NavAgent] Keyframe: Saved waypoint P at global position: {self.current_waypoint_P_global}")
-                        
-                        # 将当前关键帧添加到历史
-                        self.keyframe_history.append(frame_record)
-                        self.current_keyframe_idx = len(self.keyframe_history) - 1
-                        
-                        # 清空当前周期的非关键帧列表（开始新周期）
-                        self.current_cycle_nonkeyframes = []
-                        
-                        print(f"[NavAgent] Memory: Added keyframe #{self.current_keyframe_idx + 1} (total keyframes: {len(self.keyframe_history)})")
-                    else:
-                        # 非关键帧：添加到当前周期
-                        self.current_cycle_nonkeyframes.append(frame_record)
-                        print(f"[NavAgent] Memory: Added non-keyframe to current cycle (cycle size: {len(self.current_cycle_nonkeyframes)})")
-                
                 return response, rgb_vis_final, action, timing_info
         except (IndexError, KeyError, TypeError, ValueError) as e:
             print(f'Error parsing response {e}')
