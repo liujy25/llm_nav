@@ -52,7 +52,7 @@ class NavAgent:
         
         # ObstacleMap configuration
         self.cfg.setdefault('agent_radius', 0.3)  # Robot radius in meters
-        self.cfg.setdefault('frontier_area_thresh', 1.0)  # Minimum frontier area in m^2
+        self.cfg.setdefault('frontier_area_thresh', 0.3)  # Minimum frontier area in m^2 (降低以生成更多frontiers)
 
         self.clip_dist = self.cfg['clip_dist']
         
@@ -310,8 +310,8 @@ Remember these instructions throughout the navigation episode. Each iteration wi
             cv2.circle(bev, tuple(wp_px.astype(int)), 1, BLUE, -1)  # 蓝色填充
             cv2.circle(bev, tuple(wp_px.astype(int)), 1, WHITE, 1)  # 白色边框
             
-            # 画编号（缩小字体）
-            text = str(wp_id)
+            # 画编号（添加W前缀，缩小字体）
+            text = f"W{wp_id}"
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1)
             cv2.putText(bev, text, (int(wp_px[0]-tw//2), int(wp_px[1]+th//2)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, WHITE, 1)
@@ -600,8 +600,8 @@ Remember these instructions throughout the navigation episode. Each iteration wi
             
             print(f"  Frontier {frontier_id}: drawn at {pixel_pos}, in_original={in_original}")
             
-            # 绘制ID
-            text = str(frontier_id)
+            # 绘制ID（添加F前缀以区分waypoint）
+            text = f"F{frontier_id}"
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
             cv2.putText(rgb_padded, text, (pixel_pos[0]-tw//2, pixel_pos[1]+th//2),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
@@ -830,19 +830,19 @@ Remember these instructions throughout the navigation episode. Each iteration wi
 IMAGE DESCRIPTIONS:
 - Image 1 (BEV Map): Bird's-eye view showing explored area
   * Red circle = YOUR current position
-  * Blue circles with numbers = Historical waypoints (IDs: {wp_list})
-  * Green dots = Frontiers (unexplored boundaries)
+  * Blue circles with "W" prefix = Historical waypoints (IDs: {wp_list})
+  * Green dots = Frontiers (unexplored boundaries, labeled as F1, F2, F3... in RGB view)
   * Use this for global navigation planning
 
 - Image 2 (Current RGB View): First-person camera view
-  * Green circles with numbers = Visible frontiers (IDs: {frontier_list})
+  * Green circles labeled "F1", "F2", "F3"... = Visible frontiers (IDs: {frontier_list})
   * These are exploration targets you can navigate to
   * Frontier IDs are consistent across all views
 
 AVAILABLE ACTIONS:
 1. SELECT FRONTIER: Navigate to a visible frontier to explore new area
    Format: {{"action": "frontier", "id": <frontier_id>}}
-   Example: {{"action": "frontier", "id": 1}}
+   Example: {{"action": "frontier", "id": 2}}
 
 2. VIEW WAYPOINT: Check RGB view from a historical waypoint (shows frontiers visible from there)
    Use function: get_waypoint_rgb(wp_ids=[<id1>, <id2>, ...])

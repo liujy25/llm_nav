@@ -23,7 +23,7 @@ def extract_yaw(tf_matrix: np.ndarray) -> float:
     return np.arctan2(tf_matrix[1, 0], tf_matrix[0, 0])
 
 
-def get_point_cloud(depth: np.ndarray, mask: np.ndarray, fx: float, fy: float) -> np.ndarray:
+def get_point_cloud(depth: np.ndarray, mask: np.ndarray, fx: float, fy: float, cx: float = None, cy: float = None) -> np.ndarray:
     """
     Convert depth image to 3D point cloud in camera frame.
     
@@ -37,6 +37,10 @@ def get_point_cloud(depth: np.ndarray, mask: np.ndarray, fx: float, fy: float) -
         Focal length in x direction (pixels)
     fy : float
         Focal length in y direction (pixels)
+    cx : float, optional
+        Principal point x coordinate (pixels). If None, uses image center.
+    cy : float, optional
+        Principal point y coordinate (pixels). If None, uses image center.
         
     Returns
     -------
@@ -53,9 +57,11 @@ def get_point_cloud(depth: np.ndarray, mask: np.ndarray, fx: float, fy: float) -
     v = v[mask]
     z = depth[mask]
     
-    # Assume principal point at image center
-    cx = W / 2.0
-    cy = H / 2.0
+    # Use provided principal point or default to image center
+    if cx is None:
+        cx = W / 2.0
+    if cy is None:
+        cy = H / 2.0
     
     # Unproject to 3D
     x = (u - cx) * z / fx

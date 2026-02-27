@@ -114,21 +114,34 @@ class ObstacleMap:
             self._episode_origin = base_to_odom[:3, 3].copy()
             print(f"[ObstacleMap] Episode origin set: {self._episode_origin}")
         
-        # 1. Generate point cloud in camera frame
+        # 1. Generate point cloud in camera frame (OpenCV optical frame)
         mask = (depth > min_depth) & (depth < max_depth) & np.isfinite(depth)
         fx = intrinsic[0, 0]
         fy = intrinsic[1, 1]
-        point_cloud_camera = get_point_cloud(depth, mask, fx, fy)
+        cx = intrinsic[0, 2]
+        cy = intrinsic[1, 2]
+        point_cloud_optical = get_point_cloud(depth, mask, fx, fy, cx, cy)
         
-        print(f"[ObstacleMap] Depth shape: {depth.shape}, valid points: {mask.sum()}, point cloud size: {len(point_cloud_camera)}")
+        print(f"[ObstacleMap] Depth shape: {depth.shape}, valid points: {mask.sum()}, point cloud size: {len(point_cloud_optical)}")
         
-        if len(point_cloud_camera) == 0:
+        if len(point_cloud_optical) == 0:
             print("[ObstacleMap] WARNING: No valid points in point cloud!")
             return
         
-        # 2. Transform to odom frame
+        # 2. Convert from optical frame to camera_link frame
+        # OpenCV optical: X=right, Y=down, Z=forward
+        # ROS camera_link: X=forward, Y=left, Z=up
+        # Transformation: [X_link, Y_link, Z_link] = [Z_optical, -X_optical, -Y_optical]
+        point_cloud_camera = np.zeros_like(point_cloud_optical)
+        point_cloud_camera[:, 0] = point_cloud_optical[:, 0]   # X_link = Z_optical (forward)
+        point_cloud_camera[:, 1] = point_cloud_optical[:, 1]  # Y_link = -X_optical (left)
+        point_cloud_camera[:, 2] = point_cloud_optical[:, 2]  # Z_link = -Y_optical (up)
+        
+        print(f"[ObstacleMap] Converted from optical frame to camera_link frame")
+        
+        # 3. Transform to odom frame
         # cam->odom = base->odom @ cam->base
-        T_cam_odom = extrinsic  # This is odom->cam, need to invert
+        T_cam_odom = extrinsic  # This is odom->cam_link, need to invert
         T_odom_cam = np.linalg.inv(T_cam_odom)
         
         # Debug: print transformation matrices
@@ -245,7 +258,7 @@ class ObstacleMap:
         print(f"[ObstacleMap] Calling reveal_fog_of_war with angle={current_angle_input:.3f} rad ({np.rad2deg(current_angle_input):.1f} deg)")
         new_explored = reveal_fog_of_war(
             top_down_map=self._navigable_map.astype(np.uint8),
-            current_fog_of_war_mask=np.zeros_like(self._obstacle_map, dtype=np.uint8),
+            current_fog_of_war_mask=self.explored_area.astype(np.uint8),
             current_point=np.array([agent_pixel[1], agent_pixel[0]], dtype=np.int32),  # (row, col)
             current_angle=current_angle_input,  # 修复：使用π/2 - agent_yaw
             fov=fov_deg,
