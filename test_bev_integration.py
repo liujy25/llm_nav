@@ -91,41 +91,17 @@ def test_bev_integration(snapshot_dir, output_dir='test_output'):
         'enable_bev_map': True,
         'bev_map_size': 400,
         'bev_pixels_per_meter': 10,
-        'obstacle_height_min': 0.6,
-        'obstacle_height_max': 2.0,
+        'obstacle_height_min': 0.15,  # 修正：地面以上15cm开始算障碍物
+        'obstacle_height_max': 2.0,   # 2米以上算天花板
         'num_theta': 40,
         'clip_dist': 5.0,
     }
     agent = NavAgent(cfg)
     agent.reset(goal="chair", goal_description="")
     print(f"  NavAgent initialized with BEV map: {agent.obstacle_map is not None}")
-    
-    # 3. 测试_navigability（raycast可行点检测）
-    print("\n[Step 3] 测试_navigability（raycast可行点检测）...")
-    a_initial = agent._navigability(obs)
-    print(f"  检测到 {len(a_initial)} 个初始可行点")
-    for i, (r, theta) in enumerate(a_initial[:5]):
-        print(f"    {i+1}: r={r:.2f}m, theta={np.rad2deg(theta):.1f}°")
-    
-    # 4. 测试_action_proposer（动作过滤）
-    print("\n[Step 4] 测试_action_proposer（动作过滤）...")
-    a_final = agent._action_proposer(a_initial, obs['base_to_odom_matrix'])
-    print(f"  过滤后剩余 {len(a_final)} 个可行点")
-    
-    # 5. 测试_projection（RGB图像标注）
-    print("\n[Step 5] 测试_projection（RGB图像标注）...")
-    projected, rgb_vis = agent._projection(a_final, obs)
-    print(f"  投影成功，标注了 {len(projected)} 个动作")
-    print(f"  动作ID: {list(projected.values())}")
-    
-    # 保存标注后的RGB图像
-    rgb_vis_path = os.path.join(output_dir, 'rgb_annotated.png')
-    rgb_vis_bgr = cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(rgb_vis_path, rgb_vis_bgr)
-    print(f"  保存标注RGB: {rgb_vis_path}")
-    
-    # 6. 测试ObstacleMap更新
-    print("\n[Step 6] 测试ObstacleMap更新...")
+
+    # 3. 测试ObstacleMap更新（先更新，再做raycast）
+    print("\n[Step 3] 测试ObstacleMap更新...")
     agent.obstacle_map.update_map(
         depth=obs['depth'],
         intrinsic=obs['intrinsic'],
@@ -136,24 +112,50 @@ def test_bev_integration(snapshot_dir, output_dir='test_output'):
     )
     print(f"  ObstacleMap更新成功")
     print(f"  Explored pixels: {agent.obstacle_map.explored_area.sum()}")
-    
+    print(f"  Obstacle pixels: {agent.obstacle_map._obstacle_map.sum()}")
+    print(f"  Navigable pixels: {agent.obstacle_map._navigable_map.sum()}")
+
+    # 4. 测试_navigability_from_bev（BEV-based raycast可行点检测）
+    print("\n[Step 4] 测试_navigability_from_bev（BEV-based raycast）...")
+    a_initial = agent._navigability_from_bev(obs)
+    print(f"  检测到 {len(a_initial)} 个初始可行点")
+    for i, (r, theta) in enumerate(a_initial[:5]):
+        print(f"    {i+1}: r={r:.2f}m, theta={np.rad2deg(theta):.1f}°")
+
+    # 5. 测试_action_proposer（动作过滤）
+    print("\n[Step 5] 测试_action_proposer（动作过滤）...")
+    a_final = agent._action_proposer(a_initial, obs['base_to_odom_matrix'])
+    print(f"  过滤后剩余 {len(a_final)} 个可行点")
+    for i, (r, theta) in enumerate(a_final[:10]):
+        print(f"    {i+1}: r={r:.2f}m, theta={np.rad2deg(theta):.1f}°")
+
+    # 6. 测试_projection（RGB图像标注）
+    print("\n[Step 6] 测试_projection（RGB图像标注）...")
+    projected, rgb_vis = agent._projection(a_final, obs)
+    print(f"  投影成功，标注了 {len(projected)} 个动作")
+    print(f"  动作ID: {list(projected.values())}")
+
+    # 保存标注后的RGB图像
+    rgb_vis_path = os.path.join(output_dir, 'rgb_annotated.png')
+    rgb_vis_bgr = cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(rgb_vis_path, rgb_vis_bgr)
+
     # 7. 测试BEV地图生成
     print("\n[Step 7] 测试BEV地图生成...")
     bev_map = agent._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=a_final)
     print(f"  BEV地图生成成功，shape: {bev_map.shape}")
-    
-    # 保存第一次生成的BEV地图（仅更新一次ObstacleMap后）
+
+    # 保存BEV地图
     bev_map_path = os.path.join(output_dir, 'bev_map_step7.png')
-    # bev_map已经是RGB格式，cv2.imwrite需要BGR格式
     cv2.imwrite(bev_map_path, cv2.cvtColor(bev_map, cv2.COLOR_RGB2BGR))
-    print(f"  保存BEV地图（Step 7，探索区域较少）: {bev_map_path}")
-    
+    print(f"  保存BEV地图: {bev_map_path}")
+
     # 7.5. 测试历史轨迹可视化（模拟几个轨迹点）
     print("\n[Step 7.5] 测试历史轨迹可视化...")
     # 获取当前机器人位置
     current_pos = obs['base_to_odom_matrix'][:3, 3]
     print(f"  当前机器人位置: ({current_pos[0]:.2f}, {current_pos[1]:.2f})")
-    
+
     # 模拟3-4个历史轨迹点（在机器人周围，间距3-4米）
     agent.trajectory_history = [
         (current_pos[0] - 4.0, current_pos[1] - 3.0),  # 起点（后左）
@@ -164,38 +166,27 @@ def test_bev_integration(snapshot_dir, output_dir='test_output'):
     print(f"  模拟了 {len(agent.trajectory_history)} 个历史轨迹点")
     for i, (x, y) in enumerate(agent.trajectory_history):
         print(f"    点{i+1}: ({x:.2f}, {y:.2f})")
-    
+
     # 重新生成BEV地图，包含轨迹
     bev_with_trajectory = agent._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=a_final)
     bev_trajectory_path = os.path.join(output_dir, 'bev_with_trajectory.png')
-    # bev_with_trajectory已经是RGB格式，cv2.imwrite需要BGR格式
     cv2.imwrite(bev_trajectory_path, cv2.cvtColor(bev_with_trajectory, cv2.COLOR_RGB2BGR))
     print(f"  保存带轨迹的BEV地图: {bev_trajectory_path}")
 
-    
-    # 8. 测试完整的_nav流程（不调用VLM）
+
+    # 8. 测试完整的_nav流程（模拟，使用BEV-based方法）
     print("\n[Step 8] 测试完整的_nav流程（模拟）...")
-    
-    # 模拟_nav的前半部分（到VLM调用之前）
-    a_initial = agent._navigability(obs)
-    a_final = agent._action_proposer(a_initial, obs['base_to_odom_matrix'])
-    
-    if agent.obstacle_map is not None:
-        agent.obstacle_map.update_map(
-            depth=obs['depth'],
-            intrinsic=obs['intrinsic'],
-            extrinsic=obs['extrinsic'],
-            base_to_odom=obs['base_to_odom_matrix']
-        )
-    
+    print("  注意：使用BEV-based raycast方法，waypoints不会跑到障碍物后面")
+
+    # 准备发送给VLM的图像
     a_final_projected, rgb_vis = agent._projection(a_final, obs)
-    
+
     if agent.obstacle_map is not None:
         bev_map = agent._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=a_final)
         images = [rgb_vis, bev_map]
     else:
         images = [rgb_vis]
-    
+
     print(f"  准备发送给VLM的图像数量: {len(images)}")
     for i, img in enumerate(images):
         print(f"    Image {i+1}: shape={img.shape}, dtype={img.dtype}")
@@ -277,7 +268,7 @@ def test_bev_integration(snapshot_dir, output_dir='test_output'):
 
 if __name__ == '__main__':
     # 使用相对路径
-    snapshot_dir = '../snapshot_20260226_174134'
+    snapshot_dir = '/home/liujy/mobile_manipulation/model_server/nav/snapshot_0001'
     output_dir = 'test_output_bev'
     
     test_bev_integration(snapshot_dir, output_dir)

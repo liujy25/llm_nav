@@ -246,15 +246,13 @@ class ObstacleMap:
         print(f"[ObstacleMap] FOV: {fov_deg:.1f} degrees")
         
         # reveal_fog_of_war内部会做变换: angle_cv2 = np.rad2deg(-current_angle + π/2)
-        # 我们的agent_yaw: 0度=+X方向（图像右侧）, 90度=+Y方向（图像上方）
-        # reveal_fog_of_war的angle_cv2: 0度=图像右侧, 90度=图像上方（OpenCV椭圆约定）
-        #
-        # 推导：如果agent_yaw=0（朝向+X），我们希望angle_cv2=0（图像右侧）
-        #      angle_cv2 = -current_angle + 90度
-        #      0 = -current_angle + 90
-        #      current_angle = 90度 = π/2
-        # 因此：current_angle = π/2 - agent_yaw
-        current_angle_input = np.pi / 2 - agent_yaw
+        # 推导正确的转换公式：
+        # - agent_yaw=0（odom +X东） -> 图像+X右 -> OpenCV angle_cv2=0
+        #   0 = -current_angle + 90 -> current_angle = 90度
+        # - agent_yaw=90度（odom +Y北） -> 图像-Y上（Y轴翻转） -> OpenCV angle_cv2=270度
+        #   270 = -current_angle + 90 -> current_angle = -180度 = 180度
+        # 因此：current_angle = agent_yaw + π/2
+        current_angle_input = agent_yaw + np.pi / 2
         print(f"[ObstacleMap] Calling reveal_fog_of_war with angle={current_angle_input:.3f} rad ({np.rad2deg(current_angle_input):.1f} deg)")
         new_explored = reveal_fog_of_war(
             top_down_map=self._navigable_map.astype(np.uint8),

@@ -121,10 +121,16 @@ def navigation_reset():
     nav_state['log_dir'] = setup_log_directory(goal, goal_description or '')
     
     # Build agent config
+    # agent_cfg = {
+    #     'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/',
+    #     'vlm_api_key': 'EMPTY',
+    #     'vlm_base_url': 'http://10.15.89.71:34134/v1/',
+    # }
+
     agent_cfg = {
-        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3-VL-8B-Instruct/',
-        'vlm_api_key': 'EMPTY',
-        'vlm_base_url': 'http://10.15.89.71:34134/v1/',
+        'vlm_model': 'qwen3.5-plus',
+        'vlm_api_key': 'sk-87fb11f7a8eb4eb0835718bd31c44d74',
+        'vlm_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     }
     
     # Initialize NavAgent (or reset if already exists)
@@ -319,6 +325,8 @@ def navigation_step():
     }
     
     # Add image paths
+    if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb.jpg')):
+        viz_state['images']['rgb'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb.jpg'
     if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg')):
         viz_state['images']['rgb_vis'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb_vis.jpg'
     if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg')):
@@ -477,11 +485,15 @@ def check_stop():
     
     goal = nav_state['goal']
     goal_desc = nav_state['goal_description']
-    
+
+    goal_text = f"{goal}"
+    if goal_desc:
+        goal_text += f" ({goal_desc})"
+
     prompt = f"""
     You are a robot navigation stop classifier.
 
-    Goal: {goal}
+    Goal: {goal_text}
 
     Answer 'yes' ONLY when you are confident we should stop now.
 
@@ -628,10 +640,14 @@ def get_iteration():
     
     if os.path.exists(os.path.join(log_dir, detection_img)):
         result['images']['detection'] = f'/logs/{log_name}/{detection_img}'
-    
+
+    rgb_img = f'{iter_prefix}_rgb.jpg'
+    if os.path.exists(os.path.join(log_dir, rgb_img)):
+        result['images']['rgb'] = f'/logs/{log_name}/{rgb_img}'
+
     if os.path.exists(os.path.join(log_dir, rgb_vis_img)):
         result['images']['rgb_vis'] = f'/logs/{log_name}/{rgb_vis_img}'
-    
+
     if os.path.exists(os.path.join(log_dir, bev_map_img)):
         result['images']['bev_map'] = f'/logs/{log_name}/{bev_map_img}'
     

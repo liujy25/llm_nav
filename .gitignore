@@ -32,3 +32,14 @@ logs/
 # Test output files
 test_results.json
 test_results.png
+
+# Point cloud debug files
+*.pcd
+
+# Test snapshots and outputs
+snapshot_*/
+test_output*/
+debug_output*/
+
+# Debug scripts
+debug_*.py

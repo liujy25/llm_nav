@@ -47,6 +47,7 @@ class NavAgent:
         self.cfg.setdefault('vlm_api_key', 'EMPTY')
         self.cfg.setdefault('vlm_base_url', 'http://10.15.89.71:34134/v1/')
         self.cfg.setdefault('vlm_timeout', 10)
+        self.cfg.setdefault('vlm_history', 3)  # Number of conversation rounds to keep in context
         
         # BEV map configuration
         self.cfg.setdefault('enable_bev_map', True)  # Enable BEV map visualization
@@ -443,10 +444,190 @@ Remember these instructions throughout the navigation episode. I will show you o
         point = self._global_to_grid(global_coords)
         cv2.line(self.explored_map, agent_coords, point, self.explored_color, self.voxel_ray_size)
 
+    def _navigability_from_bev(self, obs: dict, angle_range=None, clip_dist_override=None):
+        """
+        Compute navigable directions using BEV obstacle map (more accurate).
+
+        Parameters
+        ----------
+        obs : dict
+            Observation dictionary
+        angle_range : tuple, optional
+            (theta_min, theta_max) to limit angle search range (in radians)
+            If None, use full 360 degrees
+        clip_dist_override : float, optional
+            Override self.clip_dist for ray casting
+            If None, use self.clip_dist
+
+        Returns
+        -------
+        a_initial : list
+            List of (r, theta) tuples
+        """
+        if self.obstacle_map is None:
+            # Fallback to RGB-based method if BEV map is disabled
+            return self._navigability(obs, angle_range, clip_dist_override)
+
+        T_odom_base = obs['base_to_odom_matrix']
+
+        if self.init_pos is None:
+            self.init_pos = T_odom_base[:3, 3].copy()
+
+        # Calculate FOV for _action_proposer (needed even for BEV-based method)
+        if 'intrinsic' in obs and 'rgb' in obs:
+            K = obs['intrinsic']
+            rgb_image = obs['rgb']
+            self.fov = self.cal_fov(K, rgb_image.shape[1])
+        elif not hasattr(self, 'fov'):
+            # Default FOV if not available
+            self.fov = 90.0
+
+        # Get robot position in odom frame
+        robot_pos = T_odom_base[:3, 3]
+        robot_yaw = np.arctan2(T_odom_base[1, 0], T_odom_base[0, 0])
+
+        # Convert to pixel coordinates
+        robot_px = self.obstacle_map._xy_to_px(robot_pos[:2].reshape(1, 2))[0]
+
+        # Determine angle range
+        clip_dist = clip_dist_override if clip_dist_override is not None else self.clip_dist
+
+        if angle_range is not None:
+            theta_min, theta_max = angle_range
+            all_thetas = np.linspace(theta_min, theta_max, int(self.cfg['num_theta']))
+        else:
+            # Use forward-facing FOV range (strictly within camera FOV)
+            sensor_range = np.deg2rad(self.fov / 2)
+            all_thetas = np.linspace(-sensor_range, sensor_range, int(self.cfg['num_theta']))
+
+        print(f"[_navigability_from_bev] FOV: {self.fov:.1f}°, sensor_range: {np.rad2deg(sensor_range):.1f}°")
+        print(f"[_navigability_from_bev] Angle range: [{np.rad2deg(all_thetas[0]):.1f}°, {np.rad2deg(all_thetas[-1]):.1f}°]")
+        print(f"[_navigability_from_bev] Robot yaw: {np.rad2deg(robot_yaw):.1f}°")
+
+        a_initial = []
+
+        for theta_i in all_thetas:
+            # Compute absolute angle in odom frame
+            absolute_theta = robot_yaw + theta_i
+
+            # Raycast in BEV map
+            r_i = self._raycast_bev(
+                robot_px,
+                robot_pos[:2],
+                absolute_theta,
+                clip_dist
+            )
+
+            if r_i is not None and r_i > 0.5:  # Minimum distance threshold
+                self._update_voxel(r_i, theta_i, T_odom_base, clip_dist=clip_dist, clip_frac=0.66)
+                a_initial.append((r_i, theta_i))
+
+        print(f"[_navigability_from_bev] Generated {len(a_initial)} waypoints")
+
+        return a_initial
+
+    def _raycast_bev(self, start_px, start_pos, angle, max_dist):
+        """
+        Raycast in BEV map to find maximum navigable distance.
+
+        Parameters
+        ----------
+        start_px : np.ndarray
+            Starting pixel position [px_x, px_y]
+        start_pos : np.ndarray
+            Starting position in odom frame [x, y]
+        angle : float
+            Ray direction in odom frame (radians)
+        max_dist : float
+            Maximum ray distance (meters)
+
+        Returns
+        -------
+        float or None
+            Maximum navigable distance, or None if no valid distance found
+        """
+        # Calculate end position
+        end_x = start_pos[0] + max_dist * np.cos(angle)
+        end_y = start_pos[1] + max_dist * np.sin(angle)
+        end_px = self.obstacle_map._xy_to_px(np.array([[end_x, end_y]]))[0]
+
+        # Bresenham line algorithm to get all pixels along the ray
+        x0, y0 = int(start_px[0]), int(start_px[1])
+        x1, y1 = int(end_px[0]), int(end_px[1])
+
+        # Get line pixels
+        line_pixels = self._bresenham_line(x0, y0, x1, y1)
+
+        # Find first obstacle
+        map_size = self.obstacle_map.size
+        last_valid_px = None
+
+        for px_x, px_y in line_pixels:
+            # Check bounds
+            if not (0 <= px_x < map_size and 0 <= px_y < map_size):
+                break
+
+            # Check if navigable
+            if not self.obstacle_map._navigable_map[px_y, px_x]:
+                # Hit obstacle, return distance to last valid point
+                break
+
+            last_valid_px = (px_x, px_y)
+
+        if last_valid_px is None:
+            return None
+
+        # Convert back to world coordinates and compute distance
+        last_valid_pos = self.obstacle_map._px_to_xy(np.array([last_valid_px]))[0]
+        distance = np.linalg.norm(last_valid_pos - start_pos)
+
+        return distance
+
+    def _bresenham_line(self, x0, y0, x1, y1):
+        """
+        Bresenham's line algorithm to get all pixels along a line.
+
+        Parameters
+        ----------
+        x0, y0 : int
+            Start pixel coordinates
+        x1, y1 : int
+            End pixel coordinates
+
+        Returns
+        -------
+        list
+            List of (x, y) pixel coordinates along the line
+        """
+        pixels = []
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        x, y = x0, y0
+
+        while True:
+            pixels.append((x, y))
+
+            if x == x1 and y == y1:
+                break
+
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+
+        return pixels
+
     def _navigability(self, obs: dict, angle_range=None, clip_dist_override=None):
         """
-        Compute navigable directions.
-        
+        Compute navigable directions (RGB-based, legacy method).
+
         Parameters
         ----------
         obs : dict
@@ -457,7 +638,7 @@ Remember these instructions throughout the navigation episode. I will show you o
         clip_dist_override : float, optional
             Override self.clip_dist for ray casting
             If None, use self.clip_dist
-            
+
         Returns
         -------
         a_initial : list
@@ -488,8 +669,10 @@ Remember these instructions throughout the navigation episode. I will show you o
             sensor_range = np.deg2rad(self.fov / 2) * 1.5
             all_thetas = np.linspace(-sensor_range, sensor_range, int(self.cfg['num_theta']))
 
-        start = agent_frame_to_image_coords([0.0, 0.0, 0.0], K, T_cam_base)
-        
+        # Get base frame origin in odom frame for projection
+        base_origin_in_odom = T_odom_base[:3, 3]
+        start = agent_frame_to_image_coords(base_origin_in_odom, K, T_cam_odom)
+
         # Determine clip_dist to use
         clip_dist = clip_dist_override if clip_dist_override is not None else self.clip_dist
 
@@ -897,12 +1080,9 @@ Remember these instructions throughout the navigation episode. I will show you o
         # Record current position to trajectory history
         current_pos = obs['base_to_odom_matrix'][:3, 3]
         self.trajectory_history.append((current_pos[0], current_pos[1]))
-        
-        # Compute navigability (no angle_range or clip_dist_override needed)
-        a_initial = self._navigability(obs)
-        a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
-        # Update ObstacleMap with current observation
+        # Update ObstacleMap with current observation FIRST
+        # This ensures we have the latest obstacle information for raycast
         if self.obstacle_map is not None:
             self.obstacle_map.update_map(
                 depth=obs['depth'],
@@ -910,6 +1090,11 @@ Remember these instructions throughout the navigation episode. I will show you o
                 extrinsic=obs['extrinsic'],
                 base_to_odom=obs['base_to_odom_matrix']
             )
+
+        # Compute navigability using BEV-based raycast (more accurate)
+        # This uses the updated obstacle map to avoid waypoints behind obstacles
+        a_initial = self._navigability_from_bev(obs)
+        a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
         # Start timing for projection (image annotation)
         t_projection_start = time.time()
@@ -938,6 +1123,7 @@ Remember these instructions throughout the navigation episode. I will show you o
         
         # 调用VLM（使用VLM自己的历史管理）
         response = self.actionVLM.call_chat(
+            history=self.cfg['vlm_history'],
             images=images,
             text_prompt=prompt
         )
