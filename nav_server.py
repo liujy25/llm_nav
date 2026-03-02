@@ -148,7 +148,7 @@ def navigation_reset():
     agent_cfg = {
         'vlm_model': 'qwen3-vl-8b-thinking',
 
-        'vlm_api_key': 'QWENKEY',
+        'vlm_api_key': os.environ.get('QWEN_API_KEY', 'EMPTY'),
         'vlm_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
 
         # Navigation parameters (match test_bev_integration.py)
