@@ -145,11 +145,10 @@ def navigation_reset():
     #     'vlm_timeout': 600,  # 120 seconds for vision + navigation requests
     # }
 
-    # k = "sk-87fb11f7a8eb4eb0835718bd31c44d74"
     agent_cfg = {
         'vlm_model': 'qwen3-vl-8b-thinking',
 
-        'vlm_api_key': '',
+        'vlm_api_key': 'QWENKEY',
         'vlm_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
 
         # Navigation parameters (match test_bev_integration.py)
