@@ -121,7 +121,23 @@ def navigation_reset():
     nav_state['goal_description'] = goal_description or ''
     nav_state['iteration_count'] = 0
     nav_state['log_dir'] = setup_log_directory(goal, goal_description or '')
+    
+    # Build agent config
+    agent_cfg = {
+        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3.5-27B-FP8/',
 
+        'vlm_api_key': 'EMPTY',
+        'vlm_base_url': 'http://10.15.89.71:32054/v1/',
+
+        # Navigation parameters (match test_bev_integration.py)
+        'enable_bev_map': True,
+        'bev_map_size': 400,
+        'bev_pixels_per_meter': 10,
+        'clip_dist': 4.0,
+
+        # Increase timeout for complex vision requests
+        'vlm_timeout': 600,  # 120 seconds for vision + navigation requests
+    }
     
     # Initialize NavAgent (always recreate to ensure config is updated)
     nav_state['agent'] = NavAgent(cfg=agent_cfg)
