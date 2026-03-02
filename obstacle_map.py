@@ -128,14 +128,13 @@ class ObstacleMap:
             print("[ObstacleMap] WARNING: No valid points in point cloud!")
             return
         
-        # 2. Convert from optical frame to camera_link frame
-        # OpenCV optical: X=right, Y=down, Z=forward
-        # ROS camera_link: X=forward, Y=left, Z=up
-        # Transformation: [X_link, Y_link, Z_link] = [Z_optical, -X_optical, -Y_optical]
+        # 2. Point cloud is already in camera_link frame from get_point_cloud
+        # No conversion needed - get_point_cloud returns camera_link coordinates
+        # Camera_link frame: X=forward, Y=left, Z=up
         point_cloud_camera = np.zeros_like(point_cloud_optical)
-        point_cloud_camera[:, 0] = point_cloud_optical[:, 0]   # X_link = Z_optical (forward)
-        point_cloud_camera[:, 1] = point_cloud_optical[:, 1]  # Y_link = -X_optical (left)
-        point_cloud_camera[:, 2] = point_cloud_optical[:, 2]  # Z_link = -Y_optical (up)
+        point_cloud_camera[:, 0] = point_cloud_optical[:, 0]   # X (forward)
+        point_cloud_camera[:, 1] = point_cloud_optical[:, 1]   # Y (left)
+        point_cloud_camera[:, 2] = point_cloud_optical[:, 2]   # Z (up)
         
         print(f"[ObstacleMap] Converted from optical frame to camera_link frame")
         
@@ -169,7 +168,7 @@ class ObstacleMap:
             print(f"[ObstacleMap] Point cloud odom z range: [{z_min:.3f}, {z_max:.3f}]")
         
         # Save point cloud to PCD file for debugging
-        self._save_point_cloud_pcd(point_cloud_odom, "point_cloud_odom.pcd")
+        # self._save_point_cloud_pcd(point_cloud_odom, "point_cloud_odom.pcd")
         
         # 3. Filter by height (z coordinate in odom frame)
         obstacle_cloud = filter_points_by_height(
@@ -183,8 +182,8 @@ class ObstacleMap:
             print(f"[ObstacleMap] Obstacle cloud z range: [{z_min:.3f}, {z_max:.3f}]")
         
         # Save filtered obstacle cloud
-        if len(obstacle_cloud) > 0:
-            self._save_point_cloud_pcd(obstacle_cloud, "obstacle_cloud_odom.pcd")
+        # if len(obstacle_cloud) > 0:
+        #     self._save_point_cloud_pcd(obstacle_cloud, "obstacle_cloud_odom.pcd")
         
         # 4. Project to 2D map
         if len(obstacle_cloud) > 0:
@@ -217,8 +216,19 @@ class ObstacleMap:
                 self._navigable_kernel,
                 iterations=1
             ).astype(bool)
-            
+
             print(f"[ObstacleMap] Navigable map coverage: {self._navigable_map.sum()} / {self._navigable_map.size} pixels")
+
+            # Force robot position to be navigable (robot itself may be detected as obstacle)
+            robot_pixel = self._xy_to_px(base_to_odom[:2, 3].reshape(1, 2))[0]
+            if 0 <= robot_pixel[0] < self.size and 0 <= robot_pixel[1] < self.size:
+                # Mark a small area around robot as navigable (5x5 pixels = ~0.05m radius)
+                x_min = max(0, robot_pixel[0] - 2)
+                x_max = min(self.size, robot_pixel[0] + 3)
+                y_min = max(0, robot_pixel[1] - 2)
+                y_max = min(self.size, robot_pixel[1] + 3)
+                self._navigable_map[y_min:y_max, x_min:x_max] = True
+                print(f"[ObstacleMap] Forced robot position {robot_pixel} to be navigable")
         else:
             print("[ObstacleMap] WARNING: No obstacle points after height filtering!")
         
@@ -263,22 +273,24 @@ class ObstacleMap:
             max_line_len=int(max_depth * self.pixels_per_meter),
         )
         print(f"[ObstacleMap] reveal_fog_of_war returned {new_explored.sum()} explored pixels")
-        
+
         # Dilate slightly and merge
-        new_explored = cv2.dilate(new_explored, np.ones((3, 3), np.uint8), iterations=1)
+        # REDUCED: Changed from 3x3 to 1x1 (no dilation) for more precise exploration tracking
+        # new_explored = cv2.dilate(new_explored, np.ones((3, 3), np.uint8), iterations=1)
         self.explored_area[new_explored > 0] = True
         self.explored_area[~self._navigable_map] = False
-        
+
         print(f"[ObstacleMap] Explored area: {self.explored_area.sum()} / {self.explored_area.size} pixels")
-        
+
         # Keep only the connected component containing the agent
-        self._filter_explored_area(agent_pixel)
-        
-        print(f"[ObstacleMap] Explored area after filtering: {self.explored_area.sum()} pixels")
-        
+        # DISABLED: This was causing explored areas to disappear when robot moves to disconnected regions
+        # self._filter_explored_area(agent_pixel)
+
+        # print(f"[ObstacleMap] Explored area after filtering: {self.explored_area.sum()} pixels")
+
         # 6. Detect frontiers
         self._update_frontiers()
-        
+
         print(f"[ObstacleMap] Detected {len(self.frontiers)} frontiers")
     
     def _filter_explored_area(self, agent_pixel: np.ndarray) -> None:
@@ -296,7 +308,7 @@ class ObstacleMap:
             
             for idx, cnt in enumerate(contours):
                 dist = cv2.pointPolygonTest(
-                    cnt, tuple(agent_pixel.astype(int)), True
+                    cnt, (int(agent_pixel[0]), int(agent_pixel[1])), True
                 )
                 if dist >= 0:
                     best_idx = idx

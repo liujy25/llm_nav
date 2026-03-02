@@ -23,6 +23,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(script_dir)
 
 from nav_agent import NavAgent
+from detic_detector import DeticDetector
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'llm_nav_secret_key'
@@ -31,6 +32,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Global state
 nav_state = {
     'agent': None,
+    'detic_detector': None,
     'goal': None,
     'goal_description': '',
     'iteration_count': 0,
@@ -127,20 +129,61 @@ def navigation_reset():
     #     'vlm_base_url': 'http://10.15.89.71:34134/v1/',
     # }
 
+    # agent_cfg = {
+    #     'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3.5-27B-FP8/',
+
+    #     'vlm_api_key': 'EMPTY',
+    #     'vlm_base_url': 'http://10.15.89.71:32054/v1/',
+
+    #     # Navigation parameters (match test_bev_integration.py)
+    #     'enable_bev_map': True,
+    #     'bev_map_size': 400,
+    #     'bev_pixels_per_meter': 10,
+    #     'clip_dist': 4.0,
+
+    #     # Increase timeout for complex vision requests
+    #     'vlm_timeout': 600,  # 120 seconds for vision + navigation requests
+    # }
+
     agent_cfg = {
-        'vlm_model': 'qwen3.5-plus',
+        'vlm_model': 'qwen3-vl-8b-thinking',
+
         'vlm_api_key': 'sk-87fb11f7a8eb4eb0835718bd31c44d74',
         'vlm_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+
+        # Navigation parameters (match test_bev_integration.py)
+        'enable_bev_map': True,
+        'bev_map_size': 400,
+        'bev_pixels_per_meter': 10,
+        'clip_dist': 4.0,
+
+        # Increase timeout for complex vision requests
+        'vlm_timeout': 120,  # 120 seconds for vision + navigation requests
     }
     
-    # Initialize NavAgent (or reset if already exists)
-    if nav_state['agent'] is None:
-        nav_state['agent'] = NavAgent(cfg=agent_cfg)
-        nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
-    else:
-        # Reset with new goal information
-        nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
-    
+    # Initialize NavAgent (always recreate to ensure config is updated)
+    nav_state['agent'] = NavAgent(cfg=agent_cfg)
+    nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
+
+    # Initialize Detic detector for goal detection
+    try:
+        detic_config = '/home/liujy/mobile_manipulation/perception_modules/Detic/configs/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml'
+        detic_weights = '/home/liujy/mobile_manipulation/perception_modules/Detic/models/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth'
+
+        nav_state['detic_detector'] = DeticDetector(
+            config_file=detic_config,
+            model_weights=detic_weights,
+            device='cuda',
+            confidence_threshold=confidence_threshold
+        )
+        nav_state['detic_detector'].set_goal(goal)
+        print(f"[Server] Detic detector initialized for goal: '{goal}'")
+    except Exception as e:
+        print(f"[Server] WARNING: Failed to initialize Detic: {e}")
+        import traceback
+        traceback.print_exc()
+        nav_state['detic_detector'] = None
+
     print(f"[Server] Navigation reset: goal='{goal}', description='{goal_description}', log_dir={nav_state['log_dir']}")
     print(f"[Server] NavAgent reset with goal information, VLM initialized with full task briefing")
     
@@ -232,7 +275,82 @@ def navigation_step():
         T_odom_base = np.array(json.loads(form_data['T_odom_base']), dtype=np.float32).reshape(4, 4)
     except Exception as e:
         return jsonify({'error': f'Failed to parse transforms: {str(e)}'}), 400
-    
+
+    # === DETIC GOAL DETECTION (SYNCHRONOUS) ===
+    # Check if goal is visible before running VLM navigation
+    t_detic_start = time.time()
+    if nav_state['detic_detector'] is not None:
+        try:
+            detections = nav_state['detic_detector'].detect(rgb)
+            t_detic_end = time.time()
+
+            if len(detections) > 0:
+                # Goal detected! Calculate 3D position and generate approach action
+                bbox, confidence = detections[0]  # Take highest confidence detection
+                print(f"[Server] Detic detected goal '{nav_state['goal']}' with confidence {confidence:.3f}")
+
+                # Calculate 3D position in base frame
+                try:
+                    target_pos_base = nav_state['detic_detector'].get_3d_position(
+                        bbox, depth, intrinsic, T_cam_odom, T_odom_base
+                    )
+
+                    # Generate approach waypoint (0.5m before target)
+                    distance = np.linalg.norm(target_pos_base[:2])
+                    angle = np.arctan2(target_pos_base[1], target_pos_base[0])
+
+                    # If very close (< 0.6m), we're done
+                    if distance < 0.6:
+                        finished = True
+                        approach_distance = distance
+                    else:
+                        finished = False
+                        approach_distance = max(0.5, distance - 0.5)  # Stop 0.5m before target
+
+                    # Calculate approach pose in odom frame
+                    current_pos_odom = T_odom_base[:3, 3]
+                    approach_x = current_pos_odom[0] + approach_distance * np.cos(angle)
+                    approach_y = current_pos_odom[1] + approach_distance * np.sin(angle)
+                    approach_z = current_pos_odom[2]
+                    approach_yaw = angle
+
+                    # Build goal pose using standard function
+                    goal_pose = build_goal_pose(approach_x, approach_y, approach_z, approach_yaw)
+
+                    print(f"[Server] Goal detected at distance {distance:.2f}m, generating approach action (finished={finished})")
+
+                    # Return in same format as normal navigation
+                    return jsonify({
+                        'action_type': 'nav_step',
+                        'goal_pose': {
+                            'frame_id': 'odom',
+                            'pose': goal_pose
+                        },
+                        'iteration': iteration,
+                        'finished': finished,
+                        'timing': {
+                            'total_server_time': time.time() - t_server_start,
+                            'vlm_projection_time': 0.0,
+                            'vlm_inference_time': 0.0,
+                            'detic_detection_time': t_detic_end - t_detic_start
+                        }
+                    })
+
+                except Exception as e:
+                    print(f"[Server] Failed to calculate 3D position: {e}")
+                    # Continue with VLM navigation on error
+
+            else:
+                print(f"[Server] Detic: No detection of '{nav_state['goal']}', continuing with VLM navigation")
+
+        except Exception as e:
+            print(f"[Server] Detic detection failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue with VLM navigation on error
+
+    # If no detection or Detic not initialized, continue with normal VLM navigation...
+
     # Prepare obs dict (same format as original code)
     obs = {
         'rgb': rgb,
@@ -248,12 +366,12 @@ def navigation_step():
     
     # LLM Navigation Step
     print("[Server] Calling NavAgent for decision...")
-    response, rgb_vis, action, nav_timing = nav_state['agent']._nav(
+    response, rgb_vis, action, nav_timing, bev_map = nav_state['agent']._nav(
         obs, nav_state['goal'], iteration, goal_description=nav_state['goal_description']
     )
-    
+
     print(f"[Server] NavAgent action: {action}")
-    
+
     # Save visualization
     if rgb_vis is not None:
         cv2.imwrite(
@@ -263,19 +381,25 @@ def navigation_step():
     if response is not None:
         with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_response.txt'), 'w') as f:
             f.write(response)
+
+    # Save BEV map (the actual BEV map from obstacle_map, not the old explored_map)
+    if bev_map is not None:
+        cv2.imwrite(
+            os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg'),
+            cv2.cvtColor(bev_map, cv2.COLOR_RGB2BGR)
+        )
     
     # Save prompt for debugging (if available in timing info)
     if nav_timing.get('prompt'):
         with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_prompt.txt'), 'w', encoding='utf-8') as f:
             f.write(nav_timing['prompt'])
-    
-    # Save voxel maps
+
+    # Save voxel map for debugging (optional, deprecated)
+    # Note: voxel_map and explored_map are deprecated in favor of ObstacleMap
+    # Keeping this for backward compatibility, but it's no longer updated when using BEV
     voxel_map = nav_state['agent'].voxel_map
-    explored_map = nav_state['agent'].explored_map
-    if voxel_map is not None:
+    if voxel_map is not None and voxel_map.sum() > 0:  # Only save if it has data
         cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_voxel_map.jpg'), voxel_map)
-    if explored_map is not None:
-        cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg'), explored_map)
     
     # Save timing information (will be updated at the end with total time and action type)
     timing_data = {
@@ -399,7 +523,7 @@ def navigation_step():
         r, theta = float(action[0]), float(action[1])
         print(f"[Server] Action is NAV STEP: r={r:.2f}, theta={theta:.2f}")
         
-        dis = min(0.4, r)
+        dis = r
         # Compute goal in odom frame
         x_b = dis * math.cos(theta)
         y_b = dis * math.sin(theta)
@@ -454,95 +578,6 @@ def navigation_step():
         'finished': False,
         'timing': timing_info
     })
-
-
-@app.route('/check_stop', methods=['POST'])
-def check_stop():
-    """
-    轻量级stop检测 - 只判断是否到达目标
-    供stop detection线程调用，2Hz频率
-    
-    Request:
-        - Files: 'rgb' (JPEG)
-    
-    Returns JSON: {
-        'should_stop': bool,
-        'raw_response': str
-    }
-    """
-    global nav_state
-    
-    if nav_state['goal'] is None or nav_state['agent'] is None:
-        return jsonify({'error': 'Navigation not initialized. Call /navigation_reset first.'}), 400
-    
-    try:
-        # 加载RGB
-        rgb_file = request.files['rgb']
-        rgb_pil = Image.open(rgb_file.stream).convert('RGB')
-        rgb = np.asarray(rgb_pil)
-    except Exception as e:
-        return jsonify({'error': f'Failed to load image: {str(e)}'}), 400
-    
-    goal = nav_state['goal']
-    goal_desc = nav_state['goal_description']
-
-    goal_text = f"{goal}"
-    if goal_desc:
-        goal_text += f" ({goal_desc})"
-
-    prompt = f"""
-    You are a robot navigation stop classifier.
-
-    Goal: {goal_text}
-
-    Answer 'yes' ONLY when you are confident we should stop now.
-
-    There are two valid stop situations:
-
-    1) Direct stop (APPROACHABLE goal):
-    - The goal object is clearly visible (not tiny/far/ambiguous), AND
-    - It appears near (If you think you are less than 1 meter to it.)
-
-    2) Furniture stop (SURFACE goal, e.g., on a table/shelf/counter or inside cabinet):
-    - The goal object is clearly visible, AND
-    - You can see the supporting furniture (tabletop / shelf / counter / cabinet) indicating the robot cannot drive right up to the object, AND
-    - You look close enough to the furniture edge (near the table/counter), even if the goal is not centered.
-
-    If unsure, if the goal is far, answer 'no'.
-    Answer ONLY 'yes' or 'no'.
-    """
-    
-    try:
-        action_vlm = nav_state['agent'].actionVLM
-        
-        # call_chat接口: call_chat(history: int, images: list[np.array], text_prompt: str)
-        # history=0表示不使用历史对话
-        response = action_vlm.call_chat(
-            history=0,  # 不使用历史
-            images=[rgb],  # 单张图片的列表
-            text_prompt=prompt
-        )
-        
-        # 解析yes/no
-        response_lower = response.lower().strip()
-        # 判断逻辑：包含yes且不包含no（避免"no, not yet"这种情况）
-        should_stop = 'yes' in response_lower and 'no' not in response_lower
-        
-        print(f"[StopCheck] Goal: {goal}, VLM response: '{response}' -> should_stop={should_stop}")
-        
-        return jsonify({
-            'should_stop': should_stop,
-            'raw_response': response
-        })
-    
-    except Exception as e:
-        print(f"[StopCheck] VLM call failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'should_stop': False,
-            'error': str(e)
-        })
 
 
 @app.route('/health', methods=['GET'])

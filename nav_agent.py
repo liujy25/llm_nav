@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import math
 import time
+import json
+import os
 import numpy as np
 import cv2
 import ast
@@ -29,10 +31,15 @@ class NavAgent:
     def __init__(self, cfg=None):
         self.cfg = cfg or {}
 
+        # Load prompts from JSON file
+        prompts_path = os.path.join(os.path.dirname(__file__), 'prompts.json')
+        with open(prompts_path, 'r', encoding='utf-8') as f:
+            self.prompts = json.load(f)
+
         # defaults
         self.cfg.setdefault('num_theta', 40)
         self.cfg.setdefault('image_edge_threshold', 0.04)
-        self.cfg.setdefault('clip_dist', 2.0)
+        self.cfg.setdefault('clip_dist', 5.0)
         self.cfg.setdefault('turn_angle_deg', 30.0)  # Turn left/right angle in degrees
         
         # Navigability configuration (obstacle height range)
@@ -67,7 +74,7 @@ class NavAgent:
             self.obstacle_map = ObstacleMap(
                 min_height=self.cfg['obstacle_height_min'],
                 max_height=self.cfg['obstacle_height_max'],
-                agent_radius=0.3,
+                agent_radius=0.1,
                 area_thresh=0.3,
                 size=self.cfg['bev_map_size'],
                 pixels_per_meter=self.cfg['bev_pixels_per_meter'],
@@ -81,12 +88,9 @@ class NavAgent:
         self.reset()
 
     def _initialize_vlms(self):
-        system_instruction = (
-            "You are an embodied robotic assistant, with an RGB image sensor. You observe the image and instructions "
-            "given to you and output a textual response, which is converted into actions that physically move you "
-            "within the environment. You are only allowed to search for the goal object in the room you are in now. You cannot go to other rooms."
-            "You cannot move through doors. "
-        )
+        # Use system instruction from prompts.json
+        system_instruction = self.prompts['system_instruction']
+
         self.actionVLM = OpenAIVLM(
             model=self.cfg['vlm_model'],
             system_instruction=system_instruction,
@@ -98,63 +102,79 @@ class NavAgent:
     def _construct_prompt(self, num_actions: int, iter: int):
         """
         构建统一的prompt：利用BEV地图+RGB做决策
-        
+
         BEV地图已经提供了全局信息（探索区域、未探索区域、障碍物），
         不需要关键帧机制来维护长期记忆。每帧都能看到完整地图，直接做决策。
-        
+
         Parameters
         ----------
         num_actions : int
             当前可用的MOVE动作数量
         iter : int
             当前迭代编号
-            
+
         Returns
         -------
         str
             prompt文本
         """
-        
-        prompt = f"""--- Iteration {iter} ---
 
-You are provided with TWO images:
-1. RGB Image (First): Your current first-person view showing {num_actions} available MOVE waypoints (numbered 1..{num_actions})
-2. BEV Map (Second): Bird's-eye view showing explored areas (gray) and unexplored areas (green), with your current position marked
+        # Use prompt template from JSON (join array into string)
+        template_lines = self.prompts['iteration_prompt_template'].copy()
 
-Current observation: {num_actions} available MOVE waypoints shown (numbered 1..{num_actions}).
-Additionally, there are always two TURN actions:
-- Action -1: TURN LEFT by {self.turn_angle_deg:.0f} degrees in place
-- Action -2: TURN RIGHT by {self.turn_angle_deg:.0f} degrees in place
+        # Handle the case when no move waypoints are available
+        if num_actions == 0:
+            # Replace lines that mention waypoint counts
+            for i, line in enumerate(template_lines):
+                if "MOVE waypoints visible" in line:
+                    template_lines[i] = "RGB Image (First): No MOVE waypoints available (only TURN actions)"
+                elif line.strip().startswith("- MOVE:"):
+                    template_lines[i] = "- MOVE: None available"
 
-================================================================================
+        # Build recent actions summary
+        if len(self.action_history) > 0:
+            action_strs = []
+            for act in self.action_history[-5:]:  # Last 5 actions
+                if act == -1:
+                    action_strs.append(f"TURN LEFT ({self.turn_angle_deg}°)")
+                elif act == -2:
+                    action_strs.append(f"TURN RIGHT ({self.turn_angle_deg}°)")
+                else:
+                    action_strs.append(f"MOVE {act}")
 
-Please analyze the situation and answer the following questions. 
-In your response, you should: first, give your answer of all the questions, 
-then provide your final decision in this exact format: {{'action': <action_number>}}.
+            # Count consecutive turns in same direction
+            consecutive_left = 0
+            consecutive_right = 0
+            for act in reversed(self.action_history):
+                if act == -1:
+                    consecutive_left += 1
+                    if consecutive_right > 0:
+                        break
+                elif act == -2:
+                    consecutive_right += 1
+                    if consecutive_left > 0:
+                        break
+                else:
+                    break
 
-Question 1: Current Observation
-What do you see in the RGB image (first image) and BEV map (second image)?
-- RGB: Navigable areas (floor, corridors, open spaces), obstacles (walls, furniture, objects)
-- BEV: Explored vs unexplored regions, your current position and orientation
-- Potential target objects related to "{self.goal}"
-- Unexplored directions that might lead to the target
+            recent_actions_text = f"Recent actions: {' -> '.join(action_strs)}"
+            if consecutive_left > 0:
+                total_angle = consecutive_left * self.turn_angle_deg
+                recent_actions_text += f"\n(Turned left {total_angle}° total in last {consecutive_left} steps)"
+            elif consecutive_right > 0:
+                total_angle = consecutive_right * self.turn_angle_deg
+                recent_actions_text += f"\n(Turned right {total_angle}° total in last {consecutive_right} steps)"
+        else:
+            recent_actions_text = "Recent actions: None (first iteration)"
 
-Question 2: Strategic Reasoning
-Based on your observation and the BEV map:
-- Which areas are most promising for finding "{self.goal}"?
-- Should you explore new areas or search more carefully in explored regions?
-- Which direction offers the best balance between exploration and target search?
+        prompt = '\n'.join(template_lines).format(
+            iter=iter,
+            num_actions=num_actions if num_actions > 0 else 0,
+            turn_angle=self.turn_angle_deg,
+            goal=self.goal,
+            recent_actions=recent_actions_text
+        )
 
-Question 3: Action Selection
-Which action number achieves your goal best?
-Consider all available actions (1 to {num_actions}, -1, -2).
-
-Question 4: Action Justification
-Why did you choose this specific action?
-- How does it help you find "{self.goal}"?
-- What do you expect to discover or achieve?
-"""
-        
         return prompt
 
     def _encode_image_to_base64(self, image):
@@ -220,6 +240,10 @@ Why did you choose this specific action?
         
         # Initialize trajectory history for visualization
         self.trajectory_history = []  # List of (x, y) positions in odom frame
+
+        # Initialize action history for rotation strategy
+        self.action_history = []  # List of recent actions (integers: -2, -1, 1, 2, ...)
+        self.max_action_history = 5  # Keep last 5 actions
         
         # Build initial prompt with goal information if provided
         if goal:
@@ -234,14 +258,14 @@ Why did you choose this specific action?
         """
         Build comprehensive initial prompt with full task briefing.
         This is sent once during reset and stored in VLM's history.
-        
+
         Parameters
         ----------
         goal : str
             Navigation goal (e.g., "chair", "door")
         goal_description : str, optional
             Additional description about the goal location
-            
+
         Returns
         -------
         str
@@ -250,56 +274,15 @@ Why did you choose this specific action?
         description_text = ""
         if goal_description and goal_description.strip():
             description_text = f"\nADDITIONAL INFORMATION: {goal_description.strip()}\n"
-        
-        initial_prompt = f"""=== NAVIGATION TASK BRIEFING ===
 
-OBJECTIVE: Navigate to the nearest {goal.upper()} and get as close to it as possible.
+        # Use prompt template from JSON (join array into string)
+        template_lines = self.prompts['initial_prompt_template']
+        initial_prompt = '\n'.join(template_lines).format(
+            goal=goal.upper(),
+            turn_angle=self.turn_angle_deg,
+            description_text=description_text
+        )
 
-ROBOT CAPABILITIES:
-- You have an RGB camera for observation
-- Omnidirectional (omni-wheel) base with small turning radius
-- Can rotate in place efficiently
-
-NAVIGATION ACTIONS:
-There are two types of actions available to you:
-
-1. MOVE ACTIONS (numbered 1, 2, 3, ...):
-   - Numbered circles in the image show potential destination waypoints
-   - Each waypoint is labeled with a POSITIVE number (1, 2, 3, ...) in a circle with red border
-   - The number indicates which waypoint you would move to
-   - These waypoints represent safe, reachable positions in different directions
-   - Selecting a MOVE action will navigate the robot to that waypoint
-
-2. ROTATION ACTIONS (always available):
-   - Action -1: TURN LEFT by {self.turn_angle_deg:.0f}° in place (shown on left side of image)
-   - Action -2: TURN RIGHT by {self.turn_angle_deg:.0f}° in place (shown on right side of image)
-   - These actions rotate the robot without changing position
-{description_text}
-DECISION STRATEGY:
-1. Use prior knowledge about where items like {goal.upper()} are typically located in rooms
-2. PRIORITIZE forward movement (MOVE actions) over rotation when possible
-3. Use rotation actions (TURN LEFT/RIGHT) only when you need to adjust your viewing angle
-4. Choose safe directions considering the robot's body size
-5. To check a place (desk, open area, etc.), move NEAR it first, then turn to check (avoid direct collision)
-6. Don't stay in one place too long; move to next area after checking
-7. For far destinations, explore nearby first (use actions at image edges to reveal new areas)
-8. Avoid paths near walls or obstacles
-
-ROTATION USAGE GUIDELINES:
-- Prefer MOVE actions for exploration (they cover more ground)
-- Use TURN LEFT/RIGHT when:
-  * You need to look around at your current position
-  * You want to check behind or beside you
-  * You need to align with a target before moving forward
-- Avoid excessive rotation; make progress through movement
-
-CONSTRAINTS:
-- You CANNOT go through closed doors
-- You CANNOT go up or down stairs
-- Stay in the current room
-
-Remember these instructions throughout the navigation episode. I will show you observations with iteration IDs, and you should apply these rules consistently to make navigation decisions.
-"""
         return initial_prompt
     
     def get_history_summary(self):
@@ -519,7 +502,9 @@ Remember these instructions throughout the navigation episode. I will show you o
             )
 
             if r_i is not None and r_i > 0.5:  # Minimum distance threshold
-                self._update_voxel(r_i, theta_i, T_odom_base, clip_dist=clip_dist, clip_frac=0.66)
+                # Note: _update_voxel is deprecated when using ObstacleMap
+                # ObstacleMap.explored_area is updated automatically in update_map()
+                # self._update_voxel(r_i, theta_i, T_odom_base, clip_dist=clip_dist, clip_frac=0.66)
                 a_initial.append((r_i, theta_i))
 
         print(f"[_navigability_from_bev] Generated {len(a_initial)} waypoints")
@@ -562,10 +547,18 @@ Remember these instructions throughout the navigation episode. I will show you o
         map_size = self.obstacle_map.size
         last_valid_px = None
 
-        for px_x, px_y in line_pixels:
+        # Skip first few pixels near robot (robot itself may be detected as obstacle)
+        skip_pixels = 5  # Skip ~0.05m around robot
+
+        for i, (px_x, px_y) in enumerate(line_pixels):
             # Check bounds
             if not (0 <= px_x < map_size and 0 <= px_y < map_size):
                 break
+
+            # Skip pixels near robot position
+            if i < skip_pixels:
+                last_valid_px = (px_x, px_y)
+                continue
 
             # Check if navigable
             if not self.obstacle_map._navigable_map[px_y, px_x]:
@@ -697,23 +690,53 @@ Remember these instructions throughout the navigation episode. I will show you o
             unique.setdefault(theta, []).append(mag)
 
         arrowData = []
-        topdown_map = self.voxel_map.copy()
-        mask = np.all(self.explored_map == self.explored_color, axis=-1)
-        topdown_map[mask] = self.explored_color
+
+        # Use ObstacleMap's explored_area instead of voxel_map/explored_map
+        use_obstacle_map = self.obstacle_map is not None
 
         for theta, mags in unique.items():
             mag = min(mags)
             cart = [self.e_i_scaling * mag * np.cos(theta), self.e_i_scaling * mag * np.sin(theta), 0.0]
             global_coords = local_to_global_matrix(T_odom_base, cart)
-            grid_coords = self._global_to_grid(global_coords)
-            xg, yg = grid_coords
-            xg = np.clip(xg, 2, topdown_map.shape[1] - 3)
-            yg = np.clip(yg, 2, topdown_map.shape[0] - 3)
-            score = (
-                np.sum(np.all((topdown_map[yg-2:yg+2, xg] == self.explored_color), axis=-1)) +
-                np.sum(np.all(topdown_map[yg, xg-2:xg+2] == self.explored_color, axis=-1))
-            )
-            # 不再使用clip_frac，直接使用原始距离
+
+            # Calculate exploration score using ObstacleMap if available
+            if use_obstacle_map:
+                # Convert to ObstacleMap pixel coordinates
+                xy = global_coords[:2].reshape(1, 2)
+                px = self.obstacle_map._xy_to_px(xy)[0]
+                px_x, px_y = int(px[0]), int(px[1])
+
+                # Check if within bounds
+                if 0 <= px_x < self.obstacle_map.size and 0 <= px_y < self.obstacle_map.size:
+                    # Count explored pixels in surrounding area (similar to old logic)
+                    x_min = max(0, px_x - 2)
+                    x_max = min(self.obstacle_map.size, px_x + 3)
+                    y_min = max(0, px_y - 2)
+                    y_max = min(self.obstacle_map.size, px_y + 3)
+
+                    score = (
+                        np.sum(self.obstacle_map.explored_area[px_y, x_min:x_max]) +
+                        np.sum(self.obstacle_map.explored_area[y_min:y_max, px_x])
+                    )
+                else:
+                    score = 0  # Out of bounds = unexplored
+            else:
+                # Fallback to old voxel_map method if ObstacleMap is disabled
+                grid_coords = self._global_to_grid(global_coords)
+                xg, yg = grid_coords
+                xg = np.clip(xg, 2, self.voxel_map.shape[1] - 3)
+                yg = np.clip(yg, 2, self.voxel_map.shape[0] - 3)
+
+                topdown_map = self.voxel_map.copy()
+                mask = np.all(self.explored_map == self.explored_color, axis=-1)
+                topdown_map[mask] = self.explored_color
+
+                score = (
+                    np.sum(np.all((topdown_map[yg-2:yg+2, xg] == self.explored_color), axis=-1)) +
+                    np.sum(np.all(topdown_map[yg, xg-2:xg+2] == self.explored_color, axis=-1))
+                )
+
+            # score < 3 means frontier (unexplored area)
             arrowData.append([mag, theta, score < 3])
 
         arrowData.sort(key=lambda x: x[1])
@@ -758,6 +781,29 @@ Remember these instructions throughout the navigation episode. I will show you o
                         if theta_i not in thetas and min([abs(theta_i - t) for t in thetas]) > min_angle * explore_bias:
                             out.append((r_i, theta_i, e_i))
                             thetas.add(theta_i)
+            else:
+                # No frontier waypoints found, fallback to explored area waypoints
+                # This allows the robot to navigate even when surrounded by explored areas
+                print("[_action_proposer] No frontier waypoints, using explored area waypoints as fallback")
+                longest = max(filtered, key=lambda x: x[0])
+                longest_theta = longest[1]
+                smallest_theta = longest[1]
+                longest_ndx = filtered.index(longest)
+
+                out.append([longest[0], longest[1], longest[2]])
+                thetas.add(longest[1])
+
+                for i in range(longest_ndx + 1, len(filtered)):
+                    if filtered[i][1] - longest_theta > min_angle:
+                        out.append([filtered[i][0], filtered[i][1], filtered[i][2]])
+                        thetas.add(filtered[i][1])
+                        longest_theta = filtered[i][1]
+
+                for i in range(longest_ndx - 1, -1, -1):
+                    if smallest_theta - filtered[i][1] > min_angle:
+                        out.append([filtered[i][0], filtered[i][1], filtered[i][2]])
+                        thetas.add(filtered[i][1])
+                        smallest_theta = filtered[i][1]
 
         if len(out) == 0:
             longest = max(filtered, key=lambda x: x[0])
@@ -865,12 +911,12 @@ Remember these instructions throughout the navigation episode. I will show you o
 
             # 只画圆圈（不画箭头）
             text = str(action_name)
-            text_size = 2.4 * scale_factor
+            text_size = 1.8 * scale_factor  # Reduced font size to fit two digits
             text_thickness = max(1, math.ceil(3 * scale_factor))
             (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
 
             circle_center = waypoint_px
-            circle_radius = max(tw, th) // 2 + max(1, math.ceil(15 * scale_factor))
+            circle_radius = max(1, math.ceil(40 * scale_factor))  # Fixed radius for all circles
 
             if chosen_action is not None and action_name == chosen_action:
                 cv2.circle(rgb_image, circle_center, circle_radius, GREEN, -1)
@@ -889,14 +935,14 @@ Remember these instructions throughout the navigation episode. I will show you o
         # Add turn actions to projected dict (they are always available)
         projected[-1] = -1  # Turn left
         projected[-2] = -2  # Turn right
-        
+
         text = '-1'
-        text_size = 2.4 * scale_factor  # Same size as move actions
+        text_size = 1.8 * scale_factor  # Reduced font size to match movement actions
         text_thickness = max(1, math.ceil(3 * scale_factor))
         (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
 
         circle_center_left = (math.ceil(0.05 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
-        circle_radius = max(tw, th) // 2 + max(1, math.ceil(15 * scale_factor))
+        circle_radius = max(1, math.ceil(40 * scale_factor))  # Fixed radius, same as movement actions
 
         if chosen_action == -1:
             cv2.circle(rgb_image, circle_center_left, circle_radius, GREEN, -1)
@@ -907,24 +953,13 @@ Remember these instructions throughout the navigation episode. I will show you o
 
         text_position_left = (circle_center_left[0] - tw // 2, circle_center_left[1] + th // 2)
         cv2.putText(rgb_image, text, text_position_left, font, text_size, text_color, text_thickness)
-        
-        # 添加 "TURN LEFT" 标签（放在圆圈下方）
-        label_text = 'TURN LEFT'
-        label_size = 1.8 * scale_factor
-        label_thickness = max(1, math.ceil(3 * scale_factor))  # Thicker text
-        cv2.putText(
-            rgb_image, label_text,
-            (text_position_left[0] // 2, text_position_left[1] + math.ceil(80 * scale_factor)),
-            font, label_size, RED, label_thickness
-        )
 
         # ---------- 画右转按钮 (Action -2) ----------
         text = '-2'
         (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
 
-        # Move right button further from edge to avoid text overflow
         circle_center_right = (math.ceil(0.90 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
-        circle_radius = max(tw, th) // 2 + max(1, math.ceil(15 * scale_factor))
+        circle_radius = max(1, math.ceil(40 * scale_factor))  # Fixed radius, same as movement actions
 
         if chosen_action == -2:
             cv2.circle(rgb_image, circle_center_right, circle_radius, GREEN, -1)
@@ -935,19 +970,6 @@ Remember these instructions throughout the navigation episode. I will show you o
 
         text_position_right = (circle_center_right[0] - tw // 2, circle_center_right[1] + th // 2)
         cv2.putText(rgb_image, text, text_position_right, font, text_size, text_color, text_thickness)
-        
-        # 添加 "TURN RIGHT" 标签（放在圆圈下方，确保不超出边界）
-        label_text = 'TURN RIGHT'
-        label_size = 1.8 * scale_factor
-        label_thickness = max(1, math.ceil(3 * scale_factor))  # Thicker text
-        (label_w, label_h), _ = cv2.getTextSize(label_text, font, label_size, label_thickness)
-        # Right align with the circle, with some padding from right edge
-        label_x = min(circle_center_right[0] - label_w // 2, rgb_image.shape[1] - label_w - 5)
-        cv2.putText(
-            rgb_image, label_text,
-            (label_x, text_position_right[1] + math.ceil(80 * scale_factor)),
-            font, label_size, RED, label_thickness
-        )
 
         return projected
 
@@ -1041,6 +1063,67 @@ Remember these instructions throughout the navigation episode. I will show you o
                 text_y = robot_px_y + text_height // 2
                 cv2.putText(bev, text, (text_x, text_y),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
+
+                # 绘制朝向箭头（红色，指示 RGB 相机的视野方向）
+                arrow_length = 30  # 箭头长度（像素）
+                # 注意：ObstacleMap 的 Y 轴是翻转的（图像坐标系），所以 sin 要取负
+                arrow_end_x = int(robot_px_x + arrow_length * np.cos(robot_yaw))
+                arrow_end_y = int(robot_px_y - arrow_length * np.sin(robot_yaw))  # Y 轴翻转
+                # 红色箭头 (BGR: 0, 0, 255)
+                cv2.arrowedLine(bev, (robot_px_x, robot_px_y), (arrow_end_x, arrow_end_y),
+                               (0, 0, 255), 3, tipLength=0.3)
+
+                # 绘制 FOV 边界射线（两条红色射线）
+                if hasattr(self, 'fov'):
+                    fov_half = np.deg2rad(self.fov / 2)
+
+                    # 左边界射线
+                    left_angle = robot_yaw - fov_half
+                    # 右边界射线
+                    right_angle = robot_yaw + fov_half
+
+                    # 对每条边界射线进行 raycast,找到实际终点
+                    for boundary_angle in [left_angle, right_angle]:
+                        # Raycast 找到射线终点 (遇到障碍物/未探索区域/边界)
+                        max_ray_dist = 20.0  # 最大射线长度 (米)
+
+                        # 在 odom 坐标系中计算射线
+                        ray_end_x = current_pos[0] + max_ray_dist * np.cos(boundary_angle)
+                        ray_end_y = current_pos[1] + max_ray_dist * np.sin(boundary_angle)
+                        ray_end_px = self.obstacle_map._xy_to_px(np.array([[ray_end_x, ray_end_y]])) * scale_factor
+
+                        if len(ray_end_px) > 0:
+                            end_px_x = int(ray_end_px[0, 0])
+                            end_px_y = int(ray_end_px[0, 1])
+
+                            # 使用 Bresenham 算法获取射线上的所有像素
+                            line_pixels = self._bresenham_line(robot_px_x, robot_px_y, end_px_x, end_px_y)
+
+                            # 找到第一个障碍物或未探索区域
+                            actual_end_px = (end_px_x, end_px_y)  # 默认终点
+
+                            for px_x, px_y in line_pixels:
+                                # 转换回原始地图坐标 (缩小)
+                                orig_px_x = px_x // scale_factor
+                                orig_px_y = px_y // scale_factor
+
+                                # 检查边界
+                                if not (0 <= orig_px_x < self.obstacle_map.size and 0 <= orig_px_y < self.obstacle_map.size):
+                                    actual_end_px = (px_x, px_y)
+                                    break
+
+                                # 检查是否是障碍物
+                                if self.obstacle_map._obstacle_map[orig_px_y, orig_px_x]:
+                                    actual_end_px = (px_x, px_y)
+                                    break
+
+                                # 检查是否是未探索区域
+                                if not self.obstacle_map.explored_area[orig_px_y, orig_px_x]:
+                                    actual_end_px = (px_x, px_y)
+                                    break
+
+                            # 绘制射线 (红色,较细)
+                            cv2.line(bev, (robot_px_x, robot_px_y), actual_end_px, (0, 0, 255), 2)
         
         # 标注waypoints（带黑色轮廓和序号）
         if waypoints is not None and len(waypoints) > 0:
@@ -1077,9 +1160,29 @@ Remember these instructions throughout the navigation episode. I will show you o
         return bev
 
     def _nav(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
-        # Record current position to trajectory history
+        # Record current position to trajectory history (merge if close to last point)
         current_pos = obs['base_to_odom_matrix'][:3, 3]
-        self.trajectory_history.append((current_pos[0], current_pos[1]))
+        current_xy = (current_pos[0], current_pos[1])
+
+        # Merge trajectory points that are within 0.3m of each other
+        if len(self.trajectory_history) > 0:
+            last_pos = self.trajectory_history[-1]
+            distance = np.sqrt((current_xy[0] - last_pos[0])**2 + (current_xy[1] - last_pos[1])**2)
+
+            if distance <= 0.2:
+                # Merge: update last point to average position
+                avg_x = (last_pos[0] + current_xy[0]) / 2.0
+                avg_y = (last_pos[1] + current_xy[1]) / 2.0
+                self.trajectory_history[-1] = (avg_x, avg_y)
+                print(f'[NavAgent] Merged trajectory point (distance={distance:.3f}m): {last_pos} + {current_xy} -> ({avg_x:.3f}, {avg_y:.3f})')
+            else:
+                # Add new point
+                self.trajectory_history.append(current_xy)
+                print(f'[NavAgent] Added trajectory point {len(self.trajectory_history)}: {current_xy}')
+        else:
+            # First point
+            self.trajectory_history.append(current_xy)
+            print(f'[NavAgent] Added first trajectory point: {current_xy}')
 
         # Update ObstacleMap with current observation FIRST
         # This ensures we have the latest obstacle information for raycast
@@ -1102,16 +1205,20 @@ Remember these instructions throughout the navigation episode. I will show you o
         # Generate visualization without highlighting (for initial display)
         a_final_projected, rgb_vis = self._projection(a_final, obs)
 
-        # Generate BEV map with waypoints
+        # Generate BEV map with waypoints (only show waypoints that were successfully projected to RGB)
         if self.obstacle_map is not None:
-            bev_map = self._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=a_final)
+            # Filter out turn actions (-1, -2) and only keep movement waypoints (tuples)
+            projected_waypoints = [k for k in a_final_projected.keys() if isinstance(k, tuple)]
+            bev_map = self._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=projected_waypoints)
             images = [rgb_vis, bev_map]  # Send both RGB and BEV to VLM
         else:
             images = [rgb_vis]  # Only RGB if BEV is disabled
 
         # 构建统一的prompt（不再区分关键帧/非关键帧）
+        # Count only move waypoints (tuples), not turn actions (integers)
+        num_move_actions = len([k for k in a_final_projected.keys() if isinstance(k, tuple)])
         prompt = self._construct_prompt(
-            num_actions=len(a_final_projected),
+            num_actions=num_move_actions,
             iter=iter
         )
         
@@ -1120,17 +1227,29 @@ Remember these instructions throughout the navigation episode. I will show you o
 
         # Start timing for VLM inference
         t_vlm_start = time.time()
-        
+
         # 调用VLM（使用VLM自己的历史管理）
-        response = self.actionVLM.call_chat(
-            history=self.cfg['vlm_history'],
-            images=images,
-            text_prompt=prompt
-        )
-        
+        try:
+            response = self.actionVLM.call_chat(
+                history=self.cfg['vlm_history'],
+                images=images,
+                text_prompt=prompt
+            )
+            print(f'[NavAgent] VLM Response: {response}')
+        except Exception as e:
+            print(f'[NavAgent] ERROR: VLM call failed: {e}')
+            import traceback
+            traceback.print_exc()
+            # Return with error info but still save rgb_vis
+            return None, rgb_vis, None, {
+                'projection_time': float(projection_time),
+                'vlm_inference_time': 0.0,
+                'error': str(e)
+            }
+
         t_vlm_end = time.time()
         vlm_inference_time = t_vlm_end - t_vlm_start
-        
+
         print(f'[NavAgent] Timing - Projection: {projection_time:.3f}s, VLM inference: {vlm_inference_time:.3f}s')
         print(f'[NavAgent] Prompt length: {len(prompt)} chars')
         print(f'Response: {response}')
@@ -1139,14 +1258,19 @@ Remember these instructions throughout the navigation episode. I will show you o
         try:
             response_dict = self._eval_response(response)
             action_number = int(response_dict['action'])
-            
+
+            # Record action to history
+            self.action_history.append(action_number)
+            if len(self.action_history) > self.max_action_history:
+                self.action_history.pop(0)  # Keep only last N actions
+
             # Re-generate visualization with chosen action highlighted in GREEN
             _, rgb_vis_final = self._projection(
                 a_final,
                 obs,
                 chosen_action=action_number
             )
-            
+
             # Prepare timing information (include prompt for debugging)
             timing_info = {
                 'projection_time': float(projection_time),
@@ -1154,31 +1278,40 @@ Remember these instructions throughout the navigation episode. I will show you o
                 'prompt': prompt,
                 'is_keyframe': False  # No longer using keyframe mode
             }
-            
+
             # Handle rotation actions
             if action_number == -1:
                 # Turn left: return positive angle (counter-clockwise)
-                return response, rgb_vis_final, ('turn', self.turn_angle_deg), timing_info
+                return response, rgb_vis_final, ('turn', self.turn_angle_deg), timing_info, bev_map
             elif action_number == -2:
                 # Turn right: return negative angle (clockwise)
-                return response, rgb_vis_final, ('turn', -self.turn_angle_deg), timing_info
+                return response, rgb_vis_final, ('turn', -self.turn_angle_deg), timing_info, bev_map
             else:
                 # Forward movement action
                 action = rev.get(action_number)
-                return response, rgb_vis_final, action, timing_info
+                return response, rgb_vis_final, action, timing_info, bev_map
         except (IndexError, KeyError, TypeError, ValueError) as e:
-            print(f'Error parsing response {e}')
-            return None, None, None, {'projection_time': 0.0, 'vlm_inference_time': 0.0}
+            print(f'[NavAgent] ERROR: Failed to parse VLM response: {e}')
+            print(f'[NavAgent] Raw response: {response}')
+            print(f'[NavAgent] Available actions: {list(a_final_projected.keys())}')
+            # Return response and rgb_vis even if parsing failed
+            return response, rgb_vis, None, {
+                'projection_time': float(projection_time),
+                'vlm_inference_time': float(vlm_inference_time),
+                'error': f'Parse error: {str(e)}'
+            }, bev_map
 
     def _eval_response(self, response: str):
         """Converts the VLM response string into a dictionary, if possible"""
+        if response is None or not response:
+            return {}
         try:
             eval_resp = ast.literal_eval(response[response.rindex('{'):response.rindex('}') + 1])
             if isinstance(eval_resp, dict):
                 return eval_resp
             else:
                 raise ValueError
-        except (ValueError, SyntaxError):
+        except (ValueError, SyntaxError, AttributeError):
             return {}
 
 
