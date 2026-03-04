@@ -105,7 +105,7 @@ class OpenAIVLM(VLM):
     def call_chat(self, history: int, images: list[np.array], text_prompt: str):
         """
         Perform context-aware inference with the OpenAI model.
-        
+
         History structure:
         1. System instruction (if provided, always at the beginning)
         2. Initial prompt (if provided via reset(), contains full task briefing)
@@ -129,50 +129,62 @@ class OpenAIVLM(VLM):
         }]
         image_contents = self._image_contents_from_images(images)
         current_message = {"role": "user", "content": text_contents + image_contents}
-        
+
         # Construct full message list for API call
         messages = []
-        
+
         # 1. Add system instruction (if available)
         if self.system_instruction:
             messages.append({"role": "system", "content": self.system_instruction})
-        
+
         # 2. Add initial prompt as first user message (if available)
         if self.initial_prompt:
             messages.append({"role": "user", "content": self.initial_prompt})
             # Add a placeholder assistant acknowledgment if this is the first iteration
             if len(self.history) == 0:
                 messages.append({"role": "assistant", "content": "Understood. I will follow these instructions for navigation."})
-        
+
         # 3. Add recent conversation history (limited by history parameter)
         # Only keep the most recent N rounds of conversation
         if len(self.history) > 2 * history:
             self.history = self.history[-2 * history:]
         messages.extend(self.history)
-        
+
         # 4. Add current message
         messages.append(current_message)
-        
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                max_tokens=2048,
-                temperature=0.0,
+                max_tokens=32768,
+                temperature=0.7,
+                top_p=0.8,
+                presence_penalty=1.5,
+                extra_body={
+                    "top_k": 20,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
             )
-            
+
+            # Debug: Check if response content is None
+            content = response.choices[0].message.content
+            if content is None:
+                logging.warning(f"VLM returned None content. Response: {response}")
+                return ""
+
             # Save current interaction to history
             self.history.append(current_message)
             self.history.append({
-                "role": "assistant", 
-                "content": [{"type": "text", "text": response.choices[0].message.content}]
+                "role": "assistant",
+                "content": [{"type": "text", "text": content}]
             })
 
         except Exception as e:
             logging.error(f"OPENAI API ERROR: {e}")
             return "OPENAI API ERROR"
 
-        return response.choices[0].message.content
+        return content
 
     def call_chat_with_custom_history(self, custom_history: list, images: list[np.array], text_prompt: str):
         """
@@ -222,25 +234,37 @@ class OpenAIVLM(VLM):
         
         # 3. 添加自定义历史（关键：由NavAgent控制）
         messages.extend(custom_history)
-        
+
         # 4. 添加当前消息
         messages.append(current_message)
-        
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                max_tokens=2048,
-                temperature=0.0,
+                max_tokens=32768,
+                temperature=0.7,
+                top_p=0.8,
+                presence_penalty=1.5,
+                extra_body={
+                    "top_k": 20,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
             )
-            
+
+            # Debug: Check if response content is None
+            content = response.choices[0].message.content
+            if content is None:
+                logging.warning(f"VLM returned None content. Response: {response}")
+                return ""
+
             # 注意：不保存到self.history，因为Memory由NavAgent管理
-            
+
         except Exception as e:
             logging.error(f"OPENAI API ERROR: {e}")
             return "OPENAI API ERROR"
 
-        return response.choices[0].message.content
+        return content
 
 
     def rewind(self):
@@ -284,14 +308,28 @@ class OpenAIVLM(VLM):
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=messages
+                messages=messages,
+                max_tokens=32768,
+                temperature=0.7,
+                top_p=0.8,
+                presence_penalty=1.5,
+                extra_body={
+                    "top_k": 20,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
             )
+
+            # Debug: Check if response content is None
+            content = response.choices[0].message.content
+            if content is None:
+                logging.warning(f"VLM returned None content. Response: {response}")
+                return ""
 
         except Exception as e:
             logging.error(f"OPENAI API ERROR: {e}")
             return "OPENAI API ERROR"
 
-        return response.choices[0].message.content
+        return content
 
 
     def get_spend(self):

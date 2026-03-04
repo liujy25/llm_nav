@@ -124,7 +124,7 @@ def navigation_reset():
     
     # Build agent config
     agent_cfg = {
-        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3.5-27B-FP8/',
+        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3.5-9B/',
 
         'vlm_api_key': 'EMPTY',
         'vlm_base_url': 'http://10.15.89.71:32054/v1/',
