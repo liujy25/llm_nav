@@ -24,6 +24,7 @@ sys.path.append(script_dir)
 
 from nav_agent import NavAgent
 from detic_detector import DeticDetector
+from local_planning_pipeline import LocalPlanningPipeline
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'llm_nav_secret_key'
@@ -37,7 +38,8 @@ nav_state = {
     'goal_description': '',
     'iteration_count': 0,
     'log_dir': None,
-    'latest_state': None  # Store latest visualization state
+    'latest_state': None,  # Store latest visualization state
+    'pipeline': None
 }
 
 
@@ -142,6 +144,7 @@ def navigation_reset():
     # Initialize NavAgent (always recreate to ensure config is updated)
     nav_state['agent'] = NavAgent(cfg=agent_cfg)
     nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
+    nav_state['pipeline'] = LocalPlanningPipeline(agent=nav_state['agent'])
 
     # Initialize Detic detector for goal detection
     try:
@@ -342,63 +345,67 @@ def navigation_step():
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb.jpg'), bgr)
     
-    # LLM Navigation Step
-    print("[Server] Calling NavAgent for decision...")
-    response, rgb_vis, action, nav_timing, bev_map = nav_state['agent']._nav(
-        obs, nav_state['goal'], iteration, goal_description=nav_state['goal_description']
+    # New local planning pipeline: subgoal -> future video -> PI3 trajectory -> 2D path
+    print("[Server] Calling LocalPlanningPipeline...")
+    plan_result = nav_state['pipeline'].plan(
+        obs=obs,
+        goal=nav_state['goal'],
+        iteration=iteration,
+        goal_description=nav_state['goal_description']
     )
+    subgoal = plan_result['subgoal']
+    response = json.dumps(subgoal, ensure_ascii=False)
+    nav_timing = plan_result['timing']
+    nav_timing['vlm_inference_time'] = nav_timing.get('subgoal_time', 0.0)
+    nav_timing['projection_time'] = 0.0
+    bev_map = plan_result.get('bev_map', None)
+    path_2d = plan_result.get('path_2d', [])
 
-    print(f"[Server] NavAgent action: {action}")
+    # Save visualization and intermediate artifacts
+    cv2.imwrite(
+        os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg'),
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    )
+    with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_response.txt'), 'w', encoding='utf-8') as f:
+        f.write(response)
+    with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_subgoal.json'), 'w', encoding='utf-8') as f:
+        json.dump(subgoal, f, indent=2, ensure_ascii=False)
 
-    # Save visualization
-    if rgb_vis is not None:
-        cv2.imwrite(
-            os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg'),
-            cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
-        )
-    if response is not None:
-        with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_response.txt'), 'w') as f:
-            f.write(response)
-
-    # Save BEV map (the actual BEV map from obstacle_map, not the old explored_map)
     if bev_map is not None:
         cv2.imwrite(
             os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg'),
             cv2.cvtColor(bev_map, cv2.COLOR_RGB2BGR)
         )
-    
-    # Save prompt for debugging (if available in timing info)
-    if nav_timing.get('prompt'):
-        with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_prompt.txt'), 'w', encoding='utf-8') as f:
-            f.write(nav_timing['prompt'])
 
-    # Save voxel map for debugging (optional, deprecated)
-    # Note: voxel_map and explored_map are deprecated in favor of ObstacleMap
-    # Keeping this for backward compatibility, but it's no longer updated when using BEV
-    voxel_map = nav_state['agent'].voxel_map
-    if voxel_map is not None and voxel_map.sum() > 0:  # Only save if it has data
-        cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_voxel_map.jpg'), voxel_map)
-    
-    # Save timing information (will be updated at the end with total time and action type)
+    video_pred = plan_result.get('video_prediction')
+    if video_pred is not None:
+        np.save(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_future_video.npy'), video_pred.frames)
+    np.save(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_traj3d.npy'), plan_result['traj_3d'])
+    with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_path2d.json'), 'w', encoding='utf-8') as f:
+        json.dump(path_2d, f, indent=2)
+
     timing_data = {
         'iteration': iteration,
         'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
-        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0)),
+        'video_gen_time': float(nav_timing.get('video_gen_time', 0.0)),
+        'traj_decode_time': float(nav_timing.get('traj_decode_time', 0.0)),
+        'subgoal': subgoal,
+        'pipeline_status': plan_result.get('status', 'unknown'),
+        'pipeline_error': plan_result.get('error'),
     }
     timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
     with open(timing_path, 'w') as f:
         json.dump(timing_data, f, indent=2)
-    
+
     # Prepare visualization state for Socket.IO
     log_name = os.path.basename(nav_state['log_dir'])
-    
-    # Build history: show last 4 iterations as current cycle
+
     current_cycle = []
     for prev_iter in range(max(1, iteration - 3), iteration):
         hist_img_path = f'/logs/{log_name}/iter_{prev_iter:04d}_rgb_vis.jpg'
         hist_img_full_path = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_rgb_vis.jpg')
         if os.path.exists(hist_img_full_path):
-            # Try to read action_type from timing file
             action_type_str = None
             timing_file = os.path.join(nav_state['log_dir'], f'iter_{prev_iter:04d}_timing.json')
             if os.path.exists(timing_file):
@@ -408,150 +415,66 @@ def navigation_step():
                         action_type_str = timing_data_prev.get('action_type', None)
                 except:
                     pass
-            
+
             current_cycle.append({
                 'iteration': prev_iter,
                 'action': action_type_str,
                 'image_path': hist_img_path
             })
-    
+
     viz_state = {
         'iteration': iteration,
         'goal': nav_state['goal'],
         'goal_description': nav_state['goal_description'],
-        'action_type': None,
+        'action_type': 'path_follow',
         'images': {},
         'llm_response': response if response else '',
         'current_cycle': current_cycle,
         'historical_keyframes': []
     }
-    
-    # Add image paths
+
     if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb.jpg')):
         viz_state['images']['rgb'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb.jpg'
     if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg')):
         viz_state['images']['rgb_vis'] = f'/logs/{log_name}/iter_{iteration:04d}_rgb_vis.jpg'
     if os.path.exists(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg')):
         viz_state['images']['bev_map'] = f'/logs/{log_name}/iter_{iteration:04d}_bev_map.jpg'
-    
-    if action is None:
-        viz_state['action_type'] = 'none'
-        nav_state['latest_state'] = viz_state
-        socketio.emit('navigation_update', viz_state)
-        
-        # Calculate total server time
-        t_server_end = time.time()
-        total_server_time = t_server_end - t_server_start
-        
-        timing_info = {
-            'total_server_time': float(total_server_time),
-            'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
-            'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
-        }
-        
-        # Update timing file with total server time and action type
-        timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
-        if os.path.exists(timing_path):
-            with open(timing_path, 'r') as f:
-                timing_data = json.load(f)
-            timing_data['total_server_time'] = float(total_server_time)
-            timing_data['action_type'] = 'none'
-            # Keyframe info already saved above
-            with open(timing_path, 'w') as f:
-                json.dump(timing_data, f, indent=2)
-        
-        print(f"[Server] Timing - Total: {total_server_time:.3f}s, "
-              f"VLM Projection: {timing_info['vlm_projection_time']:.3f}s, "
-              f"VLM Inference: {timing_info['vlm_inference_time']:.3f}s")
-        
-        return jsonify({
-            'action_type': 'none',
-            'goal_pose': None,
-            'iteration': iteration,
-            'finished': False,
-            'timing': timing_info
-        })
-    
-    # Current base state
-    T_odom_base = obs['base_to_odom_matrix'].astype(np.float64)
-    x0 = float(T_odom_base[0, 3])
-    y0 = float(T_odom_base[1, 3])
-    z0 = float(T_odom_base[2, 3])
-    yaw0 = mat_to_yaw(T_odom_base)
-    
-    # Check action type: ('turn', angle) or (r, theta)
-    if isinstance(action, tuple) and len(action) == 2 and action[0] == 'turn':
-        # Rotation action: ('turn', angle_in_degrees)
-        angle_deg = float(action[1])
-        angle_rad = math.radians(angle_deg)
-        
-        if angle_deg > 0:
-            print(f"[Server] Action is TURN LEFT: {angle_deg:.1f} degrees")
-            action_type = 'turn_left'
-        else:
-            print(f"[Server] Action is TURN RIGHT: {abs(angle_deg):.1f} degrees")
-            action_type = 'turn_right'
-        
-        # Rotate at current position
-        yaw_goal = yaw0 + angle_rad
-        goal_pose = build_goal_pose(x0, y0, z0, yaw_goal)
-    
-    else:
-        # Forward movement action: (r, theta)
-        r, theta = float(action[0]), float(action[1])
-        print(f"[Server] Action is NAV STEP: r={r:.2f}, theta={theta:.2f}")
-        
-        dis = r
-        # Compute goal in odom frame
-        x_b = dis * math.cos(theta)
-        y_b = dis * math.sin(theta)
-        p_base = np.array([x_b, y_b, 0.0, 1.0], dtype=np.float64)
-        p_goal_odom = T_odom_base @ p_base
-        xg = float(p_goal_odom[0])
-        yg = float(p_goal_odom[1])
-        # Keep current orientation for forward movement (no rotation)
-        yawg = yaw0
-        
-        goal_pose = build_goal_pose(xg, yg, z0, yawg)
-        action_type = 'nav_step'
-    
-    # Update visualization state and emit to clients
-    viz_state['action_type'] = action_type
+
     nav_state['latest_state'] = viz_state
     socketio.emit('navigation_update', viz_state)
-    
-    # Calculate total server time
+
     t_server_end = time.time()
     total_server_time = t_server_end - t_server_start
-    
+
     timing_info = {
         'total_server_time': float(total_server_time),
         'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
-        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0)),
+        'video_gen_time': float(nav_timing.get('video_gen_time', 0.0)),
+        'traj_decode_time': float(nav_timing.get('traj_decode_time', 0.0)),
     }
-    
-    # Update timing file with total server time and action type
-    timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+
     if os.path.exists(timing_path):
         with open(timing_path, 'r') as f:
             timing_data = json.load(f)
         timing_data['total_server_time'] = float(total_server_time)
-        timing_data['action_type'] = action_type
-        # Keyframe info already saved above
+        timing_data['action_type'] = 'path_follow'
         with open(timing_path, 'w') as f:
             json.dump(timing_data, f, indent=2)
-    
-    print(f"[Server] Timing - Total: {total_server_time:.3f}s, "
-          f"VLM Projection: {timing_info['vlm_projection_time']:.3f}s, "
-          f"VLM Inference: {timing_info['vlm_inference_time']:.3f}s")
-    
-    # Return goal pose for nav2 NavigateToPose
+
+    goal_pose = None
+    if path_2d:
+        last_wp = path_2d[-1]
+        goal_pose = build_goal_pose(last_wp['x'], last_wp['y'], float(obs['base_to_odom_matrix'][2, 3]), last_wp['yaw'])
+
+    # Return path-follow command while keeping goal_pose for compatibility
     return jsonify({
-        'action_type': action_type,
-        'goal_pose': {
-            'frame_id': 'odom',
-            'pose': goal_pose
-        },
+        'action_type': 'path_follow',
+        'goal_pose': ({'frame_id': 'odom', 'pose': goal_pose} if goal_pose is not None else None),
+        'path_2d': path_2d,
+        'subgoal': subgoal,
+        'pipeline_status': plan_result.get('status', 'unknown'),
+        'pipeline_error': plan_result.get('error'),
         'iteration': iteration,
         'finished': False,
         'timing': timing_info
