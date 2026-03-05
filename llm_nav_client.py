@@ -615,6 +615,23 @@ class LLMNavClient(Node):
                         self.get_logger().error(f'Failed to execute turn right: {e}')
                     continue
                 
+                # Handle path-follow action (new pipeline)
+                if action_type == 'path_follow':
+                    path_2d = result.get('path_2d', [])
+                    if path_2d:
+                        self.get_logger().info(f'Executing PATH FOLLOW with {len(path_2d)} waypoints (sending terminal waypoint to Nav2)')
+                    else:
+                        self.get_logger().info('Executing PATH FOLLOW (empty path_2d, fallback to goal_pose)')
+                    try:
+                        self.navigate_to_pose(goal_pose_stamped)
+                        self.get_logger().info('Path-follow step completed.')
+                    except NavigationStoppedException:
+                        self.get_logger().info('Path-follow stopped by stop detection')
+                        break
+                    except Exception as e:
+                        self.get_logger().error(f'Failed to execute path-follow step: {e}')
+                    continue
+
                 # Handle normal navigation step
                 if action_type == 'nav_step':
                     self.get_logger().info(f'Executing NAV STEP to ({pose_dict["position"]["x"]:.2f}, '
