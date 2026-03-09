@@ -51,7 +51,6 @@ class PI3DecodeInput:
     intrinsic: np.ndarray
     extrinsic: np.ndarray
     base_to_odom: np.ndarray
-    subgoal: dict[str, Any]
 
 
 class VideoGenerator(Protocol):
@@ -181,7 +180,6 @@ class LocalPlanningPipeline:
                 intrinsic=obs['intrinsic'],
                 extrinsic=obs['extrinsic'],
                 base_to_odom=obs['base_to_odom_matrix'],
-                subgoal=subgoal,
             )
             traj_3d = self.pi3_decoder.decode(d_in)
             path_2d = compress_traj3d_to_2d(traj_3d)
@@ -198,6 +196,14 @@ class LocalPlanningPipeline:
             path_2d = self._fallback_path_from_pose(obs['base_to_odom_matrix'])
             t2 = t1
             t3 = t2
+
+        # Regenerate BEV map with trajectory visualization
+        if self.agent.obstacle_map is not None and len(traj_3d) > 0:
+            bev_map = self.agent._generate_bev_with_waypoints(
+                obs['base_to_odom_matrix'],
+                waypoints=[],
+                traj_3d=traj_3d
+            )
 
         return {
             'status': status,

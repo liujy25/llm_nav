@@ -25,6 +25,7 @@ sys.path.append(script_dir)
 from nav_agent import NavAgent
 from detic_detector import DeticDetector
 from local_planning_pipeline import LocalPlanningPipeline
+from pi3_decoder_impl import Pi3Decoder
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'llm_nav_secret_key'
@@ -39,7 +40,8 @@ nav_state = {
     'iteration_count': 0,
     'log_dir': None,
     'latest_state': None,  # Store latest visualization state
-    'pipeline': None
+    'pipeline': None,
+    'pi3_checkpoint': None
 }
 
 
@@ -144,7 +146,27 @@ def navigation_reset():
     # Initialize NavAgent (always recreate to ensure config is updated)
     nav_state['agent'] = NavAgent(cfg=agent_cfg)
     nav_state['agent'].reset(goal=goal, goal_description=goal_description or '')
-    nav_state['pipeline'] = LocalPlanningPipeline(agent=nav_state['agent'])
+
+    # Initialize PI3Decoder if checkpoint is provided
+    pi3_decoder = None
+    if nav_state['pi3_checkpoint'] is not None:
+        try:
+            print(f"[Server] Initializing Pi3Decoder with checkpoint: {nav_state['pi3_checkpoint']}")
+            pi3_decoder = Pi3Decoder(
+                checkpoint_path=nav_state['pi3_checkpoint'],
+                device='cuda',
+                dtype='bfloat16',
+                pos_type='rope100',
+                decoder_size='large'
+            )
+            print("[Server] Pi3Decoder initialized successfully")
+        except Exception as e:
+            print(f"[Server] WARNING: Failed to initialize Pi3Decoder: {e}")
+            import traceback
+            traceback.print_exc()
+            pi3_decoder = None
+
+    nav_state['pipeline'] = LocalPlanningPipeline(agent=nav_state['agent'], pi3_decoder=pi3_decoder)
 
     # Initialize Detic detector for goal detection
     try:
@@ -643,7 +665,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='LLM Navigation Flask Server')
     parser.add_argument('--port', type=int, default=1874, help='Server port')
     parser.add_argument('--host', type=str, default='10.19.126.158', help='Server host')
+    parser.add_argument('--pi3-checkpoint', type=str, default=None,
+                        help='Path to Pi3 checkpoint file (.pt or .safetensors)')
     args = parser.parse_args()
+
+    # Store Pi3 checkpoint path in global state
+    nav_state['pi3_checkpoint'] = args.pi3_checkpoint
     
     print("=" * 60)
     print("LLM Navigation Server (Flask + SocketIO)")

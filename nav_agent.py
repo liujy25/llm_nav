@@ -973,17 +973,19 @@ class NavAgent:
 
         return projected
 
-    def _generate_bev_with_waypoints(self, base_to_odom: np.ndarray, waypoints: list = None) -> np.ndarray:
+    def _generate_bev_with_waypoints(self, base_to_odom: np.ndarray, waypoints: list = None, traj_3d: np.ndarray = None) -> np.ndarray:
         """
         生成标注了waypoints的BEV地图（使用ObstacleMap）
-        
+
         Parameters
         ----------
         base_to_odom : np.ndarray
             机器人base到odom的变换矩阵 (4x4)
         waypoints : list, optional
             Waypoint列表，每个元素为(r, theta)元组，theta相对于机器人base坐标系
-            
+        traj_3d : np.ndarray, optional
+            3D轨迹点，shape (N, 3)，在odom坐标系中
+
         Returns
         -------
         np.ndarray
@@ -1153,7 +1155,37 @@ class NavAgent:
                         text_y = px_y + text_height // 2
                         cv2.putText(bev, text, (text_x, text_y),
                                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
-        
+
+        # 绘制3D轨迹（如果提供）
+        if traj_3d is not None and len(traj_3d) > 0:
+            # 转换轨迹点到像素坐标（放大后）
+            traj_xy = traj_3d[:, :2]  # 只取 x, y 坐标
+            traj_px = self.obstacle_map._xy_to_px(traj_xy) * scale_factor
+
+            # 绘制轨迹线（紫色粗线）
+            for i in range(len(traj_px) - 1):
+                pt1 = (int(traj_px[i, 0]), int(traj_px[i, 1]))
+                pt2 = (int(traj_px[i+1, 0]), int(traj_px[i+1, 1]))
+                # 检查点是否在图像范围内
+                if (0 <= pt1[0] < bev.shape[1] and 0 <= pt1[1] < bev.shape[0] and
+                    0 <= pt2[0] < bev.shape[1] and 0 <= pt2[1] < bev.shape[0]):
+                    # 紫色线 (BGR: 255, 0, 255)，粗线
+                    cv2.line(bev, pt1, pt2, (255, 0, 255), 4)
+
+            # 只标注起点和终点
+            if len(traj_px) > 0:
+                # 起点（绿色圆圈）
+                start_pt = (int(traj_px[0, 0]), int(traj_px[0, 1]))
+                if 0 <= start_pt[0] < bev.shape[1] and 0 <= start_pt[1] < bev.shape[0]:
+                    cv2.circle(bev, start_pt, 10, (0, 255, 0), -1)  # 绿色
+                    cv2.circle(bev, start_pt, 10, (0, 0, 0), 2)  # 黑色轮廓
+
+                # 终点（红色圆圈）
+                end_pt = (int(traj_px[-1, 0]), int(traj_px[-1, 1]))
+                if 0 <= end_pt[0] < bev.shape[1] and 0 <= end_pt[1] < bev.shape[0]:
+                    cv2.circle(bev, end_pt, 10, (0, 0, 255), -1)  # 红色
+                    cv2.circle(bev, end_pt, 10, (0, 0, 0), 2)  # 黑色轮廓
+
         # 转换BGR到RGB，确保VLM能正确解析颜色
         bev = cv2.cvtColor(bev, cv2.COLOR_BGR2RGB)
         
