@@ -146,9 +146,14 @@ class OpenAIVLM(VLM):
 
         # 3. Add recent conversation history (limited by history parameter)
         # Only keep the most recent N rounds of conversation
-        if len(self.history) > 2 * history:
-            self.history = self.history[-2 * history:]
-        messages.extend(self.history)
+        if history == 0:
+            # When history=0, don't include any conversation history
+            history_to_send = []
+        elif len(self.history) > 2 * history:
+            history_to_send = self.history[-2 * history:]
+        else:
+            history_to_send = self.history
+        messages.extend(history_to_send)
 
         # 4. Add current message
         messages.append(current_message)

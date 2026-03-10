@@ -124,18 +124,19 @@ def navigation_reset():
     
     # Build agent config
     agent_cfg = {
-        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3.5-9B/',
+        'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3.5-27B-GPTQ-Int4/',
 
         'vlm_api_key': 'EMPTY',
-        'vlm_base_url': 'http://10.15.89.71:32054/v1/',
+        'vlm_base_url': 'http://10.15.89.71:34134/v1/',
 
-        # Navigation parameters (match test_bev_integration.py)
+        # Navigation parameters
         'enable_bev_map': True,
         'bev_map_size': 400,
-        'bev_pixels_per_meter': 10,
+        'bev_pixels_per_meter': 20,
         'clip_dist': 4.0,
 
         # Increase timeout for complex vision requests
+        'vlm_history': 0,
         'vlm_timeout': 600,  # 120 seconds for vision + navigation requests
     }
     
@@ -273,31 +274,124 @@ def navigation_step():
                         bbox, depth, intrinsic, T_cam_odom, T_odom_base
                     )
 
-                    # Generate approach waypoint (0.5m before target)
+                    # Calculate distance and angle to target
                     distance = np.linalg.norm(target_pos_base[:2])
-                    angle = np.arctan2(target_pos_base[1], target_pos_base[0])
+                    angle_to_target = np.arctan2(target_pos_base[1], target_pos_base[0])
 
-                    # If very close (< 0.6m), we're done
-                    if distance < 0.6:
-                        finished = True
-                        approach_distance = distance
-                    else:
-                        finished = False
-                        approach_distance = max(0.5, distance - 0.5)  # Stop 0.5m before target
+                    print(f"[Server] Goal detected at distance {distance:.2f}m, angle {np.rad2deg(angle_to_target):.1f}°")
 
-                    # Calculate approach pose in odom frame
+                    # Calculate final pose: 0.8m from object, facing the object
+                    final_distance = 0.8
                     current_pos_odom = T_odom_base[:3, 3]
-                    approach_x = current_pos_odom[0] + approach_distance * np.cos(angle)
-                    approach_y = current_pos_odom[1] + approach_distance * np.sin(angle)
-                    approach_z = current_pos_odom[2]
-                    approach_yaw = angle
 
-                    # Build goal pose using standard function
-                    goal_pose = build_goal_pose(approach_x, approach_y, approach_z, approach_yaw)
+                    # Target position in odom frame
+                    target_pos_odom = current_pos_odom + T_odom_base[:3, :3] @ target_pos_base
 
-                    print(f"[Server] Goal detected at distance {distance:.2f}m, generating approach action (finished={finished})")
+                    # Calculate approach position (0.8m from target, along the line from robot to target)
+                    direction = target_pos_odom[:2] - current_pos_odom[:2]
+                    direction_norm = direction / np.linalg.norm(direction)
+                    approach_pos = target_pos_odom[:2] - direction_norm * final_distance
 
-                    # Return in same format as normal navigation
+                    # Calculate yaw to face the target
+                    approach_yaw = np.arctan2(target_pos_odom[1] - approach_pos[1],
+                                             target_pos_odom[0] - approach_pos[0])
+
+                    # Build goal pose
+                    goal_pose = build_goal_pose(
+                        float(approach_pos[0]),
+                        float(approach_pos[1]),
+                        float(current_pos_odom[2]),
+                        float(approach_yaw)
+                    )
+
+                    print(f"[Server] Final pose: position=({approach_pos[0]:.2f}, {approach_pos[1]:.2f}), "
+                          f"yaw={np.rad2deg(approach_yaw):.1f}°, distance to target={final_distance}m")
+
+                    # Save images for replay
+                    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb.jpg'), bgr)
+
+                    # Draw detection bbox on RGB for visualization
+                    rgb_vis = rgb.copy()
+                    x1, y1, x2, y2 = bbox
+                    cv2.rectangle(rgb_vis, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 3)
+                    cv2.putText(rgb_vis, f"{nav_state['goal']} {confidence:.2f}",
+                               (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.9, (0, 255, 0), 2)
+                    cv2.putText(rgb_vis, f"Distance: {distance:.2f}m",
+                               (int(x1), int(y2) + 25), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.7, (0, 255, 0), 2)
+                    cv2.imwrite(
+                        os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg'),
+                        cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
+                    )
+
+                    # Generate BEV map if available
+                    if nav_state['agent'].obstacle_map is not None:
+                        robot_pos = T_odom_base[:2, 3]
+                        bev_map = nav_state['agent'].obstacle_map.visualize(robot_pos=robot_pos, show_frontiers=False)
+                        cv2.imwrite(
+                            os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg'),
+                            cv2.cvtColor(bev_map, cv2.COLOR_RGB2BGR)
+                        )
+
+                        # Save colored BEV map
+                        colored_bev = nav_state['agent'].obstacle_map.visualize_colored_bev(robot_pos=robot_pos, waypoints=None)
+                        cv2.imwrite(
+                            os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_colored_bev.jpg'),
+                            cv2.cvtColor(colored_bev, cv2.COLOR_RGB2BGR)
+                        )
+
+                    # Save response text
+                    response_text = (
+                        f"[Detic Detection - GOAL FOUND]\n\n"
+                        f"Goal: {nav_state['goal']}\n"
+                        f"Confidence: {confidence:.3f}\n"
+                        f"Distance: {distance:.2f}m\n"
+                        f"Angle: {np.rad2deg(angle_to_target):.1f}°\n\n"
+                        f"Final approach pose:\n"
+                        f"  Position: ({approach_pos[0]:.2f}, {approach_pos[1]:.2f})\n"
+                        f"  Yaw: {np.rad2deg(approach_yaw):.1f}°\n"
+                        f"  Distance to target: {final_distance}m\n\n"
+                        f"Navigation finished successfully!"
+                    )
+                    with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_response.txt'), 'w') as f:
+                        f.write(response_text)
+
+                    # Save timing information
+                    timing_data = {
+                        'iteration': iteration,
+                        'action_type': 'nav_step',
+                        'detic_detection_time': float(t_detic_end - t_detic_start),
+                        'total_server_time': float(time.time() - t_server_start),
+                        'finished': True
+                    }
+                    timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+                    with open(timing_path, 'w') as f:
+                        json.dump(timing_data, f, indent=2)
+
+                    # Prepare visualization state for Socket.IO
+                    log_name = os.path.basename(nav_state['log_dir'])
+                    viz_state = {
+                        'iteration': iteration,
+                        'goal': nav_state['goal'],
+                        'goal_description': nav_state['goal_description'],
+                        'action_type': 'nav_step',
+                        'images': {
+                            'rgb': f'/logs/{log_name}/iter_{iteration:04d}_rgb.jpg',
+                            'rgb_vis': f'/logs/{log_name}/iter_{iteration:04d}_rgb_vis.jpg',
+                            'bev_map': f'/logs/{log_name}/iter_{iteration:04d}_bev_map.jpg'
+                        },
+                        'llm_response': response_text,
+                        'current_cycle': [],
+                        'historical_keyframes': []
+                    }
+                    nav_state['latest_state'] = viz_state
+                    socketio.emit('navigation_update', viz_state)
+
+                    print(f"[Server] Navigation finished! Goal '{nav_state['goal']}' found and approached.")
+
+                    # Return with finished=True to tell client to stop
                     return jsonify({
                         'action_type': 'nav_step',
                         'goal_pose': {
@@ -305,7 +399,7 @@ def navigation_step():
                             'pose': goal_pose
                         },
                         'iteration': iteration,
-                        'finished': finished,
+                        'finished': True,
                         'timing': {
                             'total_server_time': time.time() - t_server_start,
                             'vlm_projection_time': 0.0,
@@ -366,7 +460,16 @@ def navigation_step():
             os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg'),
             cv2.cvtColor(bev_map, cv2.COLOR_RGB2BGR)
         )
-    
+
+    # Save colored BEV map
+    if nav_state['agent'].obstacle_map is not None:
+        robot_pos = T_odom_base[:2, 3]
+        colored_bev = nav_state['agent'].obstacle_map.visualize_colored_bev(robot_pos=robot_pos, waypoints=None)
+        cv2.imwrite(
+            os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_colored_bev.jpg'),
+            cv2.cvtColor(colored_bev, cv2.COLOR_RGB2BGR)
+        )
+
     # Save prompt for debugging (if available in timing info)
     if nav_timing.get('prompt'):
         with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_prompt.txt'), 'w', encoding='utf-8') as f:

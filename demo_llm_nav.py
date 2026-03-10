@@ -670,7 +670,40 @@ def run(scene_data, output_dir=None, episode_id=None, goal_text=""):
                 result = nav_controller.request_navigation_step(rgb, depth)
 
                 action_type = result.get('action_type', 'none')
-                print(f'[Client] Server response: action={action_type}')
+                finished = result.get('finished', False)
+                print(f'[Client] Server response: action={action_type}, finished={finished}')
+
+                # Check if navigation is finished
+                if finished:
+                    print(f"\n[Client] Navigation finished! Goal found.")
+                    # Execute final action to reach the goal pose
+                    if action_type == 'nav_step' and result.get('goal_pose'):
+                        goal_pose = result['goal_pose']['pose']
+                        goal_x = goal_pose['position']['x']
+                        goal_y = goal_pose['position']['y']
+
+                        dx = goal_x - nav_controller.current_position[0]
+                        dy = goal_y - nav_controller.current_position[1]
+                        dist = math.sqrt(dx*dx + dy*dy)
+
+                        if dist > 1e-6:
+                            nav_controller.look_direction[0] = dx / dist
+                            nav_controller.look_direction[1] = dy / dist
+                            nav_controller.look_direction[2] = 0.0
+                            print(f'[Client] Final approach: distance={dist:.3f}m')
+
+                            # Execute final movement
+                            action = (dist, 0.0)
+                            nav_controller.execute_action(action, 0.04)
+                            print(f'[Client] Final action executed')
+
+                    # Wait for simulation to stabilize, then exit
+                    wait_frames = 20
+                    for _ in range(wait_frames):
+                        my_world.step(render=True)
+                        frame += 1
+
+                    break  # Exit navigation loop
 
                 # 3. UPDATE ORIENTATION: Point toward goal
                 if action_type == 'nav_step' and result.get('goal_pose'):

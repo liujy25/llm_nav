@@ -69,7 +69,13 @@ class ObstacleMap:
         # Frontier storage
         self._frontiers_px = np.array([])
         self.frontiers = np.array([])  # In odom coordinates
-        
+
+        # Colored BEV map (RGB + Height)
+        self.rgb_map = np.zeros((size, size, 3), dtype=np.uint8)  # RGB colors
+        self.height_map = np.full((size, size), -np.inf, dtype=np.float32)  # Heights (init to -inf)
+        self._colored_bev_min_height = 0.2  # Minimum valid height for colored BEV
+        self._colored_bev_max_height = 1.5  # Maximum valid height for colored BEV
+
         # Episode origin (will be set on first update)
         self._episode_origin = None
     
@@ -81,6 +87,10 @@ class ObstacleMap:
         self._frontiers_px = np.array([])
         self.frontiers = np.array([])
         self._episode_origin = None
+
+        # Reset colored BEV map
+        self.rgb_map.fill(0)
+        self.height_map.fill(-np.inf)
     
     def update_map(
         self,
@@ -89,7 +99,7 @@ class ObstacleMap:
         extrinsic: np.ndarray,
         base_to_odom: np.ndarray,
         min_depth: float = 0.5,
-        max_depth: float = 5.0,
+        max_depth: float = 10.0,
     ) -> None:
         """
         Update obstacle map and explored area from depth observation.
@@ -292,6 +302,116 @@ class ObstacleMap:
         self._update_frontiers()
 
         print(f"[ObstacleMap] Detected {len(self.frontiers)} frontiers")
+
+    def update_colored_bev(
+        self,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        intrinsic: np.ndarray,
+        extrinsic: np.ndarray,
+        base_to_odom: np.ndarray,
+        min_depth: float = 0.5,
+        max_depth: float = 10.0,
+    ) -> None:
+        """
+        Update colored BEV map from RGB-D observation.
+
+        Parameters
+        ----------
+        rgb : np.ndarray
+            RGB image, shape (H, W, 3)
+        depth : np.ndarray
+            Depth image in meters, shape (H, W)
+        intrinsic : np.ndarray
+            Camera intrinsic matrix (3x3)
+        extrinsic : np.ndarray
+            Camera extrinsic matrix (4x4), odom->cam
+        base_to_odom : np.ndarray
+            Base to odom transformation (4x4)
+        min_depth : float
+            Minimum valid depth (default: 0.1m to capture close walls)
+        max_depth : float
+            Maximum valid depth
+        """
+        if self._episode_origin is None:
+            print("[ObstacleMap] WARNING: Episode origin not set, skipping colored BEV update")
+            return
+
+        # 1. Generate point cloud with valid depth mask (use smaller min_depth for colored BEV)
+        mask = (depth > min_depth) & (depth < max_depth) & np.isfinite(depth)
+        fx = intrinsic[0, 0]
+        fy = intrinsic[1, 1]
+        cx = intrinsic[0, 2]
+        cy = intrinsic[1, 2]
+
+        # Get point cloud in camera optical frame
+        point_cloud_optical = get_point_cloud(depth, mask, fx, fy, cx, cy)
+
+        if len(point_cloud_optical) == 0:
+            print("[ObstacleMap] WARNING: No valid points for colored BEV update")
+            return
+
+        # 2. Sample RGB colors for each point
+        H, W = depth.shape
+        v_coords, u_coords = np.where(mask)
+        colors = rgb[v_coords, u_coords]  # Nx3 RGB values
+
+        # 3. Convert point cloud to camera_link frame
+        point_cloud_camera = np.zeros_like(point_cloud_optical)
+        point_cloud_camera[:, 0] = point_cloud_optical[:, 0]  # X (forward)
+        point_cloud_camera[:, 1] = point_cloud_optical[:, 1]  # Y (left)
+        point_cloud_camera[:, 2] = point_cloud_optical[:, 2]  # Z (up)
+
+        # 4. Transform to odom frame
+        T_cam_odom = extrinsic
+        T_odom_cam = np.linalg.inv(T_cam_odom)
+        point_cloud_odom = transform_points(T_odom_cam, point_cloud_camera)
+
+        # 5. Filter by height (only keep points in valid height range)
+        heights = point_cloud_odom[:, 2]
+        valid_height_mask = (heights >= self._colored_bev_min_height) & (heights <= self._colored_bev_max_height)
+
+        point_cloud_filtered = point_cloud_odom[valid_height_mask]
+        colors_filtered = colors[valid_height_mask]
+        heights_filtered = heights[valid_height_mask]
+
+        if len(point_cloud_filtered) == 0:
+            print("[ObstacleMap] No points in valid height range for colored BEV")
+            return
+
+        # 6. Project to 2D grid
+        pixel_coords = self._xy_to_px(point_cloud_filtered[:, :2])
+
+        # 7. Filter valid pixels (within map bounds)
+        valid_mask = (
+            (pixel_coords[:, 0] >= 0) & (pixel_coords[:, 0] < self.size) &
+            (pixel_coords[:, 1] >= 0) & (pixel_coords[:, 1] < self.size)
+        )
+
+        px_x = pixel_coords[valid_mask, 0]
+        px_y = pixel_coords[valid_mask, 1]
+        h = heights_filtered[valid_mask]
+        c = colors_filtered[valid_mask]
+
+        if len(px_x) == 0:
+            print("[ObstacleMap] No valid pixels for colored BEV update")
+            return
+
+        # 8. Vectorized update: only update if new height is higher
+        current_heights = self.height_map[px_y, px_x]
+        update_mask = h > current_heights
+
+        px_x_update = px_x[update_mask]
+        px_y_update = px_y[update_mask]
+        h_update = h[update_mask]
+        c_update = c[update_mask]
+
+        # Update maps
+        self.height_map[px_y_update, px_x_update] = h_update
+        self.rgb_map[px_y_update, px_x_update] = c_update
+
+        print(f"[ObstacleMap] Colored BEV: updated {len(px_x_update)} pixels (from {len(point_cloud_filtered)} valid points)")
+
     
     def _filter_explored_area(self, agent_pixel: np.ndarray) -> None:
         """Keep only the explored area connected to the agent."""
@@ -460,12 +580,12 @@ class ObstacleMap:
         """
         # Initialize with gray (unexplored area)
         vis_img = np.ones((self.size, self.size, 3), dtype=np.uint8) * 128
-        
+
         # Draw explored area in white
         vis_img[self.explored_area] = (255, 255, 255)
-        
-        # Draw obstacles in black
-        vis_img[self._obstacle_map] = (0, 0, 0)
+
+        # Draw inflated obstacles in black (non-navigable areas)
+        vis_img[~self._navigable_map] = (0, 0, 0)
         
         # Draw frontiers in blue (RGB format) - only if show_frontiers is True
         if show_frontiers:
@@ -489,5 +609,70 @@ class ObstacleMap:
         
         # 转换BGR到RGB，确保返回的图像颜色正确
         vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
-        
+
         return vis_img
+
+    def visualize_colored_bev(
+        self,
+        robot_pos: Optional[np.ndarray] = None,
+        waypoints: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Generate colored BEV visualization with waypoint annotations.
+
+        Parameters
+        ----------
+        robot_pos : np.ndarray, optional
+            Current robot position (x, y) in odom frame
+        waypoints : np.ndarray, optional
+            Waypoints to visualize, shape (N, 2) in odom frame
+
+        Returns
+        -------
+        np.ndarray
+            RGB visualization image (upscaled by 2x for better visibility)
+        """
+        # 1. Initialize with gray (unexplored area)
+        vis_img = np.ones((self.size, self.size, 3), dtype=np.uint8) * 128
+
+        # 2. Mark explored area as white
+        vis_img[self.explored_area] = (255, 255, 255)
+
+        # 3. Overlay RGB data where available
+        has_rgb_data = np.isfinite(self.height_map)
+        vis_img[has_rgb_data] = self.rgb_map[has_rgb_data]
+
+        # 4. Upscale the image for better visibility (same as regular BEV map)
+        scale_factor = 2
+        vis_img = cv2.resize(vis_img, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_NEAREST)
+
+        # Draw waypoints as colored circles (if provided)
+        if waypoints is not None and len(waypoints) > 0:
+            waypoint_pixels = self._xy_to_px(waypoints) * scale_factor  # Scale coordinates
+            for i, wp_px in enumerate(waypoint_pixels):
+                wp_px_int = tuple(wp_px.astype(int))
+                if 0 <= wp_px_int[0] < vis_img.shape[1] and 0 <= wp_px_int[1] < vis_img.shape[0]:
+                    # Draw waypoint number (scaled circle radius)
+                    cv2.circle(vis_img, wp_px_int, 16, (255, 255, 0), 4)  # Yellow circle (scaled)
+                    cv2.putText(
+                        vis_img,
+                        str(i + 1),
+                        (wp_px_int[0] - 10, wp_px_int[1] + 10),  # Scaled offset
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0,  # Scaled font size
+                        (255, 255, 255),
+                        2,  # Scaled thickness
+                        cv2.LINE_AA
+                    )
+
+        # Draw robot position (if provided)
+        if robot_pos is not None:
+            robot_px = self._xy_to_px(robot_pos.reshape(1, 2))[0] * scale_factor  # Scale coordinates
+            robot_px_int = tuple(robot_px.astype(int))
+            if 0 <= robot_px_int[0] < vis_img.shape[1] and 0 <= robot_px_int[1] < vis_img.shape[0]:
+                # Draw orange-red filled circle with black outline (scaled)
+                cv2.circle(vis_img, robot_px_int, 12, (255, 69, 0), -1)  # RGB: orange-red (scaled radius)
+                cv2.circle(vis_img, robot_px_int, 12, (0, 0, 0), 4)  # Black outline (scaled thickness)
+
+        return vis_img
+

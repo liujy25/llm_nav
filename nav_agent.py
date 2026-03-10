@@ -58,8 +58,8 @@ class NavAgent:
         
         # BEV map configuration
         self.cfg.setdefault('enable_bev_map', True)  # Enable BEV map visualization
-        self.cfg.setdefault('bev_map_size', 200)  # BEV map size (200x200 for 20m x 20m)
-        self.cfg.setdefault('bev_pixels_per_meter', 10)  # 10 pixels per meter
+        self.cfg.setdefault('bev_map_size', 2000)  # BEV map size (200x200 for 20m x 20m)
+        self.cfg.setdefault('bev_pixels_per_meter', 100)  # 10 pixels per meter
 
         self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
         self.clip_dist = self.cfg['clip_dist']
@@ -68,22 +68,19 @@ class NavAgent:
         # Initialize goal attributes (will be set properly in reset())
         self.goal = None
         self.goal_description = ''
-        
-        # Initialize ObstacleMap for BEV visualization
-        if self.cfg['enable_bev_map']:
-            self.obstacle_map = ObstacleMap(
-                min_height=self.cfg['obstacle_height_min'],
-                max_height=self.cfg['obstacle_height_max'],
-                agent_radius=0.1,
-                area_thresh=0.3,
-                size=self.cfg['bev_map_size'],
-                pixels_per_meter=self.cfg['bev_pixels_per_meter'],
-            )
-            self.bev_scale = self.cfg['bev_pixels_per_meter']
-        else:
-            self.obstacle_map = None
-            self.bev_scale = None
-        
+
+        # Initialize ObstacleMap (always create for navigation logic)
+        # enable_bev_map only controls whether to send BEV to VLM
+        self.obstacle_map = ObstacleMap(
+            min_height=self.cfg['obstacle_height_min'],
+            max_height=self.cfg['obstacle_height_max'],
+            agent_radius=0.3,
+            area_thresh=0.3,
+            size=self.cfg['bev_map_size'],
+            pixels_per_meter=self.cfg['bev_pixels_per_meter'],
+        )
+        self.bev_scale = self.cfg['bev_pixels_per_meter']
+
         self._initialize_vlms()
         self.reset()
 
@@ -99,7 +96,95 @@ class NavAgent:
             timeout=self.cfg['vlm_timeout']
         )
 
-    def _construct_prompt(self, num_actions: int, iter: int):
+    def _format_full_messages_as_text(self, current_prompt: str, num_images: int = 2):
+        """
+        Format the complete messages structure (as sent to VLM) into readable text.
+        Images are replaced with placeholders like [IMAGE: RGB], [IMAGE: BEV].
+
+        Parameters
+        ----------
+        current_prompt : str
+            The current iteration's text prompt
+        num_images : int
+            Number of images in current message (default: 2 for RGB + BEV)
+
+        Returns
+        -------
+        str
+            Formatted text representation of all messages
+        """
+        lines = []
+        lines.append("=" * 80)
+        lines.append("COMPLETE CONVERSATION CONTEXT")
+        lines.append("=" * 80)
+        lines.append("")
+
+        # 1. System instruction
+        if self.actionVLM.system_instruction:
+            lines.append("[SYSTEM INSTRUCTION]")
+            lines.append("-" * 80)
+            lines.append(self.actionVLM.system_instruction)
+            lines.append("")
+
+        # 2. Initial prompt
+        if self.actionVLM.initial_prompt:
+            lines.append("[INITIAL PROMPT - Task Briefing]")
+            lines.append("-" * 80)
+            lines.append(self.actionVLM.initial_prompt)
+            lines.append("")
+            lines.append("[ASSISTANT ACKNOWLEDGMENT]")
+            lines.append("-" * 80)
+            lines.append("Understood. I will follow these instructions for navigation.")
+            lines.append("")
+
+        # 3. Recent conversation history
+        # Apply the same history limit logic as in vlm.py
+        history_limit = self.cfg['vlm_history']
+
+        if history_limit == 0:
+            # When history=0, don't include any conversation history
+            history = []
+        elif len(self.actionVLM.history) > 2 * history_limit:
+            history = self.actionVLM.history[-2 * history_limit:]
+        else:
+            history = self.actionVLM.history
+
+        if len(history) > 0:
+            lines.append(f"[CONVERSATION HISTORY - Last {history_limit} rounds]")
+            lines.append("-" * 80)
+
+            for i, msg in enumerate(history):
+                role = msg['role'].upper()
+                lines.append(f"[{role}]")
+
+                if isinstance(msg['content'], str):
+                    lines.append(msg['content'])
+                elif isinstance(msg['content'], list):
+                    for item in msg['content']:
+                        if item['type'] == 'text':
+                            lines.append(item['text'])
+                        elif item['type'] == 'image_url':
+                            lines.append("[IMAGE]")
+
+                lines.append("")
+
+        # 4. Current message
+        lines.append("[CURRENT MESSAGE]")
+        lines.append("-" * 80)
+        lines.append(current_prompt)
+
+        # Add image placeholders
+        image_labels = ["[IMAGE: RGB]", "[IMAGE: BEV]"]
+        for i in range(num_images):
+            label = image_labels[i] if i < len(image_labels) else f"[IMAGE {i+1}]"
+            lines.append(label)
+
+        lines.append("")
+        lines.append("=" * 80)
+
+        return "\n".join(lines)
+
+    def _construct_prompt(self, num_actions: int, iter: int, num_turn_actions: int = 2, available_turns: list = None):
         """
         构建统一的prompt：利用BEV地图+RGB做决策
 
@@ -112,15 +197,24 @@ class NavAgent:
             当前可用的MOVE动作数量
         iter : int
             当前迭代编号
+        num_turn_actions : int
+            当前可用的TURN动作数量 (0, 1, or 2)
+        available_turns : list
+            可用的转向动作列表 (e.g., [-1], [-2], or [-1, -2])
 
         Returns
         -------
         str
             prompt文本
         """
+        if available_turns is None:
+            available_turns = [-1, -2]
 
-        # Use prompt template from JSON (join array into string)
-        template_lines = self.prompts['iteration_prompt_template'].copy()
+        # Use prompt template from JSON (choose based on enable_bev_map)
+        if self.cfg['enable_bev_map']:
+            template_lines = self.prompts['iteration_prompt_template'].copy()
+        else:
+            template_lines = self.prompts['iteration_prompt_template_no_bev'].copy()
 
         # Handle the case when no move waypoints are available
         if num_actions == 0:
@@ -167,12 +261,31 @@ class NavAgent:
         else:
             recent_actions_text = "Recent actions: None (first iteration)"
 
+        # Build turn actions text based on available turns
+        if num_turn_actions == 0:
+            turn_actions_text = "- TURN: None available"
+        elif num_turn_actions == 1:
+            if -1 in available_turns:
+                turn_actions_text = f"- TURN: -1 (left {self.turn_angle_deg}°) only"
+            else:
+                turn_actions_text = f"- TURN: -2 (right {self.turn_angle_deg}°) only"
+        else:  # num_turn_actions == 2
+            turn_actions_text = f"- TURN: -1 (left {self.turn_angle_deg}°) or -2 (right {self.turn_angle_deg}°)"
+
+        # Add current robot position information (trajectory point number)
+        if self.current_trajectory_index is not None:
+            current_position_text = f"Current robot position: Trajectory point {self.current_trajectory_index} (marked with red circle in BEV map)"
+        else:
+            current_position_text = "Current robot position: Starting position (no trajectory point yet)"
+
         prompt = '\n'.join(template_lines).format(
             iter=iter,
             num_actions=num_actions if num_actions > 0 else 0,
             turn_angle=self.turn_angle_deg,
             goal=self.goal,
-            recent_actions=recent_actions_text
+            recent_actions=recent_actions_text,
+            turn_actions=turn_actions_text,
+            current_position=current_position_text
         )
 
         return prompt
@@ -240,10 +353,12 @@ class NavAgent:
         
         # Initialize trajectory history for visualization
         self.trajectory_history = []  # List of (x, y) positions in odom frame
+        self.current_trajectory_index = None  # Index of current trajectory point (1-based, None if no trajectory yet)
 
         # Initialize action history for rotation strategy
         self.action_history = []  # List of recent actions (integers: -2, -1, 1, 2, ...)
         self.max_action_history = 5  # Keep last 5 actions
+        self.last_turn_direction = None  # Track last turn direction: -1 (left), -2 (right), or None
         
         # Build initial prompt with goal information if provided
         if goal:
@@ -275,8 +390,12 @@ class NavAgent:
         if goal_description and goal_description.strip():
             description_text = f"\nADDITIONAL INFORMATION: {goal_description.strip()}\n"
 
-        # Use prompt template from JSON (join array into string)
-        template_lines = self.prompts['initial_prompt_template']
+        # Use prompt template from JSON (choose based on enable_bev_map)
+        if self.cfg['enable_bev_map']:
+            template_lines = self.prompts['initial_prompt_template']
+        else:
+            template_lines = self.prompts['initial_prompt_template_no_bev']
+
         initial_prompt = '\n'.join(template_lines).format(
             goal=goal.upper(),
             turn_angle=self.turn_angle_deg,
@@ -406,6 +525,11 @@ class NavAgent:
         d = float(depth_image[v, u])
         if not np.isfinite(d) or d <= 1e-6:
             return None, None
+
+        # Check if depth is too small (obstacle very close)
+        # If depth < 0.5m, treat as obstacle and return 0
+        if d < 0.5:
+            return 0.0, theta_i
 
         cam_coords = unproject_2d(u, v, d, intrinsics)  # camera frame
         base_coords = local_to_global_matrix(np.linalg.inv(T_cam_base), cam_coords)  # cam->base
@@ -560,9 +684,15 @@ class NavAgent:
                 last_valid_px = (px_x, px_y)
                 continue
 
-            # Check if navigable
-            if not self.obstacle_map._navigable_map[px_y, px_x]:
-                # Hit obstacle, return distance to last valid point
+            # Check if navigable AND explored
+            # A region must be both navigable (based on robot radius) and explored
+            # to be considered reachable. Unexplored regions (gray in BEV) should not
+            # generate waypoints as we don't know if they're actually reachable.
+            is_navigable = self.obstacle_map._navigable_map[px_y, px_x]
+            is_explored = self.obstacle_map.explored_area[px_y, px_x]
+
+            if not (is_navigable and is_explored):
+                # Hit obstacle or unexplored area, return distance to last valid point
                 break
 
             last_valid_px = (px_x, px_y)
@@ -825,7 +955,25 @@ class NavAgent:
         out.sort(key=lambda x: x[1])
         return [(mag, theta) for mag, theta, _ in out]
 
-    def _projection(self, a_final: list, obs: dict, chosen_action: int = None):
+    def _projection(self, a_final: list, obs: dict, chosen_action: int = None, available_turns: list = None):
+        """
+        Project actions onto RGB image.
+
+        Parameters
+        ----------
+        a_final : list
+            List of (mag, theta) tuples for MOVE actions
+        obs : dict
+            Observation dictionary
+        chosen_action : int, optional
+            The chosen action to highlight
+        available_turns : list, optional
+            List of available turn actions (e.g., [-1], [-2], or [-1, -2])
+            If None, both turns are available
+        """
+        if available_turns is None:
+            available_turns = [-1, -2]
+
         rgb = obs['rgb'].copy()
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
@@ -840,6 +988,7 @@ class NavAgent:
             intrinsics=K,
             T_cam_base=T_cam_base,
             chosen_action=chosen_action,
+            available_turns=available_turns,
         )
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         return projected, rgb
@@ -859,7 +1008,19 @@ class NavAgent:
             return (u, v)
         return None
 
-    def _project_onto_image(self, a_final, rgb_image, intrinsics, T_cam_base, chosen_action=None):
+    def _project_onto_image(self, a_final, rgb_image, intrinsics, T_cam_base, chosen_action=None, available_turns=None):
+        """
+        Project actions onto RGB image.
+
+        Parameters
+        ----------
+        available_turns : list, optional
+            List of available turn actions (e.g., [-1], [-2], or [-1, -2])
+            If None, both turns are available
+        """
+        if available_turns is None:
+            available_turns = [-1, -2]
+
         scale_factor = rgb_image.shape[0] / 1080.0
         font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -931,45 +1092,51 @@ class NavAgent:
         if len(a_final) > 0:
             print(f"[DEBUG] _project_onto_image: {len(a_final)} actions from _action_proposer, {projected_count} projected, {skipped_count} skipped by _can_project")
 
-        # ---------- 画左转按钮 (Action -1) ----------
-        # Add turn actions to projected dict (they are always available)
-        projected[-1] = -1  # Turn left
-        projected[-2] = -2  # Turn right
+        # ---------- Add turn actions based on available_turns ----------
+        # Only add turn actions that are in available_turns list
+        for turn_action in available_turns:
+            projected[turn_action] = turn_action
 
-        text = '-1'
-        text_size = 1.8 * scale_factor  # Reduced font size to match movement actions
-        text_thickness = max(1, math.ceil(3 * scale_factor))
-        (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
+        # ---------- Draw turn buttons ----------
+        # Draw left turn button (Action -1) if available
+        if -1 in available_turns:
+            text = '-1'
+            text_size = 1.8 * scale_factor
+            text_thickness = max(1, math.ceil(3 * scale_factor))
+            (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
 
-        circle_center_left = (math.ceil(0.05 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
-        circle_radius = max(1, math.ceil(40 * scale_factor))  # Fixed radius, same as movement actions
+            circle_center_left = (math.ceil(0.05 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
+            circle_radius = max(1, math.ceil(40 * scale_factor))
 
-        if chosen_action == -1:
-            cv2.circle(rgb_image, circle_center_left, circle_radius, GREEN, -1)
-        else:
-            cv2.circle(rgb_image, circle_center_left, circle_radius, circle_color, -1)
+            if chosen_action == -1:
+                cv2.circle(rgb_image, circle_center_left, circle_radius, GREEN, -1)
+            else:
+                cv2.circle(rgb_image, circle_center_left, circle_radius, circle_color, -1)
 
-        cv2.circle(rgb_image, circle_center_left, circle_radius, RED, max(1, math.ceil(2 * scale_factor)))
+            cv2.circle(rgb_image, circle_center_left, circle_radius, RED, max(1, math.ceil(2 * scale_factor)))
 
-        text_position_left = (circle_center_left[0] - tw // 2, circle_center_left[1] + th // 2)
-        cv2.putText(rgb_image, text, text_position_left, font, text_size, text_color, text_thickness)
+            text_position_left = (circle_center_left[0] - tw // 2, circle_center_left[1] + th // 2)
+            cv2.putText(rgb_image, text, text_position_left, font, text_size, text_color, text_thickness)
 
-        # ---------- 画右转按钮 (Action -2) ----------
-        text = '-2'
-        (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
+        # Draw right turn button (Action -2) if available
+        if -2 in available_turns:
+            text = '-2'
+            text_size = 1.8 * scale_factor
+            text_thickness = max(1, math.ceil(3 * scale_factor))
+            (tw, th), _ = cv2.getTextSize(text, font, text_size, text_thickness)
 
-        circle_center_right = (math.ceil(0.90 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
-        circle_radius = max(1, math.ceil(40 * scale_factor))  # Fixed radius, same as movement actions
+            circle_center_right = (math.ceil(0.90 * rgb_image.shape[1]), math.ceil(rgb_image.shape[0] / 2))
+            circle_radius = max(1, math.ceil(40 * scale_factor))
 
-        if chosen_action == -2:
-            cv2.circle(rgb_image, circle_center_right, circle_radius, GREEN, -1)
-        else:
-            cv2.circle(rgb_image, circle_center_right, circle_radius, circle_color, -1)
+            if chosen_action == -2:
+                cv2.circle(rgb_image, circle_center_right, circle_radius, GREEN, -1)
+            else:
+                cv2.circle(rgb_image, circle_center_right, circle_radius, circle_color, -1)
 
-        cv2.circle(rgb_image, circle_center_right, circle_radius, RED, max(1, math.ceil(2 * scale_factor)))
+            cv2.circle(rgb_image, circle_center_right, circle_radius, RED, max(1, math.ceil(2 * scale_factor)))
 
-        text_position_right = (circle_center_right[0] - tw // 2, circle_center_right[1] + th // 2)
-        cv2.putText(rgb_image, text, text_position_right, font, text_size, text_color, text_thickness)
+            text_position_right = (circle_center_right[0] - tw // 2, circle_center_right[1] + th // 2)
+            cv2.putText(rgb_image, text, text_position_right, font, text_size, text_color, text_thickness)
 
         return projected
 
@@ -1013,59 +1180,12 @@ class NavAgent:
             robot_px_x, robot_px_y = int(robot_px[0, 0] * scale_factor), int(robot_px[0, 1] * scale_factor)
         else:
             robot_px_x, robot_px_y = None, None
-        
-        # 绘制历史轨迹（在放大后的地图上）
-        if len(self.trajectory_history) > 1:
-            # 转换所有历史位置到像素坐标（放大后）
-            trajectory_array = np.array(self.trajectory_history)
-            trajectory_px = self.obstacle_map._xy_to_px(trajectory_array) * scale_factor
-            
-            # 绘制轨迹线（黑色细线）
-            for i in range(len(trajectory_px) - 1):
-                pt1 = (int(trajectory_px[i, 0]), int(trajectory_px[i, 1]))
-                pt2 = (int(trajectory_px[i+1, 0]), int(trajectory_px[i+1, 1]))
-                # 检查点是否在图像范围内
-                if (0 <= pt1[0] < bev.shape[1] and 0 <= pt1[1] < bev.shape[0] and
-                    0 <= pt2[0] < bev.shape[1] and 0 <= pt2[1] < bev.shape[0]):
-                    cv2.line(bev, pt1, pt2, (0, 0, 0), 2)  # 黑色线，放大后用2像素
-            
-            # 绘制轨迹点（浅蓝色圆圈，带黑色轮廓和序号）
-            for i in range(len(trajectory_px)):
-                pt = (int(trajectory_px[i, 0]), int(trajectory_px[i, 1]))
-                if 0 <= pt[0] < bev.shape[1] and 0 <= pt[1] < bev.shape[0]:
-                    # 浅蓝色填充 (BGR: 230, 216, 173)，半径12能容纳两位数
-                    cv2.circle(bev, pt, 12, (230, 216, 173), -1)
-                    # 黑色轮廓
-                    cv2.circle(bev, pt, 12, (0, 0, 0), 2)
-                    # 在圆圈内添加黑色序号（居中）
-                    text = str(i + 1)
-                    font_scale = 0.5
-                    thickness = 2
-                    (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                    text_x = pt[0] - text_width // 2
-                    text_y = pt[1] + text_height // 2
-                    cv2.putText(bev, text, (text_x, text_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
-        
-        # 绘制机器人位置（浅蓝色圆圈，和轨迹点一样，显示序号）
+
+        # ========== 第一层：绘制箭头和FOV射线（在轨迹点下层） ==========
         if robot_px_x is not None and robot_px_y is not None:
             if 0 <= robot_px_x < bev.shape[1] and 0 <= robot_px_y < bev.shape[0]:
-                # 浅蓝色填充 (BGR: 230, 216, 173)，和轨迹点一样
-                cv2.circle(bev, (robot_px_x, robot_px_y), 12, (230, 216, 173), -1)
-                # 黑色轮廓
-                cv2.circle(bev, (robot_px_x, robot_px_y), 12, (0, 0, 0), 2)
-                # 在圆圈内添加黑色序号（当前位置是最后一个轨迹点）
-                text = str(len(self.trajectory_history))
-                font_scale = 0.5
-                thickness = 2
-                (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                text_x = robot_px_x - text_width // 2
-                text_y = robot_px_y + text_height // 2
-                cv2.putText(bev, text, (text_x, text_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
-
                 # 绘制朝向箭头（红色，指示 RGB 相机的视野方向）
-                arrow_length = 30  # 箭头长度（像素）
+                arrow_length = 60  # 箭头长度（像素），加长以更清晰显示朝向
                 # 注意：ObstacleMap 的 Y 轴是翻转的（图像坐标系），所以 sin 要取负
                 arrow_end_x = int(robot_px_x + arrow_length * np.cos(robot_yaw))
                 arrow_end_y = int(robot_px_y - arrow_length * np.sin(robot_yaw))  # Y 轴翻转
@@ -1124,9 +1244,52 @@ class NavAgent:
 
                             # 绘制射线 (红色,较细)
                             cv2.line(bev, (robot_px_x, robot_px_y), actual_end_px, (0, 0, 255), 2)
-        
-        # 标注waypoints（带黑色轮廓和序号）
+
+        # ========== 第二层：绘制历史轨迹（在箭头上层） ==========
+        if len(self.trajectory_history) > 1:
+            # 转换所有历史位置到像素坐标（放大后）
+            trajectory_array = np.array(self.trajectory_history)
+            trajectory_px = self.obstacle_map._xy_to_px(trajectory_array) * scale_factor
+
+            # 绘制轨迹点（浅蓝色圆圈用于历史点，红色圆圈用于当前点）
+            for i in range(len(trajectory_px)):
+                pt = (int(trajectory_px[i, 0]), int(trajectory_px[i, 1]))
+                if 0 <= pt[0] < bev.shape[1] and 0 <= pt[1] < bev.shape[0]:
+                    # 判断是否是当前位置
+                    is_current = (self.current_trajectory_index is not None and
+                                  i + 1 == self.current_trajectory_index)
+
+                    if is_current:
+                        # 当前位置：红色填充 (BGR: 0, 0, 255)
+                        cv2.circle(bev, pt, 12, (0, 0, 255), -1)
+                    else:
+                        # 历史位置：浅蓝色填充 (BGR: 230, 216, 173)
+                        cv2.circle(bev, pt, 12, (230, 216, 173), -1)
+
+                    # 黑色轮廓
+                    cv2.circle(bev, pt, 12, (0, 0, 0), 2)
+                    # 在圆圈内添加黑色序号（居中）
+                    text = str(i + 1)
+                    font_scale = 0.5
+                    thickness = 2
+                    (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                    text_x = pt[0] - text_width // 2
+                    text_y = pt[1] + text_height // 2
+                    cv2.putText(bev, text, (text_x, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
+
+        # ========== 第三层：标注waypoints（在轨迹点上层） ==========
         if waypoints is not None and len(waypoints) > 0:
+            # 收集所有轨迹点的像素坐标（用于避免遮挡）
+            trajectory_positions = []
+            if len(self.trajectory_history) > 0:
+                trajectory_array = np.array(self.trajectory_history)
+                trajectory_px_for_check = self.obstacle_map._xy_to_px(trajectory_array) * scale_factor
+                trajectory_positions = [(int(px[0]), int(px[1])) for px in trajectory_px_for_check]
+
+            # 收集已绘制的waypoint位置（用于避免waypoint之间相互遮挡）
+            drawn_waypoint_positions = []
+
             for i, (r, theta) in enumerate(waypoints, start=1):
                 # 计算waypoint在odom坐标系中的位置
                 absolute_theta = robot_yaw + theta
@@ -1137,20 +1300,93 @@ class NavAgent:
                 waypoint_px = self.obstacle_map._xy_to_px(np.array([[waypoint_x, waypoint_y]])) * scale_factor
                 if len(waypoint_px) > 0:
                     px_x, px_y = int(waypoint_px[0, 0]), int(waypoint_px[0, 1])
-                    
+
                     # 检查是否在图像范围内
                     if 0 <= px_x < bev.shape[1] and 0 <= px_y < bev.shape[0]:
+                        # 检查是否与轨迹点或其他waypoints太近，如果是则偏移位置
+                        circle_radius = 12
+                        min_distance = circle_radius * 2  # 两个圆圈的直径
+
+                        # 检查与轨迹点的距离
+                        too_close = False
+                        for traj_pos in trajectory_positions:
+                            dist = np.sqrt((px_x - traj_pos[0])**2 + (px_y - traj_pos[1])**2)
+                            if dist < min_distance:
+                                too_close = True
+                                break
+
+                        # 检查与已绘制waypoints的距离
+                        if not too_close:
+                            for wp_pos in drawn_waypoint_positions:
+                                dist = np.sqrt((px_x - wp_pos[0])**2 + (px_y - wp_pos[1])**2)
+                                if dist < min_distance:
+                                    too_close = True
+                                    break
+
+                        # 如果太近，寻找附近的空白位置
+                        final_px_x, final_px_y = px_x, px_y
+                        if too_close:
+                            # 在原位置周围搜索空白位置
+                            # 搜索半径从30到60像素，每次增加10像素
+                            # 每个半径上尝试8个方向
+                            found = False
+                            for search_radius in range(30, 70, 10):
+                                if found:
+                                    break
+                                for angle_idx in range(8):
+                                    angle = angle_idx * np.pi / 4  # 0, 45, 90, 135, 180, 225, 270, 315度
+                                    test_x = int(px_x + search_radius * np.cos(angle))
+                                    test_y = int(px_y + search_radius * np.sin(angle))
+
+                                    # 检查是否在图像范围内
+                                    if not (0 <= test_x < bev.shape[1] and 0 <= test_y < bev.shape[0]):
+                                        continue
+
+                                    # 检查是否在白色区域（可导航区域）
+                                    # 注意：bev现在是BGR格式
+                                    if not (bev[test_y, test_x, 0] > 200 and
+                                            bev[test_y, test_x, 1] > 200 and
+                                            bev[test_y, test_x, 2] > 200):
+                                        continue
+
+                                    # 检查与轨迹点的距离
+                                    valid = True
+                                    for traj_pos in trajectory_positions:
+                                        dist = np.sqrt((test_x - traj_pos[0])**2 + (test_y - traj_pos[1])**2)
+                                        if dist < min_distance:
+                                            valid = False
+                                            break
+
+                                    if not valid:
+                                        continue
+
+                                    # 检查与已绘制waypoints的距离
+                                    for wp_pos in drawn_waypoint_positions:
+                                        dist = np.sqrt((test_x - wp_pos[0])**2 + (test_y - wp_pos[1])**2)
+                                        if dist < min_distance:
+                                            valid = False
+                                            break
+
+                                    if valid:
+                                        final_px_x, final_px_y = test_x, test_y
+                                        found = True
+                                        print(f'[NavAgent] Waypoint {i} offset from ({px_x}, {px_y}) to ({final_px_x}, {final_px_y}) to avoid occlusion')
+                                        break
+
+                        # 记录这个waypoint的位置
+                        drawn_waypoint_positions.append((final_px_x, final_px_y))
+
                         # 浅绿色填充 (BGR: 144, 238, 144)，半径12能容纳两位数
-                        cv2.circle(bev, (px_x, px_y), 12, (144, 238, 144), -1)
+                        cv2.circle(bev, (final_px_x, final_px_y), 12, (144, 238, 144), -1)
                         # 黑色轮廓
-                        cv2.circle(bev, (px_x, px_y), 12, (0, 0, 0), 2)
+                        cv2.circle(bev, (final_px_x, final_px_y), 12, (0, 0, 0), 2)
                         # 在圆圈内添加黑色序号（居中）
                         text = str(i)
                         font_scale = 0.5
                         thickness = 2
                         (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                        text_x = px_x - text_width // 2
-                        text_y = px_y + text_height // 2
+                        text_x = final_px_x - text_width // 2
+                        text_y = final_px_y + text_height // 2
                         cv2.putText(bev, text, (text_x, text_y),
                                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
         
@@ -1160,29 +1396,34 @@ class NavAgent:
         return bev
 
     def _nav(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
-        # Record current position to trajectory history (merge if close to last point)
+        # Record current position to trajectory history
         current_pos = obs['base_to_odom_matrix'][:3, 3]
         current_xy = (current_pos[0], current_pos[1])
 
-        # Merge trajectory points that are within 0.3m of each other
-        if len(self.trajectory_history) > 0:
-            last_pos = self.trajectory_history[-1]
-            distance = np.sqrt((current_xy[0] - last_pos[0])**2 + (current_xy[1] - last_pos[1])**2)
+        # Check if current position overlaps with any existing trajectory point
+        merge_threshold = 0.2  # meters
+        merged_index = None
 
-            if distance <= 0.2:
-                # Merge: update last point to average position
-                avg_x = (last_pos[0] + current_xy[0]) / 2.0
-                avg_y = (last_pos[1] + current_xy[1]) / 2.0
-                self.trajectory_history[-1] = (avg_x, avg_y)
-                print(f'[NavAgent] Merged trajectory point (distance={distance:.3f}m): {last_pos} + {current_xy} -> ({avg_x:.3f}, {avg_y:.3f})')
-            else:
-                # Add new point
-                self.trajectory_history.append(current_xy)
-                print(f'[NavAgent] Added trajectory point {len(self.trajectory_history)}: {current_xy}')
+        if len(self.trajectory_history) > 0:
+            # Search all trajectory points for overlap
+            for i, hist_pos in enumerate(self.trajectory_history):
+                distance = np.sqrt((current_xy[0] - hist_pos[0])**2 + (current_xy[1] - hist_pos[1])**2)
+                if distance <= merge_threshold:
+                    # Found overlapping point
+                    merged_index = i + 1  # 1-based index
+                    # Align current position to this trajectory point
+                    current_xy = hist_pos
+                    print(f'[NavAgent] Current position overlaps with trajectory point {merged_index} (distance={distance:.3f}m)')
+                    break
+
+        if merged_index is not None:
+            # Overlapping with existing point, don't add new point
+            self.current_trajectory_index = merged_index
         else:
-            # First point
+            # No overlap, add new trajectory point
             self.trajectory_history.append(current_xy)
-            print(f'[NavAgent] Added first trajectory point: {current_xy}')
+            self.current_trajectory_index = len(self.trajectory_history)
+            print(f'[NavAgent] Added trajectory point {self.current_trajectory_index}: {current_xy}')
 
         # Update ObstacleMap with current observation FIRST
         # This ensures we have the latest obstacle information for raycast
@@ -1194,32 +1435,90 @@ class NavAgent:
                 base_to_odom=obs['base_to_odom_matrix']
             )
 
+            # Update colored BEV map with RGB projection
+            self.obstacle_map.update_colored_bev(
+                rgb=obs['rgb'],
+                depth=obs['depth'],
+                intrinsic=obs['intrinsic'],
+                extrinsic=obs['extrinsic'],
+                base_to_odom=obs['base_to_odom_matrix']
+            )
+
         # Compute navigability using BEV-based raycast (more accurate)
         # This uses the updated obstacle map to avoid waypoints behind obstacles
         a_initial = self._navigability_from_bev(obs)
         a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
+        # Filter turn actions based on last turn direction BEFORE projection
+        # Determine which turn actions are available
+        if self.last_turn_direction is not None:
+            # Only allow the same turn direction as last time
+            available_turns = [self.last_turn_direction]
+            print(f'[NavAgent] Restricting to same turn direction: {self.last_turn_direction} (last turn was {self.last_turn_direction})')
+        else:
+            # Both turn directions are available
+            available_turns = [-1, -2]
+
         # Start timing for projection (image annotation)
         t_projection_start = time.time()
-        
-        # Generate visualization without highlighting (for initial display)
-        a_final_projected, rgb_vis = self._projection(a_final, obs)
 
-        # Generate BEV map with waypoints (only show waypoints that were successfully projected to RGB)
-        if self.obstacle_map is not None:
-            # Filter out turn actions (-1, -2) and only keep movement waypoints (tuples)
-            projected_waypoints = [k for k in a_final_projected.keys() if isinstance(k, tuple)]
-            bev_map = self._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=projected_waypoints)
+        # Generate visualization without highlighting (for initial display)
+        a_final_projected, rgb_vis = self._projection(a_final, obs, available_turns=available_turns)
+
+        # Generate BEV map with waypoints (always generate for consistency)
+        projected_waypoints = [k for k in a_final_projected.keys() if isinstance(k, tuple)]
+        bev_map = self._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=projected_waypoints)
+
+        # Decide whether to send BEV to VLM based on enable_bev_map
+        if self.cfg['enable_bev_map']:
             images = [rgb_vis, bev_map]  # Send both RGB and BEV to VLM
         else:
-            images = [rgb_vis]  # Only RGB if BEV is disabled
+            images = [rgb_vis]  # Only send RGB to VLM (but BEV is still generated for navigation)
+
+        # Check if only one turn action is available (no MOVE actions)
+        # If so, skip VLM and return that turn action directly
+        num_move_actions = len([k for k in a_final_projected.keys() if isinstance(k, tuple)])
+        num_turn_actions = len([k for k in a_final_projected.keys() if k in [-1, -2]])
+
+        if num_move_actions == 0 and num_turn_actions == 1:
+            single_turn = list(a_final_projected.keys())[0]
+            print(f'[NavAgent] No MOVE actions, only one turn available: {single_turn}, skipping VLM call')
+
+            # Record action to history
+            self.action_history.append(single_turn)
+            if len(self.action_history) > self.max_action_history:
+                self.action_history.pop(0)
+
+            # Prepare timing info
+            t_projection_end = time.time()
+            projection_time = t_projection_end - t_projection_start
+
+            timing_info = {
+                'projection_time': float(projection_time),
+                'vlm_inference_time': 0.0,
+                'prompt': f'[SKIPPED VLM] No MOVE actions, only one turn available: {single_turn}',
+                'is_keyframe': False
+            }
+
+            # Handle turn action
+            if single_turn == -1:
+                self.last_turn_direction = -1
+                return f'[AUTO] Turn left (only option)', rgb_vis, ('turn', self.turn_angle_deg), timing_info, bev_map
+            else:  # single_turn == -2
+                self.last_turn_direction = -2
+                return f'[AUTO] Turn right (only option)', rgb_vis, ('turn', -self.turn_angle_deg), timing_info, bev_map
+
+        # Count available turn actions for prompt
+        available_turns = [k for k in a_final_projected.keys() if k in [-1, -2]]
 
         # 构建统一的prompt（不再区分关键帧/非关键帧）
         # Count only move waypoints (tuples), not turn actions (integers)
         num_move_actions = len([k for k in a_final_projected.keys() if isinstance(k, tuple)])
         prompt = self._construct_prompt(
             num_actions=num_move_actions,
-            iter=iter
+            iter=iter,
+            num_turn_actions=num_turn_actions,
+            available_turns=available_turns
         )
         
         t_projection_end = time.time()
@@ -1268,26 +1567,31 @@ class NavAgent:
             _, rgb_vis_final = self._projection(
                 a_final,
                 obs,
-                chosen_action=action_number
+                chosen_action=action_number,
+                available_turns=available_turns
             )
 
-            # Prepare timing information (include prompt for debugging)
+            # Prepare timing information (include full conversation context for debugging)
+            full_prompt = self._format_full_messages_as_text(prompt, num_images=len(images))
             timing_info = {
                 'projection_time': float(projection_time),
                 'vlm_inference_time': float(vlm_inference_time),
-                'prompt': prompt,
+                'prompt': full_prompt,
                 'is_keyframe': False  # No longer using keyframe mode
             }
 
             # Handle rotation actions
             if action_number == -1:
-                # Turn left: return positive angle (counter-clockwise)
+                # Turn left: update last turn direction
+                self.last_turn_direction = -1
                 return response, rgb_vis_final, ('turn', self.turn_angle_deg), timing_info, bev_map
             elif action_number == -2:
-                # Turn right: return negative angle (clockwise)
+                # Turn right: update last turn direction
+                self.last_turn_direction = -2
                 return response, rgb_vis_final, ('turn', -self.turn_angle_deg), timing_info, bev_map
             else:
-                # Forward movement action
+                # Forward movement action: reset last turn direction
+                self.last_turn_direction = None
                 action = rev.get(action_number)
                 return response, rgb_vis_final, action, timing_info, bev_map
         except (IndexError, KeyError, TypeError, ValueError) as e:
