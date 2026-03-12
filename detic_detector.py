@@ -103,8 +103,9 @@ class DeticDetector:
             rgb_image: RGB image as numpy array (H, W, 3)
 
         Returns:
-            List of (bbox, confidence) tuples for detected goal objects
+            List of (bbox, confidence, mask) tuples for detected goal objects
             bbox format: [x1, y1, x2, y2]
+            mask format: (H, W) bool array
         """
         if self.goal_name is None:
             raise ValueError("Goal not set. Call set_goal() first.")
@@ -120,77 +121,110 @@ class DeticDetector:
             return []
 
         instances = predictions["instances"].to(self.cpu_device)
+        if not instances.has("pred_masks"):
+            raise RuntimeError("Detic output does not contain pred_masks. Check MASK_ON/ROI_MASK_HEAD in config.")
 
         # Filter by confidence and goal class (class 0 since we have single-class vocabulary)
         boxes = instances.pred_boxes.tensor.numpy()
         scores = instances.scores.numpy()
         classes = instances.pred_classes.numpy()
+        masks = instances.pred_masks.numpy().astype(bool)
 
         # Filter detections
         detections = []
-        for box, score, cls in zip(boxes, scores, classes):
+        for box, score, cls, mask in zip(boxes, scores, classes, masks):
             if cls == 0 and score >= self.confidence_threshold:
                 # Filter out very small detections (likely noise)
                 width = box[2] - box[0]
                 height = box[3] - box[1]
                 if width >= 20 and height >= 20:
-                    detections.append((box, score))
+                    detections.append((box, score, mask))
 
         # Sort by confidence (highest first)
         detections.sort(key=lambda x: x[1], reverse=True)
 
         return detections
 
-    def get_3d_position(self, bbox, depth_image, intrinsic, T_cam_odom, T_odom_base):
+    def get_3d_position(self, mask, depth_image, intrinsic, T_cam_odom, T_odom_base):
         """
-        Calculate 3D position of detected object in base frame
+        Calculate 3D position of detected object in base frame using instance mask.
 
         Args:
-            bbox: Bounding box [x1, y1, x2, y2]
+            mask: Instance mask (H, W), bool
             depth_image: Depth image (H, W) in meters
             intrinsic: Camera intrinsic matrix (3, 3)
-            T_cam_odom: Camera to odom transform (4, 4)
-            T_odom_base: Odom to base transform (4, 4)
+            T_cam_odom: Odom to camera transform (4, 4)
+            T_odom_base: Base to odom transform (4, 4)
 
         Returns:
             3D position [x, y, z] in base frame
         """
-        x1, y1, x2, y2 = bbox.astype(int)
+        if mask is None:
+            raise ValueError("Mask is required for 3D localization")
 
-        # Extract depth values within bounding box
-        depth_roi = depth_image[y1:y2, x1:x2]
+        if mask.shape != depth_image.shape:
+            raise ValueError(f"Mask shape {mask.shape} does not match depth shape {depth_image.shape}")
 
-        # Filter invalid depths
-        valid_depths = depth_roi[(depth_roi > 0) & (depth_roi < 10.0) & np.isfinite(depth_roi)]
+        mask_bool = mask.astype(bool)
 
-        if len(valid_depths) == 0:
-            raise ValueError("No valid depth values in bounding box")
+        # Keep only valid depths inside object mask
+        valid_depth_mask = (depth_image > 0) & (depth_image < 10.0) & np.isfinite(depth_image)
+        object_valid_mask = mask_bool & valid_depth_mask
 
-        # Use median depth (robust to outliers)
-        depth = np.median(valid_depths)
+        if object_valid_mask.sum() == 0:
+            raise ValueError("No valid depth values in object mask")
 
-        # Calculate bbox center in image coordinates
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
+        valid_depths = depth_image[object_valid_mask]
 
-        # Unproject to 3D camera coordinates
+        # Keep near-surface points to reduce background leakage from imperfect masks.
+        z_ref = float(np.percentile(valid_depths, 30))
+        z_window = 0.25  # meters
+        near_surface_mask = object_valid_mask & (np.abs(depth_image - z_ref) <= z_window)
+        if near_surface_mask.sum() < 30:
+            near_surface_mask = object_valid_mask
+
+        ys, xs = np.where(near_surface_mask)
+        zs = depth_image[ys, xs].astype(np.float64)
+
+        print(
+            f"[DeticDetector] Mask valid pixels: {object_valid_mask.sum()}, "
+            f"near-surface pixels: {near_surface_mask.sum()}, z_ref(p30)={z_ref:.3f}m"
+        )
+        print(
+            f"[DeticDetector] Depth stats (mask): median={np.median(valid_depths):.3f}m, "
+            f"min={valid_depths.min():.3f}m, max={valid_depths.max():.3f}m"
+        )
+
+        # Unproject near-surface mask points to 3D camera coordinates and use median 3D point.
         fx = intrinsic[0, 0]
         fy = intrinsic[1, 1]
         cx_intrinsic = intrinsic[0, 2]
         cy_intrinsic = intrinsic[1, 2]
 
-        x_cam = (cx - cx_intrinsic) * depth / fx
-        y_cam = (cy - cy_intrinsic) * depth / fy
-        z_cam = depth
+        x_cam_pts = (xs.astype(np.float64) - cx_intrinsic) * zs / fx
+        y_cam_pts = (ys.astype(np.float64) - cy_intrinsic) * zs / fy
+        z_cam_pts = zs
+
+        x_cam = float(np.median(x_cam_pts))
+        y_cam = float(np.median(y_cam_pts))
+        z_cam = float(np.median(z_cam_pts))
+
+        print(f"[DeticDetector] Camera frame: x={x_cam:.3f}, y={y_cam:.3f}, z={z_cam:.3f}")
 
         # Point in camera frame (homogeneous coordinates)
         point_cam = np.array([x_cam, y_cam, z_cam, 1.0])
 
-        # Transform to odom frame
-        point_odom = T_cam_odom @ point_cam
+        # Transform to odom frame.
+        # T_cam_odom is odom->cam, so we need its inverse (cam->odom).
+        T_odom_cam = np.linalg.inv(T_cam_odom)
+        point_odom = T_odom_cam @ point_cam
+
+        print(f"[DeticDetector] Odom frame: x={point_odom[0]:.3f}, y={point_odom[1]:.3f}, z={point_odom[2]:.3f}")
 
         # Transform to base frame
         T_base_odom = np.linalg.inv(T_odom_base)
         point_base = T_base_odom @ point_odom
+
+        print(f"[DeticDetector] Base frame: x={point_base[0]:.3f}, y={point_base[1]:.3f}, z={point_base[2]:.3f}")
 
         return point_base[:3]

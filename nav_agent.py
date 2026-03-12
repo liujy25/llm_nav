@@ -60,6 +60,19 @@ class NavAgent:
         self.cfg.setdefault('enable_bev_map', True)  # Enable BEV map visualization
         self.cfg.setdefault('bev_map_size', 2000)  # BEV map size (200x200 for 20m x 20m)
         self.cfg.setdefault('bev_pixels_per_meter', 100)  # 10 pixels per meter
+        
+        # Frontier occlusion filter (simple 3x3 depth check)
+        self.cfg.setdefault('frontier_occlusion_filter', True)
+        self.cfg.setdefault('frontier_occlusion_margin', 0.15)  # meters
+        self.cfg.setdefault('frontier_projection_height', 0.1)  # meters above ground
+        
+        # Fallback: force backtracking after too many consecutive turns
+        self.cfg.setdefault('fallback_turn_threshold', 12)
+        self.cfg.setdefault('fallback_max_history_candidates', 8)
+        self.cfg.setdefault('fallback_min_history_distance', 0.8)  # meters
+        
+        # RGB waypoint arrow length (pixels at 1080p; scaled by image height)
+        self.cfg.setdefault('rgb_waypoint_arrow_length_px', 84)
 
         self.turn_angle_deg = float(self.cfg['turn_angle_deg'])
         self.clip_dist = self.cfg['clip_dist']
@@ -70,11 +83,11 @@ class NavAgent:
         self.goal_description = ''
 
         # Initialize ObstacleMap (always create for navigation logic)
-        # enable_bev_map only controls whether to send BEV to VLM
+        # This is a local map that gets updated each frame with current observation
         self.obstacle_map = ObstacleMap(
             min_height=self.cfg['obstacle_height_min'],
             max_height=self.cfg['obstacle_height_max'],
-            agent_radius=0.3,
+            agent_radius=0.18,
             area_thresh=0.3,
             size=self.cfg['bev_map_size'],
             pixels_per_meter=self.cfg['bev_pixels_per_meter'],
@@ -96,7 +109,12 @@ class NavAgent:
             timeout=self.cfg['vlm_timeout']
         )
 
-    def _format_full_messages_as_text(self, current_prompt: str, num_images: int = 2):
+    def _format_full_messages_as_text(
+        self,
+        current_prompt: str,
+        num_images: int = 2,
+        image_labels: list = None
+    ):
         """
         Format the complete messages structure (as sent to VLM) into readable text.
         Images are replaced with placeholders like [IMAGE: RGB], [IMAGE: BEV].
@@ -104,7 +122,7 @@ class NavAgent:
         Parameters
         ----------
         current_prompt : str
-            The current iteration's text prompt
+            The current iteration's complete text prompt (includes template + history + observation)
         num_images : int
             Number of images in current message (default: 2 for RGB + BEV)
 
@@ -132,49 +150,16 @@ class NavAgent:
             lines.append("-" * 80)
             lines.append(self.actionVLM.initial_prompt)
             lines.append("")
-            lines.append("[ASSISTANT ACKNOWLEDGMENT]")
-            lines.append("-" * 80)
-            lines.append("Understood. I will follow these instructions for navigation.")
-            lines.append("")
 
-        # 3. Recent conversation history
-        # Apply the same history limit logic as in vlm.py
-        history_limit = self.cfg['vlm_history']
-
-        if history_limit == 0:
-            # When history=0, don't include any conversation history
-            history = []
-        elif len(self.actionVLM.history) > 2 * history_limit:
-            history = self.actionVLM.history[-2 * history_limit:]
-        else:
-            history = self.actionVLM.history
-
-        if len(history) > 0:
-            lines.append(f"[CONVERSATION HISTORY - Last {history_limit} rounds]")
-            lines.append("-" * 80)
-
-            for i, msg in enumerate(history):
-                role = msg['role'].upper()
-                lines.append(f"[{role}]")
-
-                if isinstance(msg['content'], str):
-                    lines.append(msg['content'])
-                elif isinstance(msg['content'], list):
-                    for item in msg['content']:
-                        if item['type'] == 'text':
-                            lines.append(item['text'])
-                        elif item['type'] == 'image_url':
-                            lines.append("[IMAGE]")
-
-                lines.append("")
-
-        # 4. Current message
+        # 3. Current message (includes iteration template + history + current observation)
         lines.append("[CURRENT MESSAGE]")
         lines.append("-" * 80)
         lines.append(current_prompt)
 
         # Add image placeholders
-        image_labels = ["[IMAGE: RGB]", "[IMAGE: BEV]"]
+        lines.append("")
+        if image_labels is None:
+            image_labels = ["[IMAGE: RGB]", "[IMAGE: BEV]"]
         for i in range(num_images):
             label = image_labels[i] if i < len(image_labels) else f"[IMAGE {i+1}]"
             lines.append(label)
@@ -184,82 +169,42 @@ class NavAgent:
 
         return "\n".join(lines)
 
-    def _construct_prompt(self, num_actions: int, iter: int, num_turn_actions: int = 2, available_turns: list = None):
+    def _construct_current_observation(
+        self,
+        num_actions: int,
+        iter: int,
+        num_turn_actions: int = 2,
+        available_turns: list = None,
+        fallback_note: str = "",
+    ):
         """
-        构建统一的prompt：利用BEV地图+RGB做决策
-
-        BEV地图已经提供了全局信息（探索区域、未探索区域、障碍物），
-        不需要关键帧机制来维护长期记忆。每帧都能看到完整地图，直接做决策。
+        Construct current iteration observation (position, available actions).
+        This is specific to each iteration.
 
         Parameters
         ----------
         num_actions : int
-            当前可用的MOVE动作数量
+            Number of available MOVE actions
         iter : int
-            当前迭代编号
+            Current iteration number
         num_turn_actions : int
-            当前可用的TURN动作数量 (0, 1, or 2)
+            Number of available TURN actions (0, 1, or 2)
         available_turns : list
-            可用的转向动作列表 (e.g., [-1], [-2], or [-1, -2])
+            Available turn actions (e.g., [-1], [-2], or [-1, -2])
 
         Returns
         -------
         str
-            prompt文本
+            Current observation text
         """
         if available_turns is None:
             available_turns = [-1, -2]
 
-        # Use prompt template from JSON (choose based on enable_bev_map)
-        if self.cfg['enable_bev_map']:
-            template_lines = self.prompts['iteration_prompt_template'].copy()
+        # Add current robot position information
+        if self.current_trajectory_index is not None:
+            current_position_text = f"Current robot position: Trajectory point {self.current_trajectory_index} (marked with red circle in BEV map)"
         else:
-            template_lines = self.prompts['iteration_prompt_template_no_bev'].copy()
-
-        # Handle the case when no move waypoints are available
-        if num_actions == 0:
-            # Replace lines that mention waypoint counts
-            for i, line in enumerate(template_lines):
-                if "MOVE waypoints visible" in line:
-                    template_lines[i] = "RGB Image (First): No MOVE waypoints available (only TURN actions)"
-                elif line.strip().startswith("- MOVE:"):
-                    template_lines[i] = "- MOVE: None available"
-
-        # Build recent actions summary
-        if len(self.action_history) > 0:
-            action_strs = []
-            for act in self.action_history[-5:]:  # Last 5 actions
-                if act == -1:
-                    action_strs.append(f"TURN LEFT ({self.turn_angle_deg}°)")
-                elif act == -2:
-                    action_strs.append(f"TURN RIGHT ({self.turn_angle_deg}°)")
-                else:
-                    action_strs.append(f"MOVE {act}")
-
-            # Count consecutive turns in same direction
-            consecutive_left = 0
-            consecutive_right = 0
-            for act in reversed(self.action_history):
-                if act == -1:
-                    consecutive_left += 1
-                    if consecutive_right > 0:
-                        break
-                elif act == -2:
-                    consecutive_right += 1
-                    if consecutive_left > 0:
-                        break
-                else:
-                    break
-
-            recent_actions_text = f"Recent actions: {' -> '.join(action_strs)}"
-            if consecutive_left > 0:
-                total_angle = consecutive_left * self.turn_angle_deg
-                recent_actions_text += f"\n(Turned left {total_angle}° total in last {consecutive_left} steps)"
-            elif consecutive_right > 0:
-                total_angle = consecutive_right * self.turn_angle_deg
-                recent_actions_text += f"\n(Turned right {total_angle}° total in last {consecutive_right} steps)"
-        else:
-            recent_actions_text = "Recent actions: None (first iteration)"
+            current_position_text = "Current robot position: Starting position (no trajectory point yet)"
 
         # Build turn actions text based on available turns
         if num_turn_actions == 0:
@@ -269,26 +214,159 @@ class NavAgent:
                 turn_actions_text = f"- TURN: -1 (left {self.turn_angle_deg}°) only"
             else:
                 turn_actions_text = f"- TURN: -2 (right {self.turn_angle_deg}°) only"
-        else:  # num_turn_actions == 2
+        else:
             turn_actions_text = f"- TURN: -1 (left {self.turn_angle_deg}°) or -2 (right {self.turn_angle_deg}°)"
 
-        # Add current robot position information (trajectory point number)
-        if self.current_trajectory_index is not None:
-            current_position_text = f"Current robot position: Trajectory point {self.current_trajectory_index} (marked with red circle in BEV map)"
+        # Use prompt template from JSON
+        if self.cfg['enable_bev_map']:
+            template_lines = list(self.prompts['iteration_prompt_template'])
         else:
-            current_position_text = "Current robot position: Starting position (no trajectory point yet)"
+            template_lines = list(self.prompts['iteration_prompt_template_no_bev'])
+
+        if fallback_note:
+            inserted = False
+            for idx, line in enumerate(template_lines):
+                if "Respond exactly in this format" in line:
+                    template_lines.insert(idx, "")
+                    template_lines.insert(idx + 1, fallback_note)
+                    inserted = True
+                    break
+            if not inserted:
+                template_lines.append("")
+                template_lines.append(fallback_note)
 
         prompt = '\n'.join(template_lines).format(
             iter=iter,
             num_actions=num_actions if num_actions > 0 else 0,
-            turn_angle=self.turn_angle_deg,
-            goal=self.goal,
-            recent_actions=recent_actions_text,
             turn_actions=turn_actions_text,
             current_position=current_position_text
         )
 
         return prompt
+
+    def _build_custom_history_messages(self):
+        """
+        Build custom history messages in trajectory-point-based format.
+        Format: "At trajectory point X, turned Y" or "Moved from point X to point Y"
+
+        Returns
+        -------
+        list
+            List of message dicts for VLM
+        """
+        messages = []
+        history_limit = self.cfg['vlm_history']
+
+        # Get recent history (last N records)
+        recent_history = self.simplified_history[-history_limit:] if history_limit > 0 else []
+
+        for record in recent_history:
+            if record['action_type'] == 'turn':
+                # TURN action
+                direction = "right" if record['total_rotation'] > 0 else "left"
+                angle = abs(record['total_rotation'])
+
+                if record['iter_start'] == record['iter_end']:
+                    # Single turn
+                    iter_text = f"Iteration {record['iter_start']}:"
+                    action_text = f"At trajectory point {record['trajectory_point']}, turned {direction} {angle:.1f}°"
+                else:
+                    # Multiple turns merged
+                    iter_text = f"Iteration {record['iter_start']}-{record['iter_end']}:"
+                    action_text = f"At trajectory point {record['trajectory_point']}, turned {direction} {angle:.1f}° (net rotation after {record['turn_count']} turns)"
+
+                messages.append({"role": "user", "content": iter_text})
+                messages.append({"role": "assistant", "content": action_text})
+
+            elif record['action_type'] == 'move':
+                # MOVE action
+                if record['to_trajectory_point'] is not None:
+                    # MOVE completed (we know the destination point)
+                    iter_text = f"Iteration {record['iter_start']}:"
+                    action_text = f"Moved from trajectory point {record['from_trajectory_point']} to trajectory point {record['to_trajectory_point']}"
+
+                    messages.append({"role": "user", "content": iter_text})
+                    messages.append({"role": "assistant", "content": action_text})
+                # else: MOVE not yet completed, skip (shouldn't appear in history)
+
+        return messages
+
+    def _construct_prompt(
+        self,
+        num_actions: int,
+        iter: int,
+        num_turn_actions: int = 2,
+        available_turns: list = None,
+        fallback_note: str = "",
+    ):
+        """
+        Construct prompt using simplified structure (just returns current observation).
+        The full context (system + initial + template + history) is built elsewhere.
+
+        Parameters
+        ----------
+        num_actions : int
+            Number of available MOVE actions
+        iter : int
+            Current iteration number
+        num_turn_actions : int
+            Number of available TURN actions (0, 1, or 2)
+        available_turns : list
+            Available turn actions (e.g., [-1], [-2], or [-1, -2])
+
+        Returns
+        -------
+        str
+            Current observation prompt
+        """
+        return self._construct_current_observation(
+            num_actions,
+            iter,
+            num_turn_actions,
+            available_turns,
+            fallback_note=fallback_note,
+        )
+
+    def _construct_fallback_observation(self, iter: int, candidate_traj_ids: list):
+        """
+        Construct fallback prompt for BEV-only backtracking.
+        In fallback mode, the model must choose a historical trajectory point ID.
+        """
+        ids_sorted = sorted([int(x) for x in candidate_traj_ids])
+        ids_text = ", ".join(str(x) for x in ids_sorted)
+        current_position_text = (
+            f"Current robot position: Trajectory point {self.current_trajectory_index} (red circle in BEV map)"
+            if self.current_trajectory_index is not None
+            else "Current robot position: Starting position"
+        )
+
+        template_lines = self.prompts.get("iteration_prompt_template_fallback_bev")
+        if not template_lines:
+            template_lines = [
+                "--- Iteration {iter} (FALLBACK MODE) ---",
+                "",
+                "{current_position}",
+                "",
+                "Input for this round:",
+                "- Only one image is provided: BEV map.",
+                "- RGB image is NOT provided in fallback mode.",
+                "",
+                "Available actions:",
+                "- MOVE: choose exactly one trajectory point ID from [{candidate_ids}]",
+                "- TURN: None available",
+                "",
+                "Respond exactly in this format:",
+                "**BEV Observation:** {{Describe current position, obstacles, and why the selected trajectory point is appropriate.}}",
+                "**Action and Reason:** {{Chosen trajectory point ID and concise reason.}}",
+                "**Decision:** {{'action': <trajectory_point_id>}}",
+                "",
+            ]
+
+        return "\n".join(template_lines).format(
+            iter=iter,
+            current_position=current_position_text,
+            candidate_ids=ids_text
+        )
 
     def _encode_image_to_base64(self, image):
         """
@@ -353,13 +431,20 @@ class NavAgent:
         
         # Initialize trajectory history for visualization
         self.trajectory_history = []  # List of (x, y) positions in odom frame
+        self.trajectory_yaw_history = []  # List of yaw (radians) for each trajectory point
         self.current_trajectory_index = None  # Index of current trajectory point (1-based, None if no trajectory yet)
 
         # Initialize action history for rotation strategy
         self.action_history = []  # List of recent actions (integers: -2, -1, 1, 2, ...)
         self.max_action_history = 5  # Keep last 5 actions
         self.last_turn_direction = None  # Track last turn direction: -1 (left), -2 (right), or None
-        
+        self.consecutive_turn_count = 0  # Consecutive turn actions without a move
+        self.fallback_active = False
+
+        # Simplified history for VLM context (iter_id + obs + action)
+        self.simplified_history = []  # Format: [{"iter": 1, "action": -2}, ...]
+        self.iteration_counter = 0  # Track iteration number
+
         # Build initial prompt with goal information if provided
         if goal:
             initial_prompt = self._build_initial_prompt(goal, goal_description)
@@ -418,6 +503,107 @@ class NavAgent:
     def cal_fov(self, intrinsics: np.ndarray, W: int):
         fx = intrinsics[0, 0]
         return 2 * np.arctan(W / (2 * fx)) * 180 / np.pi
+
+    def _is_frontier_occluded_simple(
+        self,
+        frontier_xy_odom: np.ndarray,
+        depth_image: np.ndarray,
+        intrinsic: np.ndarray,
+        T_cam_odom: np.ndarray,
+    ) -> bool:
+        """
+        Simple occlusion check:
+        1) Project frontier 3D point to image
+        2) Compute mean depth in 3x3 window
+        3) If observed depth is significantly closer than projected depth,
+           treat the frontier as occluded.
+        """
+        z_frontier = float(self.cfg.get('frontier_projection_height', 0.1))
+        p_odom = np.array(
+            [float(frontier_xy_odom[0]), float(frontier_xy_odom[1]), z_frontier, 1.0],
+            dtype=np.float64
+        )
+
+        p_cam = T_cam_odom.astype(np.float64) @ p_odom
+        z_pred = float(p_cam[2])
+        if z_pred <= 1e-6:
+            # Behind camera / invalid projection depth -> don't filter by occlusion here
+            return False
+
+        uv = point_to_pixel(np.array([p_odom[:3]], dtype=np.float64), intrinsic, T_cam_odom)
+        if uv is None or len(uv) == 0:
+            return False
+
+        u = int(round(float(uv[0][0])))
+        v = int(round(float(uv[0][1])))
+
+        H, W = depth_image.shape
+        if not (0 <= u < W and 0 <= v < H):
+            return False
+
+        x0 = max(0, u - 1)
+        x1 = min(W, u + 2)
+        y0 = max(0, v - 1)
+        y1 = min(H, v + 2)
+        depth_patch = depth_image[y0:y1, x0:x1]
+
+        valid_mask = np.isfinite(depth_patch) & (depth_patch > 1e-3)
+        if not np.any(valid_mask):
+            return False
+
+        depth_mean = float(np.mean(depth_patch[valid_mask]))
+        margin = float(self.cfg.get('frontier_occlusion_margin', 0.15))
+        return (depth_mean + margin) < z_pred
+
+    def _build_fallback_history_candidates(self, obs: dict):
+        """
+        Build MOVE candidates from historical trajectory points for fallback mode.
+        Returns
+        -------
+        tuple[list, list]
+            (candidate_actions, trajectory_point_indices)
+            candidate_actions format: [(r, theta, normal_odom), ...]
+            trajectory_point_indices: [point_idx_1based, ...]
+        """
+        T_odom_base = obs['base_to_odom_matrix']
+        robot_xy = T_odom_base[:2, 3]
+        robot_yaw = float(np.arctan2(T_odom_base[1, 0], T_odom_base[0, 0]))
+
+        min_dist = float(self.cfg.get('fallback_min_history_distance', 0.8))
+        max_candidates = int(self.cfg.get('fallback_max_history_candidates', 8))
+
+        candidates = []
+        seen_xy = set()
+        for idx, hist_xy in enumerate(self.trajectory_history, start=1):
+            if self.current_trajectory_index is not None and idx == self.current_trajectory_index:
+                continue
+
+            key = (round(float(hist_xy[0]), 2), round(float(hist_xy[1]), 2))
+            if key in seen_xy:
+                continue
+            seen_xy.add(key)
+
+            dx = float(hist_xy[0] - robot_xy[0])
+            dy = float(hist_xy[1] - robot_xy[1])
+            r = float(np.hypot(dx, dy))
+            if r < min_dist:
+                continue
+
+            theta_odom = float(np.arctan2(dy, dx))
+            theta_base = float(np.arctan2(np.sin(theta_odom - robot_yaw), np.cos(theta_odom - robot_yaw)))
+            normal_odom = np.array([dx / r, dy / r], dtype=np.float64)
+            candidates.append((idx, r, theta_base, normal_odom))
+
+        if len(candidates) == 0:
+            return [], []
+
+        # Prefer farther historical points to break local spinning loops.
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates = candidates[:max_candidates]
+
+        actions = [(r, theta, normal) for _, r, theta, normal in candidates]
+        traj_ids = [idx for idx, _, _, _ in candidates]
+        return actions, traj_ids
 
     def _global_to_grid(self, position: np.ndarray):
         dx = position[0] - self.init_pos[0]
@@ -553,7 +739,7 @@ class NavAgent:
 
     def _navigability_from_bev(self, obs: dict, angle_range=None, clip_dist_override=None):
         """
-        Compute navigable directions using BEV obstacle map (more accurate).
+        Compute navigable directions using frontier detection from BEV obstacle map.
 
         Parameters
         ----------
@@ -561,15 +747,18 @@ class NavAgent:
             Observation dictionary
         angle_range : tuple, optional
             (theta_min, theta_max) to limit angle search range (in radians)
-            If None, use full 360 degrees
+            If None, use full 360 degrees (not used with frontier detection)
         clip_dist_override : float, optional
-            Override self.clip_dist for ray casting
+            Override self.clip_dist for distance filtering
             If None, use self.clip_dist
 
         Returns
         -------
         a_initial : list
-            List of (r, theta) tuples
+            List of (r, theta, normal) tuples where:
+            - r: distance from robot to frontier (meters)
+            - theta: angle from robot to frontier (radians, in base frame)
+            - normal: [nx, ny] unit normal in odom frame (for goal orientation)
         """
         if self.obstacle_map is None:
             # Fallback to RGB-based method if BEV map is disabled
@@ -580,7 +769,7 @@ class NavAgent:
         if self.init_pos is None:
             self.init_pos = T_odom_base[:3, 3].copy()
 
-        # Calculate FOV for _action_proposer (needed even for BEV-based method)
+        # Calculate FOV for _action_proposer (needed for filtering)
         if 'intrinsic' in obs and 'rgb' in obs:
             K = obs['intrinsic']
             rgb_image = obs['rgb']
@@ -589,122 +778,89 @@ class NavAgent:
             # Default FOV if not available
             self.fov = 90.0
 
-        # Get robot position in odom frame
-        robot_pos = T_odom_base[:3, 3]
+        # Get robot position and orientation in odom frame
+        robot_pos_odom = T_odom_base[:3, 3]
         robot_yaw = np.arctan2(T_odom_base[1, 0], T_odom_base[0, 0])
 
-        # Convert to pixel coordinates
-        robot_px = self.obstacle_map._xy_to_px(robot_pos[:2].reshape(1, 2))[0]
+        # Get frontiers from obstacle map
+        frontiers_odom = self.obstacle_map.frontiers  # Nx2 array
+        frontier_normals_px = self.obstacle_map._frontier_normals  # Nx2 array
 
-        # Determine angle range
-        clip_dist = clip_dist_override if clip_dist_override is not None else self.clip_dist
-
-        if angle_range is not None:
-            theta_min, theta_max = angle_range
-            all_thetas = np.linspace(theta_min, theta_max, int(self.cfg['num_theta']))
-        else:
-            # Use forward-facing FOV range (strictly within camera FOV)
-            sensor_range = np.deg2rad(self.fov / 2)
-            all_thetas = np.linspace(-sensor_range, sensor_range, int(self.cfg['num_theta']))
-
-        print(f"[_navigability_from_bev] FOV: {self.fov:.1f}°, sensor_range: {np.rad2deg(sensor_range):.1f}°")
-        print(f"[_navigability_from_bev] Angle range: [{np.rad2deg(all_thetas[0]):.1f}°, {np.rad2deg(all_thetas[-1]):.1f}°]")
+        print(f"[_navigability_from_bev] FOV: {self.fov:.1f}°")
         print(f"[_navigability_from_bev] Robot yaw: {np.rad2deg(robot_yaw):.1f}°")
+        print(f"[_navigability_from_bev] Detected {len(frontiers_odom)} frontiers")
 
+        if len(frontiers_odom) == 0:
+            print("[_navigability_from_bev] No frontiers detected")
+            return []
+
+        # Convert frontiers to (r, theta, normal) format
         a_initial = []
 
-        for theta_i in all_thetas:
-            # Compute absolute angle in odom frame
-            absolute_theta = robot_yaw + theta_i
+        filtered_too_close = 0
+        filtered_occluded = 0
+        use_occlusion_filter = bool(self.cfg.get('frontier_occlusion_filter', True))
+        depth_image = obs.get('depth', None)
+        intrinsic = obs.get('intrinsic', None)
+        T_cam_odom = obs.get('extrinsic', None)
 
-            # Raycast in BEV map
-            r_i = self._raycast_bev(
-                robot_px,
-                robot_pos[:2],
-                absolute_theta,
-                clip_dist
-            )
+        for i, (frontier_xy, normal_px) in enumerate(zip(frontiers_odom, frontier_normals_px), start=1):
+            # Compute relative position in odom frame
+            dx = frontier_xy[0] - robot_pos_odom[0]
+            dy = frontier_xy[1] - robot_pos_odom[1]
 
-            if r_i is not None and r_i > 0.5:  # Minimum distance threshold
-                # Note: _update_voxel is deprecated when using ObstacleMap
-                # ObstacleMap.explored_area is updated automatically in update_map()
-                # self._update_voxel(r_i, theta_i, T_odom_base, clip_dist=clip_dist, clip_frac=0.66)
-                a_initial.append((r_i, theta_i))
+            # Distance
+            r = np.sqrt(dx**2 + dy**2)
 
-        print(f"[_navigability_from_bev] Generated {len(a_initial)} waypoints")
+            # Skip if too close (to avoid collision)
+            if r < 0.5:
+                filtered_too_close += 1
+                print(f"[_navigability_from_bev] Frontier {i}: r={r:.2f}m - FILTERED (too close < 0.5m)")
+                continue
+
+            # Simple occlusion filter based on 3x3 depth mean
+            if use_occlusion_filter and depth_image is not None and intrinsic is not None and T_cam_odom is not None:
+                if self._is_frontier_occluded_simple(frontier_xy, depth_image, intrinsic, T_cam_odom):
+                    filtered_occluded += 1
+                    print(f"[_navigability_from_bev] Frontier {i}: r={r:.2f}m - FILTERED (occluded by depth)")
+                    continue
+
+            # Angle in odom frame
+            theta_odom = np.arctan2(dy, dx)
+
+            # Convert to base frame (relative to robot's current yaw)
+            theta_base = theta_odom - robot_yaw
+
+            # Normalize angle to [-pi, pi]
+            theta_base = np.arctan2(np.sin(theta_base), np.cos(theta_base))
+
+            # Convert normal from pixel space to odom space
+            # normal_px is [nx_px, ny_px] in BEV pixel coordinates
+            # In _px_to_xy: X stays same, Y is negated
+            # For pointing to unexplored: negate X
+            normal_odom = np.array([-normal_px[0], normal_px[1]])
+
+            # Normalize to unit vector
+            normal_norm = np.linalg.norm(normal_odom)
+            if normal_norm > 1e-6:
+                normal_odom = normal_odom / normal_norm
+            else:
+                # Fallback: use direction from robot to frontier
+                normal_odom = np.array([dx, dy]) / r
+
+            a_initial.append((r, theta_base, normal_odom))
+
+        if filtered_too_close > 0:
+            print(f"[_navigability_from_bev] Filtered: {filtered_too_close} too close")
+        if filtered_occluded > 0:
+            print(f"[_navigability_from_bev] Filtered: {filtered_occluded} occluded")
+
+        print(f"[_navigability_from_bev] Generated {len(a_initial)} waypoints from frontiers")
 
         return a_initial
 
-    def _raycast_bev(self, start_px, start_pos, angle, max_dist):
-        """
-        Raycast in BEV map to find maximum navigable distance.
-
-        Parameters
-        ----------
-        start_px : np.ndarray
-            Starting pixel position [px_x, px_y]
-        start_pos : np.ndarray
-            Starting position in odom frame [x, y]
-        angle : float
-            Ray direction in odom frame (radians)
-        max_dist : float
-            Maximum ray distance (meters)
-
-        Returns
-        -------
-        float or None
-            Maximum navigable distance, or None if no valid distance found
-        """
-        # Calculate end position
-        end_x = start_pos[0] + max_dist * np.cos(angle)
-        end_y = start_pos[1] + max_dist * np.sin(angle)
-        end_px = self.obstacle_map._xy_to_px(np.array([[end_x, end_y]]))[0]
-
-        # Bresenham line algorithm to get all pixels along the ray
-        x0, y0 = int(start_px[0]), int(start_px[1])
-        x1, y1 = int(end_px[0]), int(end_px[1])
-
-        # Get line pixels
-        line_pixels = self._bresenham_line(x0, y0, x1, y1)
-
-        # Find first obstacle
-        map_size = self.obstacle_map.size
-        last_valid_px = None
-
-        # Skip first few pixels near robot (robot itself may be detected as obstacle)
-        skip_pixels = 5  # Skip ~0.05m around robot
-
-        for i, (px_x, px_y) in enumerate(line_pixels):
-            # Check bounds
-            if not (0 <= px_x < map_size and 0 <= px_y < map_size):
-                break
-
-            # Skip pixels near robot position
-            if i < skip_pixels:
-                last_valid_px = (px_x, px_y)
-                continue
-
-            # Check if navigable AND explored
-            # A region must be both navigable (based on robot radius) and explored
-            # to be considered reachable. Unexplored regions (gray in BEV) should not
-            # generate waypoints as we don't know if they're actually reachable.
-            is_navigable = self.obstacle_map._navigable_map[px_y, px_x]
-            is_explored = self.obstacle_map.explored_area[px_y, px_x]
-
-            if not (is_navigable and is_explored):
-                # Hit obstacle or unexplored area, return distance to last valid point
-                break
-
-            last_valid_px = (px_x, px_y)
-
-        if last_valid_px is None:
-            return None
-
-        # Convert back to world coordinates and compute distance
-        last_valid_pos = self.obstacle_map._px_to_xy(np.array([last_valid_px]))[0]
-        distance = np.linalg.norm(last_valid_pos - start_pos)
-
-        return distance
+    # _raycast_bev() method removed - replaced by frontier detection
+    # The new frontier-based approach provides more stable and accurate waypoints
 
     def _bresenham_line(self, x0, y0, x1, y1):
         """
@@ -816,8 +972,17 @@ class NavAgent:
 
         explore = explore_bias > 0
         unique = {}
-        for mag, theta in a_initial:
-            unique.setdefault(theta, []).append(mag)
+        normals = {}  # Store normals for each theta
+
+        # Handle both (mag, theta) and (mag, theta, normal) formats
+        for item in a_initial:
+            if len(item) == 3:
+                mag, theta, normal = item
+                unique.setdefault(theta, []).append(mag)
+                normals[theta] = normal  # Store normal for this theta
+            else:
+                mag, theta = item
+                unique.setdefault(theta, []).append(mag)
 
         arrowData = []
 
@@ -953,9 +1118,23 @@ class NavAgent:
                     smallest_theta = filtered[i][1]
 
         out.sort(key=lambda x: x[1])
-        return [(mag, theta) for mag, theta, _ in out]
+        # Return with normals if available
+        result = []
+        for mag, theta, _ in out:
+            if theta in normals:
+                result.append((mag, theta, normals[theta]))
+            else:
+                result.append((mag, theta))
+        return result
 
-    def _projection(self, a_final: list, obs: dict, chosen_action: int = None, available_turns: list = None):
+    def _projection(
+        self,
+        a_final: list,
+        obs: dict,
+        chosen_action: int = None,
+        available_turns: list = None,
+        force_include_unprojectable: bool = False,
+    ):
         """
         Project actions onto RGB image.
 
@@ -987,8 +1166,10 @@ class NavAgent:
             rgb_image=bgr,
             intrinsics=K,
             T_cam_base=T_cam_base,
+            T_odom_base=T_odom_base,
             chosen_action=chosen_action,
             available_turns=available_turns,
+            force_include_unprojectable=force_include_unprojectable,
         )
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         return projected, rgb
@@ -1008,7 +1189,17 @@ class NavAgent:
             return (u, v)
         return None
 
-    def _project_onto_image(self, a_final, rgb_image, intrinsics, T_cam_base, chosen_action=None, available_turns=None):
+    def _project_onto_image(
+        self,
+        a_final,
+        rgb_image,
+        intrinsics,
+        T_cam_base,
+        T_odom_base,
+        chosen_action=None,
+        available_turns=None,
+        force_include_unprojectable: bool = False,
+    ):
         """
         Project actions onto RGB image.
 
@@ -1023,6 +1214,10 @@ class NavAgent:
 
         scale_factor = rgb_image.shape[0] / 1080.0
         font = cv2.FONT_HERSHEY_SIMPLEX
+        fixed_arrow_len_px = max(
+            1,
+            int(round(float(self.cfg.get('rgb_waypoint_arrow_length_px', 42)) * scale_factor))
+        )
 
         text_color = BLACK
         circle_color = WHITE
@@ -1037,40 +1232,65 @@ class NavAgent:
         projected_count = 0
         skipped_count = 0
         skipped_reasons = []
-        
-        for (r_i, theta_i) in a_final:
+
+        for waypoint in a_final:
+            # Handle both (r, theta) and (r, theta, normal) formats
+            # Normal might be numpy array or tuple
+            if len(waypoint) == 3:
+                r_i, theta_i, normal_odom = waypoint
+                # Convert tuple back to numpy array if needed
+                if isinstance(normal_odom, tuple):
+                    normal_odom = np.array(normal_odom)
+            else:
+                r_i, theta_i = waypoint
+                normal_odom = None
+
             # 先检查原始距离是否可以投影（用于过滤）
             end_px = self._can_project(r_i, theta_i, rgb_image.shape[:2], intrinsics, T_cam_base)
             if end_px is None:
-                skipped_count += 1
-                skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - original distance not projectable")
-                continue
+                if not force_include_unprojectable:
+                    skipped_count += 1
+                    skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - original distance not projectable")
+                    continue
             
-            # Waypoint位置：最大距离的4/5处（80%）
-            r_waypoint = r_i * 0.8
-            
-            # 投影waypoint到图像（不做边缘检测，因为已经用原始距离检查过了）
+            # Project the real waypoint position (no distance scaling)
             H, W = rgb_image.shape[:2]
-            p_base = np.array([r_waypoint * np.cos(theta_i), r_waypoint * np.sin(theta_i), 0.0], dtype=np.float64)
+            p_base = np.array([r_i * np.cos(theta_i), r_i * np.sin(theta_i), 0.0], dtype=np.float64)
             uv = point_to_pixel(p_base, intrinsics, T_cam_base)
             if uv is None:
-                skipped_count += 1
-                skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - waypoint projection failed")
-                continue
-            waypoint_px = (int(round(uv[0][0])), int(round(uv[0][1])))
+                if not force_include_unprojectable:
+                    skipped_count += 1
+                    skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - waypoint projection failed")
+                    continue
+                waypoint_px = None
+            else:
+                waypoint_px = (int(round(uv[0][0])), int(round(uv[0][1])))
             
             # 确保waypoint在图像范围内
-            if not (0 <= waypoint_px[0] < W and 0 <= waypoint_px[1] < H):
-                skipped_count += 1
-                skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - waypoint out of bounds: ({waypoint_px[0]}, {waypoint_px[1]})")
-                continue
+            if waypoint_px is not None and not (0 <= waypoint_px[0] < W and 0 <= waypoint_px[1] < H):
+                if not force_include_unprojectable:
+                    skipped_count += 1
+                    skipped_reasons.append(f"r={r_i:.2f}, theta={np.degrees(theta_i):.1f}° - waypoint out of bounds: ({waypoint_px[0]}, {waypoint_px[1]})")
+                    continue
+                waypoint_px = None
             
             projected_count += 1
             action_name = len(projected) + 1
-            projected[(r_i, theta_i)] = action_name
-            print(f"[DEBUG] Projected action {action_name}: r={r_i:.2f}m, waypoint_r={r_waypoint:.2f}m, theta={np.degrees(theta_i):.1f}°, px=({waypoint_px[0]}, {waypoint_px[1]})")
+            # Store the complete waypoint tuple (with normal if available)
+            # Convert normal to tuple for hashability
+            if normal_odom is not None:
+                projected[(r_i, theta_i, tuple(normal_odom))] = action_name
+            else:
+                projected[(r_i, theta_i)] = action_name
+            if waypoint_px is None:
+                print(f"[DEBUG] Projected action {action_name}: r={r_i:.2f}m, theta={np.degrees(theta_i):.1f}°, px=(not_in_rgb)")
+            else:
+                print(f"[DEBUG] Projected action {action_name}: r={r_i:.2f}m, theta={np.degrees(theta_i):.1f}°, px=({waypoint_px[0]}, {waypoint_px[1]})")
 
-            # 只画圆圈（不画箭头）
+            if waypoint_px is None:
+                continue
+
+            # Draw annotation in order: arrow -> circle -> index text.
             text = str(action_name)
             text_size = 1.8 * scale_factor  # Reduced font size to fit two digits
             text_thickness = max(1, math.ceil(3 * scale_factor))
@@ -1078,6 +1298,85 @@ class NavAgent:
 
             circle_center = waypoint_px
             circle_radius = max(1, math.ceil(40 * scale_factor))  # Fixed radius for all circles
+
+            # Draw normal arrow first, then draw circle/text on top to keep numbers readable.
+            if normal_odom is not None:
+                # Draw the RGB arrow as the projection of the BEV arrow segment.
+                # BEV uses: start_offset_px=12, end_offset_px=12+30 on a 2x-upscaled map.
+                bev_scale_factor = 2.0
+                start_offset_px_bev = 12.0
+                end_offset_px_bev = 42.0
+                start_offset_m = start_offset_px_bev / (bev_scale_factor * self.bev_scale)
+                end_offset_m = end_offset_px_bev / (bev_scale_factor * self.bev_scale)
+
+                # Waypoint position in base frame
+                waypoint_x_base = r_i * np.cos(theta_i)
+                waypoint_y_base = r_i * np.sin(theta_i)
+
+                # Convert normal from odom frame to base frame
+                # T_odom_base rotates base to odom, so we need inverse rotation for odom->base
+                robot_yaw = np.arctan2(T_odom_base[1, 0], T_odom_base[0, 0])
+                cos_yaw = np.cos(-robot_yaw)
+                sin_yaw = np.sin(-robot_yaw)
+                normal_base = np.array([
+                    cos_yaw * normal_odom[0] - sin_yaw * normal_odom[1],
+                    sin_yaw * normal_odom[0] + cos_yaw * normal_odom[1]
+                ], dtype=np.float64)
+
+                normal_norm = np.linalg.norm(normal_base)
+                if normal_norm > 1e-6:
+                    normal_base = normal_base / normal_norm
+
+                    # Construct BEV-equivalent arrow start/end in base frame
+                    point_start_3d = np.array([
+                        waypoint_x_base + normal_base[0] * start_offset_m,
+                        waypoint_y_base + normal_base[1] * start_offset_m,
+                        0.1
+                    ], dtype=np.float64)
+                    point_end_3d = np.array([
+                        waypoint_x_base + normal_base[0] * end_offset_m,
+                        waypoint_y_base + normal_base[1] * end_offset_m,
+                        0.1
+                    ], dtype=np.float64)
+
+                    # Project both points and draw arrow from waypoint circle center
+                    uv_start = point_to_pixel(point_start_3d, intrinsics, T_cam_base)
+                    uv_end = point_to_pixel(point_end_3d, intrinsics, T_cam_base)
+                    if uv_start is not None and uv_end is not None:
+                        u_start = int(round(uv_start[0][0]))
+                        v_start = int(round(uv_start[0][1]))
+                        u_end = int(round(uv_end[0][0]))
+                        v_end = int(round(uv_end[0][1]))
+
+                        if (0 <= u_start < W and 0 <= v_start < H and
+                                0 <= u_end < W and 0 <= v_end < H):
+                            du = u_end - u_start
+                            dv = v_end - v_start
+                            norm_uv = np.hypot(du, dv)
+                            if norm_uv > 1e-6:
+                                dir_u = du / norm_uv
+                                dir_v = dv / norm_uv
+                                arrow_end = (
+                                    int(round(circle_center[0] + dir_u * fixed_arrow_len_px)),
+                                    int(round(circle_center[1] + dir_v * fixed_arrow_len_px))
+                                )
+
+                                cv2.arrowedLine(
+                                    rgb_image,
+                                    circle_center,
+                                    arrow_end,
+                                    BLACK,
+                                    5,
+                                    tipLength=0.2
+                                )
+                                cv2.arrowedLine(
+                                    rgb_image,
+                                    circle_center,
+                                    arrow_end,
+                                    WHITE,
+                                    3,
+                                    tipLength=0.2
+                                )
 
             if chosen_action is not None and action_name == chosen_action:
                 cv2.circle(rgb_image, circle_center, circle_radius, GREEN, -1)
@@ -1140,7 +1439,13 @@ class NavAgent:
 
         return projected
 
-    def _generate_bev_with_waypoints(self, base_to_odom: np.ndarray, waypoints: list = None) -> np.ndarray:
+    def _generate_bev_with_waypoints(
+        self,
+        base_to_odom: np.ndarray,
+        waypoints: list = None,
+        fallback_mode: bool = False,
+        show_waypoints: bool = True
+    ) -> np.ndarray:
         """
         生成标注了waypoints的BEV地图（使用ObstacleMap）
         
@@ -1150,6 +1455,8 @@ class NavAgent:
             机器人base到odom的变换矩阵 (4x4)
         waypoints : list, optional
             Waypoint列表，每个元素为(r, theta)元组，theta相对于机器人base坐标系
+        show_waypoints : bool, optional
+            是否绘制waypoint层。fallback模式下应为False，只保留正常BEV+轨迹标注。
             
         Returns
         -------
@@ -1246,10 +1553,12 @@ class NavAgent:
                             cv2.line(bev, (robot_px_x, robot_px_y), actual_end_px, (0, 0, 255), 2)
 
         # ========== 第二层：绘制历史轨迹（在箭头上层） ==========
-        if len(self.trajectory_history) > 1:
+        if len(self.trajectory_history) >= 1:  # Changed from > 1 to >= 1 to show first position
             # 转换所有历史位置到像素坐标（放大后）
             trajectory_array = np.array(self.trajectory_history)
             trajectory_px = self.obstacle_map._xy_to_px(trajectory_array) * scale_factor
+            history_point_color = (230, 216, 173)
+            history_arrow_length_px = 30
 
             # 绘制轨迹点（浅蓝色圆圈用于历史点，红色圆圈用于当前点）
             for i in range(len(trajectory_px)):
@@ -1259,12 +1568,25 @@ class NavAgent:
                     is_current = (self.current_trajectory_index is not None and
                                   i + 1 == self.current_trajectory_index)
 
+                    # 历史轨迹点方向箭头：使用该轨迹点记录的真实yaw
+                    # 先画箭头，再画圆圈和数字，避免遮挡序号
+                    if (not is_current) and (i < len(self.trajectory_yaw_history)):
+                        pt_yaw = float(self.trajectory_yaw_history[i])
+                        arrow_end = (
+                            int(round(pt[0] + np.cos(pt_yaw) * history_arrow_length_px)),
+                            int(round(pt[1] - np.sin(pt_yaw) * history_arrow_length_px))
+                        )
+
+                        # 黑色描边 + 同色箭头，风格与frontier箭头一致
+                        cv2.arrowedLine(bev, pt, arrow_end, (0, 0, 0), 4, tipLength=0.2)
+                        cv2.arrowedLine(bev, pt, arrow_end, history_point_color, 2, tipLength=0.2)
+
                     if is_current:
                         # 当前位置：红色填充 (BGR: 0, 0, 255)
                         cv2.circle(bev, pt, 12, (0, 0, 255), -1)
                     else:
                         # 历史位置：浅蓝色填充 (BGR: 230, 216, 173)
-                        cv2.circle(bev, pt, 12, (230, 216, 173), -1)
+                        cv2.circle(bev, pt, 12, history_point_color, -1)
 
                     # 黑色轮廓
                     cv2.circle(bev, pt, 12, (0, 0, 0), 2)
@@ -1279,7 +1601,7 @@ class NavAgent:
                                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
 
         # ========== 第三层：标注waypoints（在轨迹点上层） ==========
-        if waypoints is not None and len(waypoints) > 0:
+        if show_waypoints and waypoints is not None and len(waypoints) > 0:
             # 收集所有轨迹点的像素坐标（用于避免遮挡）
             trajectory_positions = []
             if len(self.trajectory_history) > 0:
@@ -1290,7 +1612,18 @@ class NavAgent:
             # 收集已绘制的waypoint位置（用于避免waypoint之间相互遮挡）
             drawn_waypoint_positions = []
 
-            for i, (r, theta) in enumerate(waypoints, start=1):
+            for i, waypoint in enumerate(waypoints, start=1):
+                # Handle both (r, theta) and (r, theta, normal) formats
+                # Normal might be numpy array or tuple
+                if len(waypoint) == 3:
+                    r, theta, normal_odom = waypoint
+                    # Convert tuple back to numpy array if needed
+                    if isinstance(normal_odom, tuple):
+                        normal_odom = np.array(normal_odom)
+                else:
+                    r, theta = waypoint
+                    normal_odom = None
+
                 # 计算waypoint在odom坐标系中的位置
                 absolute_theta = robot_yaw + theta
                 waypoint_x = current_pos[0] + r * np.cos(absolute_theta)
@@ -1323,9 +1656,9 @@ class NavAgent:
                                     too_close = True
                                     break
 
-                        # 如果太近，寻找附近的空白位置
+                        # 如果太近，寻找附近的空白位置（fallback模式下不偏移，保持历史点精确位置）
                         final_px_x, final_px_y = px_x, px_y
-                        if too_close:
+                        if too_close and (not fallback_mode):
                             # 在原位置周围搜索空白位置
                             # 搜索半径从30到60像素，每次增加10像素
                             # 每个半径上尝试8个方向
@@ -1376,6 +1709,31 @@ class NavAgent:
                         # 记录这个waypoint的位置
                         drawn_waypoint_positions.append((final_px_x, final_px_y))
 
+                        # Draw normal arrow first, then draw circle/text on top.
+                        if normal_odom is not None:
+                            arrow_length_px = 30  # pixels at 2x scale
+                            # Normal is already in odom frame, pointing to unexplored
+                            # Convert to pixel direction (note Y flip in image coordinates)
+                            normal_px_dir = np.array([normal_odom[0], -normal_odom[1]])
+                            normal_norm = np.linalg.norm(normal_px_dir)
+                            if normal_norm > 1e-6:
+                                normal_px_dir = normal_px_dir / normal_norm
+
+                                # Arrow from circle center to end point
+                                start_px = np.array([final_px_x, final_px_y], dtype=int)
+                                end_px = start_px + (normal_px_dir * arrow_length_px).astype(int)
+
+                                # Draw outlined arrow for visibility; center will be covered by circle
+                                cv2.arrowedLine(bev, tuple(start_px), tuple(end_px),
+                                               (0, 0, 0), 4, tipLength=0.2)
+                                cv2.arrowedLine(bev, tuple(start_px), tuple(end_px),
+                                               (144, 238, 144), 2, tipLength=0.2)  # Light green arrow
+                                print(f'[BEV] Drew arrow for waypoint {i} at ({final_px_x}, {final_px_y}), normal={normal_odom}')
+                            else:
+                                print(f'[BEV] Waypoint {i} has zero-length normal, skipping arrow')
+                        else:
+                            print(f'[BEV] Waypoint {i} has no normal vector, skipping arrow')
+
                         # 浅绿色填充 (BGR: 144, 238, 144)，半径12能容纳两位数
                         cv2.circle(bev, (final_px_x, final_px_y), 12, (144, 238, 144), -1)
                         # 黑色轮廓
@@ -1390,43 +1748,52 @@ class NavAgent:
                         cv2.putText(bev, text, (text_x, text_y),
                                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
         
-        # 转换BGR到RGB，确保VLM能正确解析颜色
         bev = cv2.cvtColor(bev, cv2.COLOR_BGR2RGB)
         
         return bev
 
-    def _nav(self, obs: dict, goal: str, iter: int, goal_description: str = ""):
-        # Record current position to trajectory history
-        current_pos = obs['base_to_odom_matrix'][:3, 3]
-        current_xy = (current_pos[0], current_pos[1])
+    def update_observation_only(self, obs: dict, is_keyframe: bool = True):
+        """
+        Update map state from current observation.
 
-        # Check if current position overlaps with any existing trajectory point
-        merge_threshold = 0.2  # meters
-        merged_index = None
+        When `is_keyframe` is True, also maintain trajectory keypoints with the
+        same merge logic used by the full navigation loop.
+        """
+        if is_keyframe:
+            current_pos = obs['base_to_odom_matrix'][:3, 3]
+            current_xy = (float(current_pos[0]), float(current_pos[1]))
+            current_yaw = float(np.arctan2(obs['base_to_odom_matrix'][1, 0], obs['base_to_odom_matrix'][0, 0]))
 
-        if len(self.trajectory_history) > 0:
-            # Search all trajectory points for overlap
-            for i, hist_pos in enumerate(self.trajectory_history):
-                distance = np.sqrt((current_xy[0] - hist_pos[0])**2 + (current_xy[1] - hist_pos[1])**2)
-                if distance <= merge_threshold:
-                    # Found overlapping point
-                    merged_index = i + 1  # 1-based index
-                    # Align current position to this trajectory point
-                    current_xy = hist_pos
-                    print(f'[NavAgent] Current position overlaps with trajectory point {merged_index} (distance={distance:.3f}m)')
-                    break
+            # Check if current position overlaps with any existing trajectory point
+            merge_threshold = 0.2  # meters
+            merged_index = None
 
-        if merged_index is not None:
-            # Overlapping with existing point, don't add new point
-            self.current_trajectory_index = merged_index
-        else:
-            # No overlap, add new trajectory point
-            self.trajectory_history.append(current_xy)
-            self.current_trajectory_index = len(self.trajectory_history)
-            print(f'[NavAgent] Added trajectory point {self.current_trajectory_index}: {current_xy}')
+            if len(self.trajectory_history) > 0:
+                # Search all trajectory points for overlap
+                for i, hist_pos in enumerate(self.trajectory_history):
+                    distance = np.sqrt((current_xy[0] - hist_pos[0])**2 + (current_xy[1] - hist_pos[1])**2)
+                    if distance <= merge_threshold:
+                        # Found overlapping point
+                        merged_index = i + 1  # 1-based index
+                        # Align current position to this trajectory point
+                        current_xy = hist_pos
+                        print(f'[NavAgent] Current position overlaps with trajectory point {merged_index} (distance={distance:.3f}m)')
+                        break
 
-        # Update ObstacleMap with current observation FIRST
-        # This ensures we have the latest obstacle information for raycast
+            if merged_index is not None:
+                # Overlapping with existing point, don't add new point
+                self.current_trajectory_index = merged_index
+                # Refresh yaw for this trajectory point to reflect current orientation
+                if merged_index - 1 < len(self.trajectory_yaw_history):
+                    self.trajectory_yaw_history[merged_index - 1] = current_yaw
+            else:
+                # No overlap, add new point
+                self.trajectory_history.append(current_xy)
+                self.trajectory_yaw_history.append(current_yaw)
+                self.current_trajectory_index = len(self.trajectory_history)
+                print(f'[NavAgent] Added trajectory point {self.current_trajectory_index}: {current_xy}')
+
+        # Always update BEV obstacle map every frame
         if self.obstacle_map is not None:
             self.obstacle_map.update_map(
                 depth=obs['depth'],
@@ -1435,23 +1802,53 @@ class NavAgent:
                 base_to_odom=obs['base_to_odom_matrix']
             )
 
-            # Update colored BEV map with RGB projection
-            self.obstacle_map.update_colored_bev(
-                rgb=obs['rgb'],
-                depth=obs['depth'],
-                intrinsic=obs['intrinsic'],
-                extrinsic=obs['extrinsic'],
-                base_to_odom=obs['base_to_odom_matrix']
-            )
+    def _nav(
+        self,
+        obs: dict,
+        goal: str,
+        iter: int,
+        goal_description: str = "",
+        observation_already_updated: bool = False
+    ):
+        # Keep legacy behavior: full navigation loop updates keyframe trajectory and map.
+        if not observation_already_updated:
+            self.update_observation_only(obs, is_keyframe=True)
 
-        # Compute navigability using BEV-based raycast (more accurate)
-        # This uses the updated obstacle map to avoid waypoints behind obstacles
-        a_initial = self._navigability_from_bev(obs)
-        a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
+        # Compute navigation candidates.
+        # Normal mode: frontier-based waypoints.
+        # Fallback mode: historical trajectory points (after too many consecutive turns).
+        fallback_turn_threshold = int(self.cfg.get('fallback_turn_threshold', 12))
+        fallback_triggered = self.consecutive_turn_count >= fallback_turn_threshold
+        fallback_mode = False
+        fallback_traj_ids = []
+
+        if fallback_triggered:
+            fallback_actions, fallback_traj_ids = self._build_fallback_history_candidates(obs)
+            if len(fallback_actions) > 0:
+                fallback_mode = True
+                self.fallback_active = True
+                a_final = fallback_actions
+                print(
+                    f"[NavAgent] FALLBACK ACTIVE: consecutive turns={self.consecutive_turn_count}, "
+                    f"history candidates={len(a_final)}, trajectory points={fallback_traj_ids}"
+                )
+            else:
+                print(
+                    f"[NavAgent] FALLBACK TRIGGERED but no valid history candidates "
+                    f"(consecutive turns={self.consecutive_turn_count}), using normal frontier mode"
+                )
+                a_initial = self._navigability_from_bev(obs)
+                a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
+        else:
+            a_initial = self._navigability_from_bev(obs)
+            a_final = self._action_proposer(a_initial, obs['base_to_odom_matrix'])
 
         # Filter turn actions based on last turn direction BEFORE projection
         # Determine which turn actions are available
-        if self.last_turn_direction is not None:
+        if fallback_mode:
+            # Force a MOVE choice in fallback mode.
+            available_turns = []
+        elif self.last_turn_direction is not None:
             # Only allow the same turn direction as last time
             available_turns = [self.last_turn_direction]
             print(f'[NavAgent] Restricting to same turn direction: {self.last_turn_direction} (last turn was {self.last_turn_direction})')
@@ -1462,18 +1859,57 @@ class NavAgent:
         # Start timing for projection (image annotation)
         t_projection_start = time.time()
 
-        # Generate visualization without highlighting (for initial display)
-        a_final_projected, rgb_vis = self._projection(a_final, obs, available_turns=available_turns)
+        if fallback_mode:
+            # In fallback, action number must be trajectory point ID, and VLM only sees BEV.
+            a_final_projected = {}
+            for waypoint, traj_id in zip(a_final, fallback_traj_ids):
+                if len(waypoint) == 3:
+                    r_i, theta_i, normal_odom = waypoint
+                    if isinstance(normal_odom, np.ndarray):
+                        normal_key = tuple(float(x) for x in normal_odom.tolist())
+                    else:
+                        normal_key = tuple(float(x) for x in normal_odom)
+                    waypoint_key = (float(r_i), float(theta_i), normal_key)
+                else:
+                    r_i, theta_i = waypoint
+                    waypoint_key = (float(r_i), float(theta_i))
+                a_final_projected[waypoint_key] = int(traj_id)
 
-        # Generate BEV map with waypoints (always generate for consistency)
-        projected_waypoints = [k for k in a_final_projected.keys() if isinstance(k, tuple)]
-        bev_map = self._generate_bev_with_waypoints(obs['base_to_odom_matrix'], waypoints=projected_waypoints)
-
-        # Decide whether to send BEV to VLM based on enable_bev_map
-        if self.cfg['enable_bev_map']:
-            images = [rgb_vis, bev_map]  # Send both RGB and BEV to VLM
+            rgb_vis = obs['rgb'].copy()
+            # Do not overlay fallback waypoints; model should choose from blue trajectory points in BEV.
+            bev_map = self._generate_bev_with_waypoints(
+                obs['base_to_odom_matrix'],
+                waypoints=None,
+                fallback_mode=False,
+                show_waypoints=False
+            )
+            images = [bev_map]
+            image_labels = ["[IMAGE: BEV]"]
         else:
-            images = [rgb_vis]  # Only send RGB to VLM (but BEV is still generated for navigation)
+            # Generate visualization without highlighting (for initial display)
+            a_final_projected, rgb_vis = self._projection(
+                a_final,
+                obs,
+                available_turns=available_turns,
+                force_include_unprojectable=False
+            )
+
+            # Generate BEV map with waypoints (always generate for consistency)
+            projected_waypoints = [k for k in a_final_projected.keys() if isinstance(k, tuple)]
+            bev_map = self._generate_bev_with_waypoints(
+                obs['base_to_odom_matrix'],
+                waypoints=projected_waypoints,
+                fallback_mode=False,
+                show_waypoints=True
+            )
+
+            # Decide whether to send BEV to VLM based on enable_bev_map
+            if self.cfg['enable_bev_map']:
+                images = [rgb_vis, bev_map]  # Send both RGB and BEV to VLM
+                image_labels = ["[IMAGE: RGB]", "[IMAGE: BEV]"]
+            else:
+                images = [rgb_vis]  # Only send RGB to VLM (but BEV is still generated for navigation)
+                image_labels = ["[IMAGE: RGB]"]
 
         # Check if only one turn action is available (no MOVE actions)
         # If so, skip VLM and return that turn action directly
@@ -1488,6 +1924,7 @@ class NavAgent:
             self.action_history.append(single_turn)
             if len(self.action_history) > self.max_action_history:
                 self.action_history.pop(0)
+            self.consecutive_turn_count += 1
 
             # Prepare timing info
             t_projection_end = time.time()
@@ -1514,25 +1951,76 @@ class NavAgent:
         # 构建统一的prompt（不再区分关键帧/非关键帧）
         # Count only move waypoints (tuples), not turn actions (integers)
         num_move_actions = len([k for k in a_final_projected.keys() if isinstance(k, tuple)])
-        prompt = self._construct_prompt(
-            num_actions=num_move_actions,
-            iter=iter,
-            num_turn_actions=num_turn_actions,
-            available_turns=available_turns
-        )
-        
+
+        # Trajectory point merge/add has been handled at the start of _nav.
+        # Here we only resolve pending MOVE destination using current trajectory index.
+        if len(self.simplified_history) > 0:
+            last_record = self.simplified_history[-1]
+            if last_record['action_type'] == 'move' and last_record['to_trajectory_point'] is None:
+                from_point = last_record.get('from_trajectory_point')
+                to_point = self.current_trajectory_index
+                if to_point is not None and from_point is not None and to_point != from_point:
+                    last_record['to_trajectory_point'] = to_point
+                    print(f"[NavAgent] Updated MOVE record: from point {from_point} to point {to_point}")
+
+        # Increment iteration counter
+        self.iteration_counter += 1
+
+        # Build current observation prompt
+        if fallback_mode:
+            current_observation = self._construct_fallback_observation(
+                iter=self.iteration_counter,
+                candidate_traj_ids=fallback_traj_ids
+            )
+        else:
+            current_observation = self._construct_prompt(
+                num_actions=num_move_actions,
+                iter=self.iteration_counter,
+                num_turn_actions=num_turn_actions,
+                available_turns=available_turns,
+                fallback_note=""
+            )
+
+        # Build custom history messages (simplified: iter + action only)
+        custom_history = self._build_custom_history_messages()
+
+        # Build complete text prompt (history + current_observation)
+        prompt_parts = []
+
+        if len(custom_history) > 0:
+            prompt_parts.append("=" * 80)
+            prompt_parts.append("CONVERSATION HISTORY")
+            prompt_parts.append("=" * 80)
+            for msg in custom_history:
+                if msg['role'] == 'user':
+                    prompt_parts.append(msg['content'])
+                else:
+                    prompt_parts.append(msg['content'])
+            prompt_parts.append("")
+
+        prompt_parts.append(current_observation)
+
+        full_text_prompt = "\n".join(prompt_parts)
+
         t_projection_end = time.time()
         projection_time = t_projection_end - t_projection_start
+
+        # Format full prompt for logging BEFORE calling VLM
+        full_prompt = self._format_full_messages_as_text(
+            full_text_prompt,
+            num_images=len(images),
+            image_labels=image_labels
+        )
 
         # Start timing for VLM inference
         t_vlm_start = time.time()
 
-        # 调用VLM（使用VLM自己的历史管理）
+        # Call VLM with custom history (simplified structure)
         try:
-            response = self.actionVLM.call_chat(
-                history=self.cfg['vlm_history'],
+            response = self.actionVLM.call_chat_with_custom_history(
+                custom_history=custom_history,
                 images=images,
-                text_prompt=prompt
+                text_prompt=full_text_prompt
             )
             print(f'[NavAgent] VLM Response: {response}')
         except Exception as e:
@@ -1550,7 +2038,7 @@ class NavAgent:
         vlm_inference_time = t_vlm_end - t_vlm_start
 
         print(f'[NavAgent] Timing - Projection: {projection_time:.3f}s, VLM inference: {vlm_inference_time:.3f}s')
-        print(f'[NavAgent] Prompt length: {len(prompt)} chars')
+        print(f'[NavAgent] Prompt length: {len(full_text_prompt)} chars')
         print(f'Response: {response}')
 
         rev = {v: k for k, v in a_final_projected.items()}
@@ -1563,16 +2051,59 @@ class NavAgent:
             if len(self.action_history) > self.max_action_history:
                 self.action_history.pop(0)  # Keep only last N actions
 
+            # Save to simplified history with trajectory point information
+            if action_number in [-1, -2]:
+                # TURN action
+                rotation = self.turn_angle_deg if action_number == -2 else -self.turn_angle_deg
+                self.consecutive_turn_count += 1
+
+                # Check if we should merge with the last TURN record
+                if (len(self.simplified_history) > 0 and
+                    self.simplified_history[-1]['action_type'] == 'turn' and
+                    self.simplified_history[-1]['trajectory_point'] == self.current_trajectory_index):
+                    # Merge with previous TURN record
+                    self.simplified_history[-1]['total_rotation'] += rotation
+                    self.simplified_history[-1]['iter_end'] = self.iteration_counter
+                    self.simplified_history[-1]['turn_count'] += 1
+                    print(f"[NavAgent] Merged TURN: point {self.current_trajectory_index}, total rotation {self.simplified_history[-1]['total_rotation']:.1f}°, iterations {self.simplified_history[-1]['iter_start']}-{self.simplified_history[-1]['iter_end']}")
+                else:
+                    # Create new TURN record
+                    self.simplified_history.append({
+                        'iter_start': self.iteration_counter,
+                        'iter_end': self.iteration_counter,
+                        'trajectory_point': self.current_trajectory_index,
+                        'action_type': 'turn',
+                        'total_rotation': rotation,
+                        'turn_count': 1
+                    })
+                    print(f"[NavAgent] New TURN record: point {self.current_trajectory_index}, rotation {rotation:.1f}°, iteration {self.iteration_counter}")
+            else:
+                # MOVE action
+                self.consecutive_turn_count = 0
+                self.fallback_active = False
+                self.simplified_history.append({
+                    'iter_start': self.iteration_counter,
+                    'iter_end': self.iteration_counter,
+                    'from_trajectory_point': self.current_trajectory_index,
+                    'to_trajectory_point': None,  # Will be updated in next iteration
+                    'action_type': 'move'
+                })
+                print(f"[NavAgent] New MOVE record: from point {self.current_trajectory_index}, iteration {self.iteration_counter}")
+
             # Re-generate visualization with chosen action highlighted in GREEN
-            _, rgb_vis_final = self._projection(
-                a_final,
-                obs,
-                chosen_action=action_number,
-                available_turns=available_turns
-            )
+            if fallback_mode:
+                rgb_vis_final = rgb_vis
+                print(f"[NavAgent] FALLBACK selected trajectory point ID: {action_number}")
+            else:
+                _, rgb_vis_final = self._projection(
+                    a_final,
+                    obs,
+                    chosen_action=action_number,
+                    available_turns=available_turns,
+                    force_include_unprojectable=False
+                )
 
             # Prepare timing information (include full conversation context for debugging)
-            full_prompt = self._format_full_messages_as_text(prompt, num_images=len(images))
             timing_info = {
                 'projection_time': float(projection_time),
                 'vlm_inference_time': float(vlm_inference_time),

@@ -101,6 +101,9 @@ class OpenAIVLM(VLM):
         self.history = []  # Conversation history (user+assistant pairs)
         self.max_image_res = max_image_res
 
+        # Detect if using OpenAI official API (doesn't support extra_body params like top_k)
+        self.is_openai_official = base_url and 'api.openai.com' in base_url
+
 
     def call_chat(self, history: int, images: list[np.array], text_prompt: str):
         """
@@ -158,19 +161,27 @@ class OpenAIVLM(VLM):
         # 4. Add current message
         messages.append(current_message)
 
+        # Prepare API call parameters
+        api_params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "presence_penalty": 1.5,
+        }
+
+        # OpenAI official API uses max_completion_tokens, others use max_tokens
+        if self.is_openai_official:
+            api_params["max_completion_tokens"] = 32768
+        else:
+            api_params["max_tokens"] = 32768
+            api_params["extra_body"] = {
+                "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=32768,
-                temperature=0.7,
-                top_p=0.8,
-                presence_penalty=1.5,
-                extra_body={
-                    "top_k": 20,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
-            )
+            response = self.client.chat.completions.create(**api_params)
 
             # Debug: Check if response content is None
             content = response.choices[0].message.content
@@ -243,19 +254,27 @@ class OpenAIVLM(VLM):
         # 4. 添加当前消息
         messages.append(current_message)
 
+        # Prepare API call parameters
+        api_params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "presence_penalty": 1.5,
+        }
+
+        # OpenAI official API uses max_completion_tokens, others use max_tokens
+        if self.is_openai_official:
+            api_params["max_completion_tokens"] = 32768
+        else:
+            api_params["max_tokens"] = 32768
+            api_params["extra_body"] = {
+                "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=32768,
-                temperature=0.7,
-                top_p=0.8,
-                presence_penalty=1.5,
-                extra_body={
-                    "top_k": 20,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
-            )
+            response = self.client.chat.completions.create(**api_params)
 
             # Debug: Check if response content is None
             content = response.choices[0].message.content
@@ -310,19 +329,28 @@ class OpenAIVLM(VLM):
         }]
         image_contents = self._image_contents_from_images(images)
         messages = [{"role": "user", "content": text_contents + image_contents}]
+
+        # Prepare API call parameters
+        api_params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "presence_penalty": 1.5,
+        }
+
+        # OpenAI official API uses max_completion_tokens, others use max_tokens
+        if self.is_openai_official:
+            api_params["max_completion_tokens"] = 32768
+        else:
+            api_params["max_tokens"] = 32768
+            api_params["extra_body"] = {
+                "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=32768,
-                temperature=0.7,
-                top_p=0.8,
-                presence_penalty=1.5,
-                extra_body={
-                    "top_k": 20,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
-            )
+            response = self.client.chat.completions.create(**api_params)
 
             # Debug: Check if response content is None
             content = response.choices[0].message.content

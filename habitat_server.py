@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Flask Server for LLM Navigation
+Habitat Flask Server for LLM Navigation
 Server端负责推理（NavAgent），返回Path或Action
 """
 import os
@@ -94,6 +94,23 @@ def build_goal_pose(x: float, y: float, z: float, yaw: float) -> Dict[str, Any]:
             'position': {'x': float(x), 'y': float(y), 'z': float(z)},
         'orientation': yaw_to_quaternion(float(yaw))
     }
+
+
+def parse_optional_bool(value, default: bool = True) -> bool:
+    """Parse optional bool from form/json-like values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    text = str(value).strip().lower()
+    if text in {'1', 'true', 't', 'yes', 'y', 'on'}:
+        return True
+    if text in {'0', 'false', 'f', 'no', 'n', 'off'}:
+        return False
+    return default
 
 
 @app.route('/navigation_reset', methods=['POST'])
@@ -202,6 +219,7 @@ def navigation_step():
             'intrinsic': JSON string, 3x3 matrix flattened
             'T_cam_odom': JSON string, 4x4 matrix flattened (odom->cam)
             'T_odom_base': JSON string, 4x4 matrix flattened (base->odom)
+            'is_keyframe': optional bool (default true)
     
     Returns JSON: {
         'action_type': 'nav_step' | 'turn_around' | 'none',
@@ -263,18 +281,39 @@ def navigation_step():
     except Exception as e:
         return jsonify({'error': f'Failed to load images: {str(e)}'}), 400
     
-    # Parse transforms
+    # Parse transforms and mode flags
     try:
         form_data = request.form
         intrinsic = np.array(json.loads(form_data['intrinsic']), dtype=np.float32).reshape(3, 3)
         T_cam_odom = np.array(json.loads(form_data['T_cam_odom']), dtype=np.float32).reshape(4, 4)
         T_odom_base = np.array(json.loads(form_data['T_odom_base']), dtype=np.float32).reshape(4, 4)
+        is_keyframe = parse_optional_bool(form_data.get('is_keyframe', None), default=True)
     except Exception as e:
         return jsonify({'error': f'Failed to parse transforms: {str(e)}'}), 400
+
+    print(f"[Server] Mode: {'KEYFRAME' if is_keyframe else 'NON-KEYFRAME'}")
+
+    # Prepare obs dict
+    obs = {
+        'rgb': rgb,
+        'depth': depth,
+        'intrinsic': intrinsic,
+        'extrinsic': T_cam_odom,
+        'base_to_odom_matrix': T_odom_base
+    }
+
+    # Persist raw RGB for every iteration
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb.jpg'), bgr)
+
+    # Always update map; trajectory keypoint maintenance happens only on keyframes.
+    if nav_state['agent'] is not None:
+        nav_state['agent'].update_observation_only(obs, is_keyframe=is_keyframe)
 
     # === DETIC GOAL DETECTION (SYNCHRONOUS) ===
     # Check if goal is visible before running VLM navigation
     t_detic_start = time.time()
+    t_detic_end = t_detic_start
     if nav_state['detic_detector'] is not None:
         try:
             detections = nav_state['detic_detector'].detect(rgb)
@@ -384,6 +423,7 @@ def navigation_step():
                     timing_data = {
                         'iteration': iteration,
                         'action_type': 'nav_step',
+                        'is_keyframe': bool(is_keyframe),
                         'detic_detection_time': float(t_detic_end - t_detic_start),
                         'total_server_time': float(time.time() - t_server_start),
                         'finished': True
@@ -426,7 +466,8 @@ def navigation_step():
                             'total_server_time': time.time() - t_server_start,
                             'vlm_projection_time': 0.0,
                             'vlm_inference_time': 0.0,
-                            'detic_detection_time': t_detic_end - t_detic_start
+                            'detic_detection_time': t_detic_end - t_detic_start,
+                            'is_keyframe': bool(is_keyframe)
                         }
                     })
 
@@ -435,7 +476,10 @@ def navigation_step():
                     # Continue with VLM navigation on error
 
             else:
-                print(f"[Server] Detic: No detection of '{nav_state['goal']}', continuing with VLM navigation")
+                if is_keyframe:
+                    print(f"[Server] Detic: No detection of '{nav_state['goal']}', continuing with VLM navigation")
+                else:
+                    print(f"[Server] Detic: No detection of '{nav_state['goal']}', non-keyframe will return none")
 
         except Exception as e:
             print(f"[Server] Detic detection failed: {e}")
@@ -443,25 +487,93 @@ def navigation_step():
             traceback.print_exc()
             # Continue with VLM navigation on error
 
-    # If no detection or Detic not initialized, continue with normal VLM navigation...
+    # If no detection or Detic not initialized:
+    # - Non-keyframe: stop here (only detection + map update).
+    # - Keyframe: continue with normal VLM navigation.
+    if not is_keyframe:
+        print("[Server] Non-keyframe: skipping frontier/VLM decision")
 
-    # Prepare obs dict (same format as original code)
-    obs = {
-        'rgb': rgb,
-        'depth': depth,
-        'intrinsic': intrinsic,
-        'extrinsic': T_cam_odom,
-        'base_to_odom_matrix': T_odom_base
-    }
-    
-    # Save images for debugging
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb.jpg'), bgr)
-    
-    # LLM Navigation Step
+        rgb_vis = rgb.copy()
+        cv2.imwrite(
+            os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_rgb_vis.jpg'),
+            cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
+        )
+
+        bev_map = None
+        if nav_state['agent'].obstacle_map is not None:
+            robot_pos = T_odom_base[:2, 3]
+            bev_map = nav_state['agent'].obstacle_map.visualize(robot_pos=robot_pos, show_frontiers=False)
+            cv2.imwrite(
+                os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_bev_map.jpg'),
+                cv2.cvtColor(bev_map, cv2.COLOR_RGB2BGR)
+            )
+
+        response = (
+            f"[Non-keyframe]\n"
+            f"Goal: {nav_state['goal']}\n"
+            f"Detic detection: not found\n"
+            f"Action: none\n"
+            f"Map updated only."
+        )
+        with open(os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_response.txt'), 'w') as f:
+            f.write(response)
+
+        timing_data = {
+            'iteration': iteration,
+            'action_type': 'none',
+            'is_keyframe': False,
+            'detic_detection_time': float(t_detic_end - t_detic_start),
+            'vlm_projection_time': 0.0,
+            'vlm_inference_time': 0.0,
+            'total_server_time': float(time.time() - t_server_start),
+            'finished': False
+        }
+        timing_path = os.path.join(nav_state['log_dir'], f'iter_{iteration:04d}_timing.json')
+        with open(timing_path, 'w') as f:
+            json.dump(timing_data, f, indent=2)
+
+        log_name = os.path.basename(nav_state['log_dir'])
+        viz_state = {
+            'iteration': iteration,
+            'goal': nav_state['goal'],
+            'goal_description': nav_state['goal_description'],
+            'action_type': 'none',
+            'images': {
+                'rgb': f'/logs/{log_name}/iter_{iteration:04d}_rgb.jpg',
+                'rgb_vis': f'/logs/{log_name}/iter_{iteration:04d}_rgb_vis.jpg'
+            },
+            'llm_response': response,
+            'current_cycle': [],
+            'historical_keyframes': []
+        }
+        if bev_map is not None:
+            viz_state['images']['bev_map'] = f'/logs/{log_name}/iter_{iteration:04d}_bev_map.jpg'
+        nav_state['latest_state'] = viz_state
+        socketio.emit('navigation_update', viz_state)
+
+        timing_info = {
+            'total_server_time': float(time.time() - t_server_start),
+            'vlm_projection_time': 0.0,
+            'vlm_inference_time': 0.0,
+            'detic_detection_time': float(t_detic_end - t_detic_start),
+            'is_keyframe': False
+        }
+        return jsonify({
+            'action_type': 'none',
+            'goal_pose': None,
+            'iteration': iteration,
+            'finished': False,
+            'timing': timing_info
+        })
+
+    # Keyframe path: run full frontier/VLM navigation.
     print("[Server] Calling NavAgent for decision...")
     response, rgb_vis, action, nav_timing, bev_map = nav_state['agent']._nav(
-        obs, nav_state['goal'], iteration, goal_description=nav_state['goal_description']
+        obs,
+        nav_state['goal'],
+        iteration,
+        goal_description=nav_state['goal_description'],
+        observation_already_updated=True
     )
 
     print(f"[Server] NavAgent action: {action}")
@@ -507,6 +619,8 @@ def navigation_step():
     # Save timing information (will be updated at the end with total time and action type)
     timing_data = {
         'iteration': iteration,
+        'is_keyframe': True,
+        'detic_detection_time': float(t_detic_end - t_detic_start),
         'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
         'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
     }
@@ -571,7 +685,9 @@ def navigation_step():
         timing_info = {
             'total_server_time': float(total_server_time),
             'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
-            'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+            'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0)),
+            'detic_detection_time': float(t_detic_end - t_detic_start),
+            'is_keyframe': True
         }
         
         # Update timing file with total server time and action type
@@ -671,7 +787,9 @@ def navigation_step():
     timing_info = {
         'total_server_time': float(total_server_time),
         'vlm_projection_time': float(nav_timing.get('projection_time', 0.0)),
-        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0))
+        'vlm_inference_time': float(nav_timing.get('vlm_inference_time', 0.0)),
+        'detic_detection_time': float(t_detic_end - t_detic_start),
+        'is_keyframe': True
     }
     
     # Update timing file with total server time and action type
@@ -861,13 +979,13 @@ def handle_disconnect():
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='LLM Navigation Flask Server')
+    parser = argparse.ArgumentParser(description='Habitat LLM Navigation Flask Server')
     parser.add_argument('--port', type=int, default=1874, help='Server port')
     parser.add_argument('--host', type=str, default='10.19.126.158', help='Server host')
     args = parser.parse_args()
     
     print("=" * 60)
-    print("LLM Navigation Server (Flask + SocketIO)")
+    print("Habitat LLM Navigation Server (Flask + SocketIO)")
     print("=" * 60)
     print(f"Starting server on {args.host}:{args.port}")
     print("\nEndpoints:")
