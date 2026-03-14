@@ -407,7 +407,8 @@ class ObstacleMap:
         self._update_frontiers(
             robot_pos_odom=robot_pos_odom,
             robot_yaw=robot_yaw,
-            fov_rad=fov_horizontal
+            fov_rad=fov_horizontal,
+            fov_max_depth=max_depth,
         )
 
         print(f"[ObstacleMap] Detected {len(self.frontiers)} frontiers")
@@ -606,7 +607,8 @@ class ObstacleMap:
         robot_pos_odom: np.ndarray,
         robot_yaw: float,
         fov_rad: float,
-        fov_expansion_deg: float = 10.0
+        fov_expansion_deg: float = 10.0,
+        fov_max_depth: float = 20.0,
     ) -> None:
         """
         Detect frontier waypoints based on global map, then filter by FOV.
@@ -628,6 +630,8 @@ class ObstacleMap:
             Camera FOV in radians
         fov_expansion_deg : float
             Expand FOV by this many degrees for frontier selection (default: 10)
+        fov_max_depth : float
+            Distance limit in meters for frontier FOV filtering
         """
         # Step 1: Detect frontiers based on global map
         # Use explored_area directly without dilation
@@ -647,7 +651,7 @@ class ObstacleMap:
                 robot_pos_odom=robot_pos_odom,
                 robot_yaw=robot_yaw,
                 fov_rad=fov_expanded_rad,
-                max_depth=20.0  # Distance limit: 20 meters
+                max_depth=fov_max_depth
             )
 
             # Filter frontiers by FOV
@@ -690,6 +694,56 @@ class ObstacleMap:
             self.frontiers = np.array([])
 
         print(f"[ObstacleMap] Final frontiers: {len(self.frontiers)}")
+
+    def get_global_frontiers(
+        self,
+        robot_pos_odom: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Detect all global frontiers without FOV or A* reachability filtering.
+        Used by fallback mode to provide frontier candidates from all directions.
+
+        Pipeline: global detection -> obstacle proximity filter -> inward move + normal
+
+        Parameters
+        ----------
+        robot_pos_odom : np.ndarray
+            Robot position in odom frame [x, y]
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            (frontiers_odom Nx2, normals Nx2) in odom coordinates
+        """
+        # Step 1: Global frontier detection
+        frontiers_px = detect_frontier_waypoints(
+            self._navigable_map.astype(np.uint8),
+            self.explored_area.astype(np.uint8),
+            self._area_thresh_in_pixels,
+        )
+        print(f"[ObstacleMap] Global frontiers (fallback): {len(frontiers_px)}")
+
+        if len(frontiers_px) == 0:
+            return np.array([]), np.array([])
+
+        # Step 2: Obstacle proximity filter (skip FOV and A* filters)
+        frontiers_px = self._filter_frontiers_near_obstacles(frontiers_px)
+        print(f"[ObstacleMap] After obstacle filter (fallback): {len(frontiers_px)}")
+
+        if len(frontiers_px) == 0:
+            return np.array([]), np.array([])
+
+        # Step 3: Inward move + normal computation
+        frontiers_px, normals = self._move_frontiers_inward(frontiers_px, self.explored_area)
+
+        if len(frontiers_px) == 0:
+            return np.array([]), np.array([])
+
+        # Convert to odom coordinates
+        frontiers_odom = self._px_to_xy(frontiers_px)
+        print(f"[ObstacleMap] Final global frontiers (fallback): {len(frontiers_odom)}")
+
+        return frontiers_odom, normals
 
     def _move_frontiers_inward(
         self,

@@ -8,6 +8,7 @@ import os
 import numpy as np
 import torch
 import cv2
+from typing import List, Dict, Optional
 
 # Add Detic paths
 DETIC_ROOT = '/home/liujy/mobile_manipulation/perception_modules/Detic'
@@ -39,7 +40,10 @@ class DeticDetector:
         """
         self.confidence_threshold = confidence_threshold
         self.device = device
-        self.goal_name = None
+        self.goal_name: Optional[str] = None
+        self.goal_pool: List[str] = []
+        self.goal_to_class: Dict[str, int] = {}
+        self.active_goal_class: Optional[int] = None
 
         # Setup config
         cfg = get_cfg()
@@ -74,15 +78,28 @@ class DeticDetector:
 
         print(f"[DeticDetector] Initialized with confidence_threshold={confidence_threshold}")
 
-    def set_goal(self, goal_name: str):
+    def set_goal_pool(self, goal_names: List[str]):
         """
-        Set the goal object to detect and update classifier
+        Set a pool of candidate goal classes and update classifier once.
 
         Args:
-            goal_name: Name of the object to detect (e.g., "chair", "door")
+            goal_names: List of object class names
         """
-        self.goal_name = goal_name
-        vocabulary = [goal_name]
+        if goal_names is None:
+            raise ValueError("goal_names is required")
+
+        # Remove empty names and keep order while deduplicating.
+        vocabulary = []
+        seen = set()
+        for name in goal_names:
+            n = str(name).strip()
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            vocabulary.append(n)
+
+        if len(vocabulary) == 0:
+            raise ValueError("goal_names is empty after cleanup")
 
         # Generate CLIP embeddings for custom vocabulary
         texts = ['a ' + x for x in vocabulary]
@@ -92,8 +109,42 @@ class DeticDetector:
         # Reset classifier with new vocabulary
         num_classes = len(vocabulary)
         reset_cls_test(self.predictor.model, emb, num_classes)
+        self.goal_pool = vocabulary
+        self.goal_to_class = {name: idx for idx, name in enumerate(vocabulary)}
 
-        print(f"[DeticDetector] Set goal to: '{goal_name}'")
+        # If previous active goal is no longer valid, clear it.
+        if self.goal_name not in self.goal_to_class:
+            self.goal_name = None
+            self.active_goal_class = None
+
+        print(f"[DeticDetector] Set goal pool: {self.goal_pool}")
+
+    def set_active_goal(self, goal_name: str):
+        """
+        Select one active class from preloaded goal pool.
+
+        Args:
+            goal_name: Name of active object class for filtering detections
+        """
+        if len(self.goal_pool) == 0:
+            raise ValueError("Goal pool not set. Call set_goal_pool() first.")
+        if goal_name not in self.goal_to_class:
+            raise ValueError(f"Goal '{goal_name}' not in goal pool: {self.goal_pool}")
+
+        self.goal_name = goal_name
+        self.active_goal_class = int(self.goal_to_class[goal_name])
+        print(f"[DeticDetector] Active goal set to: '{goal_name}' (class_id={self.active_goal_class})")
+
+    def get_available_goals(self) -> List[str]:
+        """Return available preloaded goal classes."""
+        return list(self.goal_pool)
+
+    def set_goal(self, goal_name: str):
+        """
+        Backward-compatible single-goal API.
+        """
+        self.set_goal_pool([goal_name])
+        self.set_active_goal(goal_name)
 
     def detect(self, rgb_image: np.ndarray):
         """
@@ -107,8 +158,8 @@ class DeticDetector:
             bbox format: [x1, y1, x2, y2]
             mask format: (H, W) bool array
         """
-        if self.goal_name is None:
-            raise ValueError("Goal not set. Call set_goal() first.")
+        if self.active_goal_class is None:
+            raise ValueError("Active goal not set. Call set_active_goal() first.")
 
         # Convert RGB to BGR for Detic
         bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
@@ -124,7 +175,7 @@ class DeticDetector:
         if not instances.has("pred_masks"):
             raise RuntimeError("Detic output does not contain pred_masks. Check MASK_ON/ROI_MASK_HEAD in config.")
 
-        # Filter by confidence and goal class (class 0 since we have single-class vocabulary)
+        # Filter by confidence and active goal class
         boxes = instances.pred_boxes.tensor.numpy()
         scores = instances.scores.numpy()
         classes = instances.pred_classes.numpy()
@@ -133,7 +184,7 @@ class DeticDetector:
         # Filter detections
         detections = []
         for box, score, cls, mask in zip(boxes, scores, classes, masks):
-            if cls == 0 and score >= self.confidence_threshold:
+            if int(cls) == int(self.active_goal_class) and score >= self.confidence_threshold:
                 # Filter out very small detections (likely noise)
                 width = box[2] - box[0]
                 height = box[3] - box[1]
