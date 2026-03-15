@@ -334,7 +334,8 @@ def navigation_reset():
     nav_state['iteration_count'] = 0
     nav_state['log_dir'] = setup_log_directory(goal, goal_description or '')
     nav_state['blocked_detections'] = []
-    
+    nav_state['goal_confirmed'] = False
+
     # Build agent config
     agent_cfg = {
         'vlm_model': '/data/sea_disk0/liujy/models/Qwen/Qwen3.5-27B-GPTQ-Int4/',
@@ -348,7 +349,7 @@ def navigation_reset():
         'bev_map_size': 800,
         'bev_pixels_per_meter': 20,
         'clip_dist': 4.0,
-        'bev_min_depth': 0.01,
+        'bev_min_depth': 0.51,
         'bev_max_depth': 4.99,
         'frontier_visibility_max_depth': 5.0,
 
@@ -506,7 +507,9 @@ def navigation_step():
     t_detic_end = t_detic_start
     t_detic_verify = 0.0
     detic_verify_result = 'not_triggered'
-    if nav_state['detic_detector'] is not None:
+    if nav_state.get('goal_confirmed', False):
+        print(f"[Server] Goal already confirmed, skipping Detic detection")
+    elif nav_state['detic_detector'] is not None:
         try:
             detections = nav_state['detic_detector'].detect(rgb)
             t_detic_end = time.time()
@@ -712,6 +715,7 @@ def navigation_step():
                             nav_state['latest_state'] = viz_state
                             socketio.emit('navigation_update', viz_state)
 
+                            nav_state['goal_confirmed'] = True
                             print(f"[Server] Navigation finished! Goal '{nav_state['goal']}' verified and approached.")
                             return jsonify({
                                 'action_type': 'nav_step',

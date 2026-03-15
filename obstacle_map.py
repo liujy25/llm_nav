@@ -29,11 +29,15 @@ class ObstacleMap:
     def __init__(
         self,
         min_height: float = 0.15,
-        max_height: float = 2.0,
+        max_height: float = 1.5,
+        floor_min_height: float = -0.05,
         agent_radius: float = 0.3,
         area_thresh: float = 3.0,  # square meters
         size: int = 5000,
         pixels_per_meter: int = 100,  # Match nav_agent's scale
+        min_depth_tolerance: float = 0.05,
+        skip_near_depth_ratio: float = 0.2,
+        skip_reliable_ratio: float = 0.02,
     ):
         """
         Parameters
@@ -55,10 +59,16 @@ class ObstacleMap:
         self.pixels_per_meter = pixels_per_meter
         self._min_height = min_height
         self._max_height = max_height
+        self._floor_min_height = floor_min_height
+        self._min_depth_tolerance = min_depth_tolerance
+        self._skip_near_depth_ratio = skip_near_depth_ratio
+        self._skip_reliable_ratio = skip_reliable_ratio
         self._area_thresh_in_pixels = area_thresh * (pixels_per_meter ** 2)
         
         # Initialize maps
         self._obstacle_map = np.zeros((size, size), dtype=bool)
+        self._dilated_obstacles = np.zeros((size, size), dtype=bool)
+        self._floor_map = np.zeros((size, size), dtype=bool)
         self._navigable_map = np.zeros((size, size), dtype=bool)
         self.explored_area = np.zeros((size, size), dtype=bool)
         
@@ -78,6 +88,8 @@ class ObstacleMap:
     def reset(self) -> None:
         """Reset all maps."""
         self._obstacle_map.fill(0)
+        self._dilated_obstacles.fill(0)
+        self._floor_map.fill(0)
         self._navigable_map.fill(0)
         self.explored_area.fill(0)
         self._frontiers_px = np.array([])
@@ -117,17 +129,36 @@ class ObstacleMap:
             print(f"[ObstacleMap] Episode origin set: {self._episode_origin}")
         
         # 1. Generate point cloud in camera frame (OpenCV optical frame)
-        mask = (depth > min_depth) & (depth < max_depth) & np.isfinite(depth)
+        # Client may clip all values below min_depth to the lower bound. When
+        # that clipped near-range region dominates the frame, skip the whole BEV
+        # update rather than inventing geometry at an incorrect distance.
+        finite_depth = np.isfinite(depth) & (depth > 0.0)
+        reliable_mask = finite_depth & (depth > (min_depth + self._min_depth_tolerance)) & (depth < max_depth)
+        near_clipped_mask = finite_depth & (depth <= (min_depth + self._min_depth_tolerance))
+        total_pixels = depth.size
+        reliable_ratio = float(reliable_mask.sum()) / float(total_pixels)
+        near_clipped_ratio = float(near_clipped_mask.sum()) / float(total_pixels)
+
+        if near_clipped_ratio >= self._skip_near_depth_ratio and reliable_ratio <= self._skip_reliable_ratio:
+            print(
+                f"[ObstacleMap] Skipping BEV update due to near-depth dominated frame: "
+                f"near_clipped_ratio={near_clipped_ratio:.3f}, reliable_ratio={reliable_ratio:.3f}"
+            )
+            return
+
         fx = intrinsic[0, 0]
         fy = intrinsic[1, 1]
         cx = intrinsic[0, 2]
         cy = intrinsic[1, 2]
-        point_cloud_optical = get_point_cloud(depth, mask, fx, fy, cx, cy)
-        
-        print(f"[ObstacleMap] Depth shape: {depth.shape}, valid points: {mask.sum()}, point cloud size: {len(point_cloud_optical)}")
+        point_cloud_optical = get_point_cloud(depth, reliable_mask, fx, fy, cx, cy)
+
+        print(
+            f"[ObstacleMap] Depth shape: {depth.shape}, reliable points: {reliable_mask.sum()}, "
+            f"near-clipped points: {near_clipped_mask.sum()}, point cloud size: {len(point_cloud_optical)}"
+        )
         
         if len(point_cloud_optical) == 0:
-            print("[ObstacleMap] WARNING: No valid points in point cloud!")
+            print("[ObstacleMap] WARNING: No reliable points in point cloud!")
             return
         
         # 2. Point cloud is already in camera_link frame from get_point_cloud
@@ -173,8 +204,24 @@ class ObstacleMap:
         # self._save_point_cloud_pcd(point_cloud_odom, "point_cloud_odom.pcd")
         
         # 3. Filter by height (z coordinate in odom frame)
-        obstacle_cloud = filter_points_by_height(
+        # Obstacles: above max height OR between min_height and max_height OR below floor_min_height
+        obstacle_cloud_mid = filter_points_by_height(
             point_cloud_odom, self._min_height, self._max_height
+        )
+        # Low obstacles: below floor_min_height (e.g. holes, drop-offs)
+        low_obstacle_mask = point_cloud_odom[:, 2] < self._floor_min_height
+        obstacle_cloud_low = point_cloud_odom[low_obstacle_mask]
+        # Combine
+        if len(obstacle_cloud_low) > 0 and len(obstacle_cloud_mid) > 0:
+            obstacle_cloud = np.vstack([obstacle_cloud_mid, obstacle_cloud_low])
+        elif len(obstacle_cloud_low) > 0:
+            obstacle_cloud = obstacle_cloud_low
+        else:
+            obstacle_cloud = obstacle_cloud_mid
+
+        # 3b. Extract floor points for navigable area
+        floor_cloud = filter_points_by_height(
+            point_cloud_odom, self._floor_min_height, self._min_height
         )
 
         # Print z range for filtered cloud
@@ -214,194 +261,64 @@ class ObstacleMap:
         # 6. Project to 2D map and mark new obstacles
         if len(obstacle_cloud) > 0:
             xy_points = obstacle_cloud[:, :2]
-            
-            # Debug: print XY distribution
-            print(f"[ObstacleMap] XY points - X range: [{xy_points[:, 0].min():.3f}, {xy_points[:, 0].max():.3f}]")
-            print(f"[ObstacleMap] XY points - Y range: [{xy_points[:, 1].min():.3f}, {xy_points[:, 1].max():.3f}]")
-            
             pixel_points = self._xy_to_px(xy_points)
-            
-            # Debug: print pixel distribution
-            print(f"[ObstacleMap] Pixel points - X range: [{pixel_points[:, 0].min()}, {pixel_points[:, 0].max()}]")
-            print(f"[ObstacleMap] Pixel points - Y range: [{pixel_points[:, 1].min()}, {pixel_points[:, 1].max()}]")
-            
-            # Mark obstacles
             valid_mask = (
                 (pixel_points[:, 0] >= 0) & (pixel_points[:, 0] < self.size) &
                 (pixel_points[:, 1] >= 0) & (pixel_points[:, 1] < self.size)
             )
             valid_pixels = pixel_points[valid_mask]
             self._obstacle_map[valid_pixels[:, 1], valid_pixels[:, 0]] = True
-            
             print(f"[ObstacleMap] Obstacle cloud: {len(obstacle_cloud)} points, valid pixels: {len(valid_pixels)}")
-            print(f"[ObstacleMap] Obstacle map coverage: {self._obstacle_map.sum()} / {self._obstacle_map.size} pixels")
-            
-            # Update navigable map (inverse of dilated obstacles)
-            self._navigable_map = ~cv2.dilate(
-                self._obstacle_map.astype(np.uint8),
-                self._navigable_kernel,
-                iterations=1
-            ).astype(bool)
 
-            print(f"[ObstacleMap] Navigable map coverage: {self._navigable_map.sum()} / {self._navigable_map.size} pixels")
+        # 6b. Project floor points to floor map
+        if len(floor_cloud) > 0:
+            floor_xy = floor_cloud[:, :2]
+            floor_px = self._xy_to_px(floor_xy)
+            floor_valid = (
+                (floor_px[:, 0] >= 0) & (floor_px[:, 0] < self.size) &
+                (floor_px[:, 1] >= 0) & (floor_px[:, 1] < self.size)
+            )
+            floor_valid_px = floor_px[floor_valid]
+            self._floor_map[floor_valid_px[:, 1], floor_valid_px[:, 0]] = True
+            print(f"[ObstacleMap] Floor cloud: {len(floor_cloud)} points, valid pixels: {len(floor_valid_px)}")
 
-            # Force robot position to be navigable (robot itself may be detected as obstacle)
-            robot_pixel = self._xy_to_px(base_to_odom[:2, 3].reshape(1, 2))[0]
-            if 0 <= robot_pixel[0] < self.size and 0 <= robot_pixel[1] < self.size:
-                # Mark a small area around robot as navigable (5x5 pixels = ~0.05m radius)
-                x_min = max(0, robot_pixel[0] - 2)
-                x_max = min(self.size, robot_pixel[0] + 3)
-                y_min = max(0, robot_pixel[1] - 2)
-                y_max = min(self.size, robot_pixel[1] + 3)
-                self._navigable_map[y_min:y_max, x_min:x_max] = True
-                print(f"[ObstacleMap] Forced robot position {robot_pixel} to be navigable")
-        else:
-            print("[ObstacleMap] WARNING: No obstacle points after height filtering!")
+        # 6c. Update navigable map: floor area minus dilated obstacles
+        self._dilated_obstacles = cv2.dilate(
+            self._obstacle_map.astype(np.uint8),
+            self._navigable_kernel,
+            iterations=1
+        ).astype(bool)
+        self._navigable_map = self._floor_map & ~self._dilated_obstacles
 
-        # 7. Update explored area: combine depth observation and raycast
-        # Step 7a: Mark depth-visible areas
-        self._mark_explored_from_depth(point_cloud_odom)
-        depth_explored_count = self.explored_area.sum()
-        print(f"[ObstacleMap] Depth explored area: {depth_explored_count} pixels")
+        print(f"[ObstacleMap] Obstacle: {self._obstacle_map.sum()}, Floor: {self._floor_map.sum()}, Navigable: {self._navigable_map.sum()}")
 
-        # Step 7b: Add raycast in FOV to fill blind spots (especially near robot)
-        # FOV mask and robot info already computed above
-        # IMPORTANT: reveal_fog_of_war expects 1=navigable, 0=obstacle.
-        # Use the inflated navigable map to reduce "light leaks" through thin wall gaps.
-        raycast_topdown = self._navigable_map.astype(np.uint8)
+        # Force robot position to be navigable
+        robot_pixel = self._xy_to_px(base_to_odom[:2, 3].reshape(1, 2))[0]
+        if 0 <= robot_pixel[0] < self.size and 0 <= robot_pixel[1] < self.size:
+            x_min = max(0, robot_pixel[0] - 2)
+            x_max = min(self.size, robot_pixel[0] + 3)
+            y_min = max(0, robot_pixel[1] - 2)
+            y_max = min(self.size, robot_pixel[1] + 3)
+            self._navigable_map[y_min:y_max, x_min:x_max] = True
 
-        # DEBUG: Check obstacle map statistics
-        obstacle_count = self._obstacle_map.sum()
-        obstacle_in_fov = (self._obstacle_map & current_fov_mask).sum()
-        print(f"[ObstacleMap] DEBUG: Total obstacles: {obstacle_count}, obstacles in FOV: {obstacle_in_fov}")
-
-        # DEBUG: Save obstacle map for visualization
-        if obstacle_in_fov > 0:
-            # Check if obstacles form contours
-            obstacles_in_cone_uint8 = (self._obstacle_map & current_fov_mask).astype(np.uint8)
-            test_contours, _ = cv2.findContours(obstacles_in_cone_uint8, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            print(f"[ObstacleMap] DEBUG: Found {len(test_contours)} obstacle contours in FOV")
-            if len(test_contours) > 0:
-                total_contour_pixels = sum([cv2.contourArea(cnt) for cnt in test_contours])
-                print(f"[ObstacleMap] DEBUG: Total contour area: {total_contour_pixels} pixels")
-
+        # 7. Update explored area
+        # explored = (accumulated floor observations & ~dilated_obstacles) | raycast
+        # Raycast fills blind spots near the robot (below min_depth)
+        raycast_topdown = (~self._dilated_obstacles).astype(np.uint8)
         raycast_explored = reveal_fog_of_war(
             top_down_map=raycast_topdown,
             current_fog_of_war_mask=np.zeros_like(raycast_topdown, dtype=np.uint8),
-            current_point=robot_pixel,
-            current_angle=robot_yaw + np.pi / 2,  # Original angle convention
-            fov=np.rad2deg(fov_horizontal),  # Convert to degrees
+            current_point=robot_pixel[::-1],
+            current_angle=robot_yaw + np.pi / 2,
+            fov=np.rad2deg(fov_horizontal),
             max_line_len=max_depth_px
         )
 
-        # DEBUG: Check raycast results
-        raycast_count = raycast_explored.sum()
-        print(f"[ObstacleMap] DEBUG: Raycast marked {raycast_count} pixels as explored")
-
-        # Step 7c: Take union of depth and raycast
-        unique_raycast = np.unique(raycast_explored)
-        print(f"[ObstacleMap] Raycast unique values: {unique_raycast}")
-
-        # DEBUG: Check where raycast added explored pixels
-        before_raycast = self.explored_area.sum()
-        combined_explored = self.explored_area | raycast_explored.astype(bool)
-        raycast_added = combined_explored.sum() - depth_explored_count
-        print(f"[ObstacleMap] Raycast added: {raycast_added} pixels")
-
-        # DEBUG: Check if raycast marked areas behind obstacles
-        # Areas behind obstacles should NOT be marked as explored
-        raycast_only = raycast_explored.astype(bool) & ~self.explored_area
-        raycast_behind_obstacles = raycast_only & self._obstacle_map
-        if raycast_behind_obstacles.sum() > 0:
-            print(f"[ObstacleMap] WARNING: Raycast marked {raycast_behind_obstacles.sum()} pixels INSIDE obstacles!")
-
-        # Check if raycast marked non-navigable areas
-        raycast_non_navigable = raycast_only & ~self._navigable_map
-        if raycast_non_navigable.sum() > 0:
-            print(f"[ObstacleMap] WARNING: Raycast marked {raycast_non_navigable.sum()} non-navigable pixels!")
-
-        # Step 7d: Dilate to fill small gaps
-        # IMPORTANT: Restrict to navigable areas BEFORE dilation to prevent crossing obstacles
-        # If we dilate first, dilation will cross obstacles and mark areas behind walls
-        combined_in_navigable = combined_explored & self._navigable_map
-
-        # DEBUG: Check navigable_map vs obstacle_map relationship
-        navigable_overlaps_obstacle = self._navigable_map & self._obstacle_map
-        if navigable_overlaps_obstacle.sum() > 0:
-            print(f"[ObstacleMap] ERROR: navigable_map overlaps with obstacle_map by {navigable_overlaps_obstacle.sum()} pixels!")
-
-        # DEBUG: Check if combined_in_navigable contains obstacles
-        combined_in_obstacles = combined_in_navigable & self._obstacle_map
-        if combined_in_obstacles.sum() > 0:
-            print(f"[ObstacleMap] ERROR: combined_in_navigable contains {combined_in_obstacles.sum()} obstacle pixels!")
-
-        kernel = np.ones((3, 3), np.uint8)  # Reduced from (5,5) to (3,3)
-
-        # DEBUG: Check before dilation
-        before_dilate = combined_in_navigable.sum()
-        print(f"[ObstacleMap] DEBUG: Before dilation: {before_dilate} pixels in navigable area")
-
-        # explored_dilated = cv2.dilate(
-        #     combined_in_navigable.astype(np.uint8),
-        #     kernel,
-        #     iterations=1
-        # ).astype(bool)
-
-        explored_dilated = combined_in_navigable
-
-        # Hard clamp after dilation so explored area never crosses obstacles/walls.
-        explored_dilated = explored_dilated & self._navigable_map
-
-        unique_dilated = np.unique(explored_dilated.astype(np.uint8))
-        print(f"[ObstacleMap] Dilated unique values: {unique_dilated}")
-
-        # DEBUG: Check dilation effect
-        after_dilate = explored_dilated.sum()
-        dilate_added = after_dilate - before_dilate
-        print(f"[ObstacleMap] DEBUG: Dilation added {dilate_added} pixels")
-
-        # Check if dilation crossed obstacles (should be much less now)
-        dilated_only = explored_dilated & ~combined_in_navigable
-        dilated_into_obstacles = dilated_only & self._obstacle_map
-        if dilated_into_obstacles.sum() > 0:
-            print(f"[ObstacleMap] WARNING: Dilation extended {dilated_into_obstacles.sum()} pixels INTO obstacles!")
-
-        # Check if dilation crossed into non-navigable areas (should be minimal now)
-        dilated_non_navigable = dilated_only & ~self._navigable_map
-        if dilated_non_navigable.sum() > 0:
-            print(f"[ObstacleMap] WARNING: Dilation extended {dilated_non_navigable.sum()} pixels into non-navigable areas!")
-            # This should be ZERO now since we dilate within navigable_map
-            print(f"[ObstacleMap] ERROR: This should not happen! Dilation should stay within navigable_map!")
-
-        # Step 7e: Clip dilated areas to current FOV
-        explored_clipped = explored_dilated & current_fov_mask
-        clipped_count = explored_dilated.sum() - explored_clipped.sum()
-        if clipped_count > 0:
-            print(f"[ObstacleMap] Clipped {clipped_count} dilated pixels outside FOV")
-
-        # Step 7f: Incremental update - merge current FOV observations with global map
-        # Only keep explored pixels in navigable areas
-        old_explored_count = self.explored_area.sum()
-
-        # DEBUG: Check what will be added
-        new_explored_in_fov = explored_clipped & self._navigable_map
-        new_explored_count = new_explored_in_fov.sum()
-        print(f"[ObstacleMap] DEBUG: Will add {new_explored_count} new explored pixels in FOV")
-
-        # Check if new explored areas overlap with obstacles
-        new_explored_in_obstacles = new_explored_in_fov & self._obstacle_map
-        if new_explored_in_obstacles.sum() > 0:
-            print(f"[ObstacleMap] ERROR: Trying to mark {new_explored_in_obstacles.sum()} obstacle pixels as explored!")
-
-        self.explored_area = self.explored_area | (explored_clipped & self._navigable_map)
-
-        # Keep only the connected explored component around the robot to avoid
-        # isolated white regions that appear behind walls.
-        self._filter_explored_area(robot_pixel)
-
-        final_added = self.explored_area.sum() - old_explored_count
-        print(f"[ObstacleMap] DEBUG: Actually added {final_added} explored pixels to global map")
-        print(f"[ObstacleMap] Final explored area: {self.explored_area.sum()} / {self.explored_area.size} pixels")
+        # Accumulate new observations, then remove areas covered by obstacles
+        self.explored_area = self.explored_area | (self._floor_map & ~self._dilated_obstacles) | raycast_explored.astype(bool)
+        self.explored_area = self.explored_area & ~self._dilated_obstacles
+        print(f"[ObstacleMap] Explored area: {self.explored_area.sum()} pixels "
+              f"(floor: {(self._floor_map & ~self._dilated_obstacles).sum()}, raycast: {raycast_explored.sum()})")
 
         # 8. Detect frontiers (with FOV filtering)
         self._update_frontiers(
@@ -634,9 +551,9 @@ class ObstacleMap:
             Distance limit in meters for frontier FOV filtering
         """
         # Step 1: Detect frontiers based on global map
-        # Use explored_area directly without dilation
+        # Use ~dilated_obstacles as navigable (white + gray areas)
         frontiers_px = detect_frontier_waypoints(
-            self._navigable_map.astype(np.uint8),
+            (~self._dilated_obstacles).astype(np.uint8),
             self.explored_area.astype(np.uint8),
             self._area_thresh_in_pixels,
         )
@@ -700,10 +617,11 @@ class ObstacleMap:
         robot_pos_odom: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Detect all global frontiers without FOV or A* reachability filtering.
+        Detect all global frontiers without FOV filtering.
         Used by fallback mode to provide frontier candidates from all directions.
+        Applies A* reachability filtering (same as normal mode).
 
-        Pipeline: global detection -> obstacle proximity filter -> inward move + normal
+        Pipeline: global detection -> A* reachability filter -> inward move + normal
 
         Parameters
         ----------
@@ -717,7 +635,7 @@ class ObstacleMap:
         """
         # Step 1: Global frontier detection
         frontiers_px = detect_frontier_waypoints(
-            self._navigable_map.astype(np.uint8),
+            (~self._dilated_obstacles).astype(np.uint8),
             self.explored_area.astype(np.uint8),
             self._area_thresh_in_pixels,
         )
@@ -726,9 +644,10 @@ class ObstacleMap:
         if len(frontiers_px) == 0:
             return np.array([]), np.array([])
 
-        # Step 2: Obstacle proximity filter (skip FOV and A* filters)
-        frontiers_px = self._filter_frontiers_near_obstacles(frontiers_px)
-        print(f"[ObstacleMap] After obstacle filter (fallback): {len(frontiers_px)}")
+        # Step 2: A* reachability filter (same as normal mode)
+        robot_px = self._xy_to_px(robot_pos_odom.reshape(1, 2))[0]
+        frontiers_px = self._filter_unreachable_frontiers(frontiers_px, robot_px)
+        print(f"[ObstacleMap] After reachability filter (fallback): {len(frontiers_px)}")
 
         if len(frontiers_px) == 0:
             return np.array([]), np.array([])
@@ -916,8 +835,8 @@ class ObstacleMap:
             return frontiers_px
 
         # Create cost map for pathfinding
-        # Traversable areas: explored AND navigable (white areas in BEV)
-        traversable = self.explored_area & self._navigable_map
+        # Traversable areas: explored area (white areas in BEV)
+        traversable = self.explored_area
 
         # Create cost map: 1 for traversable, very high cost for non-traversable
         # route_through_array finds minimum cost path
@@ -1048,8 +967,8 @@ class ObstacleMap:
         # Draw explored area in white
         vis_img[self.explored_area] = (255, 255, 255)
 
-        # Draw inflated obstacles in black (non-navigable areas)
-        vis_img[~self._navigable_map] = (0, 0, 0)
+        # Draw inflated obstacles in black
+        vis_img[self._dilated_obstacles] = (0, 0, 0)
 
         # Draw frontiers in blue (RGB format) - only if show_frontiers is True
         if show_frontiers and len(self._frontiers_px) > 0:

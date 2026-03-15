@@ -40,6 +40,7 @@ test_results.png
 snapshot_*/
 test_output*/
 debug_output*/
+testdata/
 
 # Debug scripts
 debug_*.py

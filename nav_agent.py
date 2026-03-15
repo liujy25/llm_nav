@@ -43,8 +43,8 @@ class NavAgent:
         self.cfg.setdefault('turn_angle_deg', 30.0)  # Turn left/right angle in degrees
         
         # Navigability configuration (obstacle height range)
-        self.cfg.setdefault('obstacle_height_min', 0.15)  # Minimum obstacle height (m)
-        self.cfg.setdefault('obstacle_height_max', 2.0)   # Maximum obstacle height (m)
+        self.cfg.setdefault('obstacle_height_min', 0.2)  # Minimum obstacle height (m)
+        self.cfg.setdefault('obstacle_height_max', 1.0)   # Maximum obstacle height (m)
         
         # Prompt mode: 'reasoning' or 'action_only'
         self.cfg.setdefault('prompt_mode', 'reasoning')  # 'reasoning' or 'action_only'
@@ -61,6 +61,9 @@ class NavAgent:
         self.cfg.setdefault('bev_map_size', 2000)  # BEV map size (200x200 for 20m x 20m)
         self.cfg.setdefault('bev_pixels_per_meter', 100)  # 10 pixels per meter
         self.cfg.setdefault('bev_min_depth', 0.5)
+        self.cfg.setdefault('bev_min_depth_tolerance', 0.05)
+        self.cfg.setdefault('bev_skip_near_depth_ratio', 0.2)
+        self.cfg.setdefault('bev_skip_reliable_ratio', 0.02)
         self.cfg.setdefault('bev_max_depth', 5.0)
         
         # Frontier occlusion filter (simple 3x3 depth check)
@@ -94,6 +97,9 @@ class NavAgent:
             area_thresh=1.0,
             size=self.cfg['bev_map_size'],
             pixels_per_meter=self.cfg['bev_pixels_per_meter'],
+            min_depth_tolerance=self.cfg['bev_min_depth_tolerance'],
+            skip_near_depth_ratio=self.cfg['bev_skip_near_depth_ratio'],
+            skip_reliable_ratio=self.cfg['bev_skip_reliable_ratio'],
         )
         self.bev_scale = self.cfg['bev_pixels_per_meter']
 
@@ -1544,57 +1550,6 @@ class NavAgent:
                 cv2.arrowedLine(bev, (robot_px_x, robot_px_y), (arrow_end_x, arrow_end_y),
                                (0, 0, 255), 3, tipLength=0.3)
 
-                # 绘制 FOV 边界射线（两条红色射线）
-                if hasattr(self, 'fov'):
-                    fov_half = np.deg2rad(self.fov / 2)
-
-                    # 左边界射线
-                    left_angle = robot_yaw - fov_half
-                    # 右边界射线
-                    right_angle = robot_yaw + fov_half
-
-                    # 对每条边界射线进行 raycast,找到实际终点
-                    for boundary_angle in [left_angle, right_angle]:
-                        # Raycast 找到射线终点 (遇到障碍物/未探索区域/边界)
-                        max_ray_dist = 20.0  # 最大射线长度 (米)
-
-                        # 在 odom 坐标系中计算射线
-                        ray_end_x = current_pos[0] + max_ray_dist * np.cos(boundary_angle)
-                        ray_end_y = current_pos[1] + max_ray_dist * np.sin(boundary_angle)
-                        ray_end_px = self.obstacle_map._xy_to_px(np.array([[ray_end_x, ray_end_y]])) * scale_factor
-
-                        if len(ray_end_px) > 0:
-                            end_px_x = int(ray_end_px[0, 0])
-                            end_px_y = int(ray_end_px[0, 1])
-
-                            # 使用 Bresenham 算法获取射线上的所有像素
-                            line_pixels = self._bresenham_line(robot_px_x, robot_px_y, end_px_x, end_px_y)
-
-                            # 找到第一个障碍物或未探索区域
-                            actual_end_px = (end_px_x, end_px_y)  # 默认终点
-
-                            for px_x, px_y in line_pixels:
-                                # 转换回原始地图坐标 (缩小)
-                                orig_px_x = px_x // scale_factor
-                                orig_px_y = px_y // scale_factor
-
-                                # 检查边界
-                                if not (0 <= orig_px_x < self.obstacle_map.size and 0 <= orig_px_y < self.obstacle_map.size):
-                                    actual_end_px = (px_x, px_y)
-                                    break
-
-                                # 检查是否是障碍物
-                                if self.obstacle_map._obstacle_map[orig_px_y, orig_px_x]:
-                                    actual_end_px = (px_x, px_y)
-                                    break
-
-                                # 检查是否是未探索区域
-                                if not self.obstacle_map.explored_area[orig_px_y, orig_px_x]:
-                                    actual_end_px = (px_x, px_y)
-                                    break
-
-                            # 绘制射线 (红色,较细)
-                            cv2.line(bev, (robot_px_x, robot_px_y), actual_end_px, (0, 0, 255), 2)
 
         # ========== 第二层：绘制历史轨迹（在箭头上层） ==========
         if len(self.trajectory_history) >= 1:  # Changed from > 1 to >= 1 to show first position
